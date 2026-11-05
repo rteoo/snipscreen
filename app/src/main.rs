@@ -32,6 +32,13 @@ const ICON_OFF: Color32 = Color32::from_rgb(0x6b, 0x6b, 0x6b);
 const BTN: Vec2 = vec2(36.0, 34.0);
 const GAP: f32 = 4.0;
 const DIVIDER_W: f32 = 13.0;
+/// Narrowest window that fits the capture, markup (with the crop buttons) and output groups side by side.
+const MIN_WINDOW_W: f32 = 520.0;
+const MIN_WINDOW_H: f32 = 240.0;
+/// Measured: capture group ~298 + markup with crop buttons 350 + output group 133 + 2 gaps + 24 toolbar margin = 837.
+const MIN_EDIT_W: f32 = 850.0;
+/// Clear space kept between the toolbar groups.
+const GROUP_GAP: f32 = 16.0;
 const DIM: Color32 = Color32::from_black_alpha(120);
 /// Time for the window's hide animation to finish before the screen is copied.
 const HIDE_SETTLE: Duration = Duration::from_millis(250);
@@ -186,6 +193,8 @@ struct App {
     crop: Option<(Pos2, Pos2)>,
     /// `None` fits the snip to the window; otherwise 1.0 is one screen pixel per pixel.
     zoom: Option<f32>,
+    /// Minimum window width last sent to the OS, so the command goes out only on change.
+    min_width: f32,
 
     auto_copy: bool,
     auto_save: bool,
@@ -247,6 +256,7 @@ impl App {
             erase_marked: false,
             crop: None,
             zoom: None,
+            min_width: MIN_WINDOW_W,
             auto_copy: true,
             auto_save: true,
             pick_on_launch: screenshot.is_none(),
@@ -392,7 +402,7 @@ impl App {
         let ppp = ctx.pixels_per_point();
         let monitor = ctx.input(|i| i.viewport().monitor_size).unwrap_or(vec2(1920.0, 1080.0));
         let snip = vec2(size[0], size[1]) / ppp;
-        (snip + vec2(48.0, 120.0)).clamp(vec2(760.0, 440.0), (monitor * 0.85).max(vec2(760.0, 440.0)))
+        (snip + vec2(48.0, 120.0)).clamp(vec2(MIN_EDIT_W, 440.0), (monitor * 0.85).max(vec2(MIN_EDIT_W, 440.0)))
     }
 
     fn finish(&mut self, ctx: &egui::Context, image: ColorImage) {
@@ -567,7 +577,17 @@ impl App {
         }
     }
 
+    /// With a snip open the toolbar needs room for all three groups; without one the window may shrink further.
+    fn sync_min_width(&mut self, ctx: &egui::Context) {
+        let want = if self.doc.is_some() { MIN_EDIT_W } else { MIN_WINDOW_W };
+        if want != self.min_width {
+            self.min_width = want;
+            ctx.send_viewport_cmd(ViewportCommand::MinInnerSize(vec2(want, MIN_WINDOW_H)));
+        }
+    }
+
     fn toolbar(&mut self, ui: &mut egui::Ui) {
+        self.sync_min_width(&ui.ctx().clone());
         egui::Panel::top("toolbar")
             .frame(egui::Frame::new().fill(TOOLBAR_BG).inner_margin(egui::Margin::symmetric(12, 6)))
             .show(ui, |ui| {
@@ -586,7 +606,7 @@ impl App {
 
                 if self.doc.is_some() {
                     let width = self.markup_width();
-                    let x = (row.center().x - width / 2.0).min(right_start - 16.0 - width).max(left_end + 16.0);
+                    let x = markup_x(row.center().x, width, left_end, right_start);
                     let mid_rect = Rect::from_min_size(pos2(x, row.min.y), vec2(width + 1.0, BTN.y));
                     let mut mid = ui.new_child(egui::UiBuilder::new().max_rect(mid_rect).layout(Layout::left_to_right(Align::Center)));
                     self.markup_controls(&mut mid);
@@ -1508,7 +1528,7 @@ fn main() -> eframe::Result {
         viewport: egui::ViewportBuilder::default()
             .with_title("Snipscreen")
             .with_inner_size([620.0, 330.0])
-            .with_min_inner_size([520.0, 240.0]),
+            .with_min_inner_size([MIN_WINDOW_W, MIN_WINDOW_H]),
         ..Default::default()
     };
     eframe::run_native(
@@ -1516,6 +1536,12 @@ fn main() -> eframe::Result {
         options,
         Box::new(move |cc| Ok(Box::new(App::new(cc, screenshot)))),
     )
+}
+
+/// Left edge of the markup group: centred in the toolbar when it fits clear of the capture and
+/// output groups, otherwise pushed right up against the capture group.
+fn markup_x(center: f32, width: f32, left_end: f32, right_start: f32) -> f32 {
+    (center - width / 2.0).min(right_start - GROUP_GAP - width).max(left_end + GROUP_GAP)
 }
 
 /// Editor shortcuts pressed this frame.
@@ -1641,6 +1667,26 @@ mod tests {
         let mut out = ctx.run_ui(input, |ui| keys = ui.ctx().input_mut(read_keys));
         out.textures_delta.clear();
         keys
+    }
+
+    #[test]
+    fn markup_group_never_overlaps_its_neighbours() {
+        // Group widths as laid out by `toolbar`: capture 298, output 133, markup with crop buttons 350.
+        let (left_end, out_w, width) = (12.0 + 298.0, 133.0, 350.0);
+        for window in [MIN_EDIT_W as i32, 900, 1200, 2000] {
+            let row_end = window as f32 - 12.0;
+            let right_start = row_end - out_w;
+            let x = markup_x((12.0 + row_end) / 2.0, width, left_end, right_start);
+            assert!(x >= left_end + GROUP_GAP, "overlaps capture group at {window}");
+            assert!(x + width <= right_start - GROUP_GAP, "overlaps output group at {window}");
+        }
+    }
+
+    #[test]
+    fn markup_group_centres_when_room_and_hugs_the_capture_group_otherwise() {
+        assert_eq!(markup_x(500.0, 200.0, 100.0, 900.0), 400.0);
+        assert_eq!(markup_x(500.0, 300.0, 100.0, 600.0), 284.0, "pushed left by the output group");
+        assert_eq!(markup_x(500.0, 800.0, 100.0, 1000.0), 116.0, "pulled right by the capture group");
     }
 
     #[test]
