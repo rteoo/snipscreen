@@ -32,8 +32,8 @@ use windows::Win32::Graphics::Dxgi::{
 use windows::Win32::Media::MediaFoundation::*;
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
 use windows_sys::Win32::Graphics::Gdi::{
-    CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, SelectObject, BITMAPINFO,
-    BI_RGB, DIB_RGB_COLORS, HBITMAP, HDC, HGDIOBJ,
+    BitBlt, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC, ReleaseDC, SelectObject, BITMAPINFO,
+    BI_RGB, CAPTUREBLT, DIB_RGB_COLORS, HBITMAP, HDC, HGDIOBJ, SRCCOPY,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     DrawIconEx, GetCursorInfo, GetIconInfo, CURSORINFO, CURSOR_SHOWING, DI_NORMAL, ICONINFO,
@@ -290,6 +290,9 @@ impl std::fmt::Display for GrabError {
 /// first so a dismissed UAC prompt resumes quickly, then capped.
 const REOPEN_FIRST: Duration = Duration::from_millis(100);
 const REOPEN_MAX: Duration = Duration::from_secs(1);
+/// Longest wait for the first screen image before copying it another way:
+/// a still screen sends none, so this delays the start of such recordings.
+const FIRST_FRAME_WAIT: Duration = Duration::from_millis(250);
 
 /// Reads one monitor through DXGI Desktop Duplication (GPU copy, no stalls
 /// from other windows redrawing) and draws the mouse pointer on top.
@@ -423,8 +426,9 @@ impl Grabber {
                 };
             }
             let copied = (|| {
-                // Pointer-only updates carry no new desktop image.
-                if info.LastPresentTime == 0 && self.have_frame {
+                // Pointer-only updates carry no new desktop image. The first
+                // frame after `DuplicateOutput` can be one too, with a black texture.
+                if info.LastPresentTime == 0 {
                     return Ok(());
                 }
                 let texture: ID3D11Texture2D = resource.ok_or_else(windows::core::Error::empty)?.cast()?;
@@ -495,9 +499,53 @@ impl Grabber {
         }
     }
 
+    /// Waits up to `FIRST_FRAME_WAIT` for duplication's first image. On a
+    /// still screen duplication hands over only a pointer update with a
+    /// black texture until something changes, so it then falls back to one
+    /// GDI copy rather than starting black.
+    fn first_image(&mut self) -> windows::core::Result<()> {
+        let deadline = Instant::now() + FIRST_FRAME_WAIT;
+        while !self.have_frame {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return self.copy_with_gdi();
+            }
+            if self.dup.is_none() {
+                std::thread::sleep(left.min(Duration::from_millis(10)));
+            }
+            self.refresh(left.as_millis().max(1) as u32)?;
+        }
+        Ok(())
+    }
+
+    /// Copies the area off the screen with GDI into `clean`. Upright already:
+    /// GDI works in desktop coordinates, whatever way the monitor is turned.
+    fn copy_with_gdi(&mut self) -> windows::core::Result<()> {
+        let [x, y, w, h] = self.area;
+        unsafe {
+            let screen = GetDC(null_mut());
+            if screen.is_null() {
+                return Err(windows::core::Error::from_thread());
+            }
+            let ok = BitBlt(self.mem, 0, 0, w, h, screen, x, y, SRCCOPY | CAPTUREBLT);
+            ReleaseDC(null_mut(), screen);
+            if ok == 0 {
+                return Err(windows::core::Error::from_thread());
+            }
+            let len = (w * h * 4) as usize;
+            std::ptr::copy_nonoverlapping(self.pixels, self.clean.as_mut_ptr(), len);
+        }
+        self.have_frame = true;
+        Ok(())
+    }
+
     /// The area as BGRA rows, with the mouse pointer drawn in.
     fn frame(&mut self) -> windows::core::Result<&[u8]> {
-        self.refresh(if self.have_frame { 0 } else { 500 })?;
+        if self.have_frame {
+            self.refresh(0)?;
+        } else {
+            self.first_image()?;
+        }
         let [x, y, w, h] = self.area;
         unsafe {
             let len = (w * h * 4) as usize;
@@ -940,6 +988,7 @@ mod tests {
     #[test]
     #[ignore]
     fn reopens_after_lost_duplication() {
+        let _desktop = desktop();
         let (w, h) = (640, 480);
         let mut g = Grabber::new([0, 0, w, h]).expect("grabber");
         g.frame().expect("first frame");
@@ -952,12 +1001,40 @@ mod tests {
         }
     }
 
+    /// One desktop duplication per output per process: tests that open one
+    /// take turns.
+    fn desktop() -> std::sync::MutexGuard<'static, ()> {
+        static DESKTOP: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        DESKTOP.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Needs a desktop. The first frame is a real screen image, from
+    /// duplication or else GDI, and arrives within the bounded wait.
+    #[test]
+    #[ignore]
+    fn first_frame_is_a_real_image() {
+        let _desktop = desktop();
+        let (w, h) = (640, 480);
+        let mut g = Grabber::new([0, 0, w, h]).expect("grabber");
+        g.copy_with_gdi().expect("GDI copy");
+        assert!(g.have_frame);
+        assert!(g.clean.as_chunks::<4>().0.iter().any(|p| p[..3] != [0, 0, 0]), "GDI copy of the desktop is all black");
+        drop(g);
+        let mut g = Grabber::new([0, 0, w, h]).expect("grabber");
+        let t = Instant::now();
+        assert_eq!(g.frame().expect("first frame").len(), (w * h * 4) as usize);
+        assert!(g.have_frame, "first frame must hold a screen image");
+        assert!(t.elapsed() < FIRST_FRAME_WAIT + Duration::from_millis(250), "first frame took {:?}", t.elapsed());
+        assert!(g.clean.as_chunks::<4>().0.iter().any(|p| p[..3] != [0, 0, 0]), "first frame is all black");
+    }
+
     /// Needs a desktop and sound devices. A 3 s recording of the real screen
     /// with system sound runs in real time and keeps close to 30 fps with
     /// the sink writer throttled.
     #[test]
     #[ignore]
     fn records_the_desktop_in_real_time() {
+        let _desktop = desktop();
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("target").join("test-realtime.mp4");
         let _ = std::fs::remove_file(&path);
         let settings = Settings { area: [0, 0, 1280, 720], system_sound: true, microphone: None, path: path.clone() };
@@ -974,6 +1051,8 @@ mod tests {
         let (frames, span) = unsafe { count_video_frames(&done.path) }.expect("decode");
         std::fs::remove_file(&done.path).unwrap();
         assert!((2.9..4.0).contains(&done.seconds), "took {} s", done.seconds);
+        let thumb = done.first_frame.expect("thumbnail");
+        assert!(thumb.pixels.iter().any(|&c| c != Color32::BLACK), "thumbnail is all black");
         // The clock starts before the grabber and encoder are set up, so
         // measure the rate over the frames themselves.
         assert!(span > 1.5, "video spans only {span:.2} s");
