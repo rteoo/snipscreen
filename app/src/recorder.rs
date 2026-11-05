@@ -458,15 +458,17 @@ impl Grabber {
                     self.staging = make_staging(&self.device, [rw, rh])?;
                     self.staging_size = [rw, rh];
                 }
-                if let Some(src) = clip_box(rect, [desktop.Width, desktop.Height]) {
-                    let (dx, dy) = ((src.left as i32 - rx) as u32, (src.top as i32 - ry) as u32);
-                    self.context.CopySubresourceRegion(&self.staging, 0, dx, dy, 0, &texture, 0, Some(&src));
-                }
+                // Only the copied part is read back: the rest of `staging` is
+                // stale or, after a turn, blank.
+                let Some(src) = clip_box(rect, [desktop.Width, desktop.Height]) else { return Ok(()) };
+                let (dx, dy) = ((src.left as i32 - rx) as u32, (src.top as i32 - ry) as u32);
+                self.context.CopySubresourceRegion(&self.staging, 0, dx, dy, 0, &texture, 0, Some(&src));
+                let copied = [dx, dy, dx + src.right - src.left, dy + src.bottom - src.top].map(|v| v as usize);
                 let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
                 self.context.Map(&self.staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))?;
                 let pitch = mapped.RowPitch as usize;
                 let src = std::slice::from_raw_parts(mapped.pData as *const u8, pitch * (rh as usize - 1) + rw as usize * 4);
-                unrotate(src, pitch, self.rotation, w as usize, h as usize, &mut self.clean);
+                unrotate(src, pitch, self.rotation, w as usize, h as usize, copied, &mut self.clean);
                 self.context.Unmap(&self.staging, 0);
                 self.have_frame = true;
                 Ok(())
@@ -663,12 +665,16 @@ fn texture_rect([x, y, w, h]: [i32; 4], rotation: DXGI_MODE_ROTATION, [tw, th]: 
 }
 
 /// Copies the area out of `src` (its `texture_rect`, rows `pitch` bytes
-/// apart, BGRA) into `dst` as upright `w`×`h` BGRA rows.
-fn unrotate(src: &[u8], pitch: usize, rotation: DXGI_MODE_ROTATION, w: usize, h: usize, dst: &mut [u8]) {
+/// apart, BGRA) into `dst` as upright `w`×`h` BGRA rows. Only the part of
+/// `src` inside `copied` (left, top, right, bottom) is taken; the rest of
+/// `dst` keeps what it had.
+fn unrotate(src: &[u8], pitch: usize, rotation: DXGI_MODE_ROTATION, w: usize, h: usize, [x0, y0, x1, y1]: [usize; 4], dst: &mut [u8]) {
     let turned = matches!(rotation, DXGI_MODE_ROTATION_ROTATE90 | DXGI_MODE_ROTATION_ROTATE180 | DXGI_MODE_ROTATION_ROTATE270);
     for (y, out) in dst.chunks_exact_mut(w * 4).take(h).enumerate() {
         if !turned {
-            out.copy_from_slice(&src[y * pitch..][..w * 4]);
+            if (y0..y1).contains(&y) && x0 < x1 {
+                out[x0 * 4..x1 * 4].copy_from_slice(&src[y * pitch + x0 * 4..][..(x1 - x0) * 4]);
+            }
             continue;
         }
         for (x, px) in out.as_chunks_mut::<4>().0.iter_mut().enumerate() {
@@ -677,7 +683,9 @@ fn unrotate(src: &[u8], pitch: usize, rotation: DXGI_MODE_ROTATION, w: usize, h:
                 DXGI_MODE_ROTATION_ROTATE180 => (w - 1 - x, h - 1 - y),
                 _ => (h - 1 - y, x),
             };
-            px.copy_from_slice(&src[sy * pitch + sx * 4..][..4]);
+            if (x0..x1).contains(&sx) && (y0..y1).contains(&sy) {
+                px.copy_from_slice(&src[sy * pitch + sx * 4..][..4]);
+            }
         }
     }
 }
@@ -1003,10 +1011,41 @@ mod tests {
                 }
             }
             let mut clean = vec![0u8; 4 * 3 * 4];
-            unrotate(&staging, pitch, rotation, 4, 3, &mut clean);
+            unrotate(&staging, pitch, rotation, 4, 3, [0, 0, rw as usize, rh as usize], &mut clean);
             let got: Vec<u32> = clean.as_chunks::<4>().0.iter().map(|p| u32::from_le_bytes(*p)).collect();
             let want: Vec<u32> = (1..4).flat_map(|y| (2..6).map(move |x| y * 7 + x)).collect();
             assert_eq!(got, want, "{rotation:?}");
+        }
+    }
+
+    /// Turned between portrait and landscape onto a desktop that covers only
+    /// part of the area: the fresh staging texture is blank outside the
+    /// copied part, and those pixels must keep the last image, not go black.
+    #[test]
+    fn partly_covered_area_keeps_the_last_image() {
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_MODE_ROTATION_IDENTITY;
+        const LAST: u32 = 0xdead_beef;
+        let local = [2, 1, 4, 3];
+        for rotation in [DXGI_MODE_ROTATION_IDENTITY, DXGI_MODE_ROTATION_ROTATE90, DXGI_MODE_ROTATION_ROTATE180, DXGI_MODE_ROTATION_ROTATE270] {
+            let (tex, size) = unturned(rotation);
+            let [rx, ry, rw, rh] = texture_rect(local, rotation, size);
+            // Only the left part of the staging texture got this frame; the rest is blank.
+            let copied = [0, 0, rw as usize - 1, rh as usize];
+            let pitch = rw as usize * 4;
+            let mut staging = vec![0u8; pitch * rh as usize];
+            for sy in 0..copied[3] {
+                for sx in 0..copied[2] {
+                    let v = tex[(ry as usize + sy) * size[0] as usize + rx as usize + sx];
+                    staging[sy * pitch + sx * 4..][..4].copy_from_slice(&v.to_le_bytes());
+                }
+            }
+            let mut clean: Vec<u8> = std::iter::repeat_n(LAST.to_le_bytes(), 4 * 3).flatten().collect();
+            unrotate(&staging, pitch, rotation, 4, 3, copied, &mut clean);
+            let got: Vec<u32> = clean.as_chunks::<4>().0.iter().map(|p| u32::from_le_bytes(*p)).collect();
+            let want: Vec<u32> = (1..4).flat_map(|y| (2..6).map(move |x| y * 7 + x)).collect();
+            let fresh = got.iter().zip(&want).filter(|(g, w)| g == w).count();
+            assert!(got.iter().zip(&want).all(|(g, w)| g == w || *g == LAST), "{rotation:?}: {got:?}");
+            assert_eq!(fresh, copied[2] * copied[3], "{rotation:?}: {got:?}");
         }
     }
 
