@@ -41,6 +41,8 @@ const MIN_EDIT_W: f32 = 850.0;
 const GROUP_GAP: f32 = 16.0;
 /// Snip zoom change per Ctrl+Plus / Ctrl+Minus press.
 const ZOOM_STEP: f32 = 1.25;
+/// Empty space kept around the snip inside the scrolling canvas, in points.
+const CANVAS_MARGIN: Vec2 = vec2(32.0, 32.0);
 const DIM: Color32 = Color32::from_black_alpha(120);
 /// Time for the window's hide animation to finish before the screen is copied.
 const HIDE_SETTLE: Duration = Duration::from_millis(250);
@@ -1019,17 +1021,27 @@ impl App {
         let px_size = vec2(doc.size()[0] as f32, doc.size()[1] as f32);
         let natural = px_size / ppp;
         let view = ui.available_size();
-        let fit = ((view - vec2(32.0, 32.0)) / natural).min_elem().clamp(0.02, 1.0);
+        let fit = ((view - CANVAS_MARGIN) / natural).min_elem().clamp(0.02, 1.0);
         let wheel_zoom = if ui.rect_contains_pointer(ui.max_rect()) { ui.input(|i| i.zoom_delta()) } else { 1.0 };
         let zoom_delta = wheel_zoom * std::mem::replace(&mut self.key_zoom, 1.0);
+        let old_zoom = self.zoom.unwrap_or(fit);
         if zoom_delta != 1.0 {
-            self.zoom = Some((self.zoom.unwrap_or(fit) * zoom_delta).clamp(0.05, 8.0));
+            self.zoom = Some((old_zoom * zoom_delta).clamp(0.05, 8.0));
         }
         let zoom = self.zoom.unwrap_or(fit);
         let shown = natural * zoom;
 
-        egui::ScrollArea::both().auto_shrink(false).show(ui, |ui| {
-            let area = shown + vec2(32.0, 32.0);
+        let view_rect = ui.available_rect_before_wrap();
+        let mut scroll = egui::ScrollArea::both().id_salt(SCROLL_ID).auto_shrink(false);
+        if zoom != old_zoom {
+            // Wheel zoom stays on the pointer, keyboard zoom on the middle of the view.
+            let pointer = if wheel_zoom != 1.0 { ui.input(|i| i.pointer.hover_pos()) } else { None };
+            let anchor = pointer.map_or(view / 2.0, |p| p - view_rect.min);
+            scroll = scroll.scroll_offset(anchored_offset(scroll_offset(ui), anchor, natural * old_zoom, shown, view));
+        }
+
+        scroll.show(ui, |ui| {
+            let area = shown + CANVAS_MARGIN;
             let (outer, resp) = ui.allocate_exact_size(area.max(view), Sense::click_and_drag());
             let img_rect = Rect::from_center_size(outer.center(), shown);
             let k = px_size.x / img_rect.width(); // image pixels per point
@@ -1130,6 +1142,7 @@ impl App {
                 }
             }
         });
+        zoom_badge(ui.painter(), view_rect, zoom);
     }
 
     fn picker_ui(&mut self, ui: &mut egui::Ui) {
@@ -1795,6 +1808,36 @@ impl PopupClickGuard {
     }
 }
 
+const SCROLL_ID: &str = "snip_scroll";
+
+/// Where the canvas's scroll area is scrolled to, as of its last frame. Call from the `Ui` that holds it.
+fn scroll_offset(ui: &egui::Ui) -> Vec2 {
+    let id = ui.make_persistent_id(egui::IdSalt::new(SCROLL_ID));
+    egui::scroll_area::State::load(ui.ctx(), id).map_or(Vec2::ZERO, |s| s.clamped_offset())
+}
+
+/// Scroll offset that keeps the spot under `anchor` (relative to the view's corner) where it was when
+/// the snip is redrawn at `new_shown` instead of `old_shown`. The snip is centred in scrolling content
+/// that is its size plus `CANVAS_MARGIN`, or the whole view if that is larger. All values in points.
+fn anchored_offset(offset: Vec2, anchor: Vec2, old_shown: Vec2, new_shown: Vec2, view: Vec2) -> Vec2 {
+    let snip_corner = |shown: Vec2| ((shown + CANVAS_MARGIN).max(view) - shown) / 2.0;
+    let on_snip = (offset + anchor - snip_corner(old_shown)) / old_shown;
+    (snip_corner(new_shown) + on_snip * new_shown - anchor).max(Vec2::ZERO)
+}
+
+fn zoom_label(zoom: f32) -> String {
+    // Zoom 1.0 is one screen pixel per snip pixel.
+    format!("{:.0}%", zoom * 100.0)
+}
+
+/// Current zoom in the bottom-right corner of the canvas, quiet enough to ignore.
+fn zoom_badge(painter: &egui::Painter, view: Rect, zoom: f32) {
+    let galley = painter.layout_no_wrap(zoom_label(zoom), FontId::proportional(11.0), ICON_OFF);
+    let rect = Rect::from_min_size(view.right_bottom() - galley.size() - vec2(20.0, 16.0), galley.size()).expand2(vec2(6.0, 2.0));
+    painter.rect_filled(rect, 4.0, TOOLBAR_BG.gamma_multiply(0.85));
+    painter.galley(rect.min + vec2(6.0, 2.0), galley, ICON_OFF);
+}
+
 /// Undoes or redoes one step. The pending crop box is in pixels of the image it was drawn on,
 /// and the restored image can be a different size, so the box is dropped rather than applied to it.
 fn step_history(doc: &mut Doc, crop: &mut Option<(Pos2, Pos2)>, redo: bool) {
@@ -2039,6 +2082,76 @@ mod tests {
         step_history(&mut doc, &mut crop, true);
         assert_eq!(doc.size(), [50, 40], "redo re-crops");
         assert_eq!(crop, None, "a box drawn on the large image would fall outside the small one");
+    }
+
+    #[test]
+    fn anchored_offset_keeps_the_anchor_on_the_same_spot_of_the_snip() {
+        let view = vec2(400.0, 300.0);
+        let (old, new) = (vec2(800.0, 600.0), vec2(1000.0, 750.0));
+        // Anchor at the view centre with the snip scrolled to (150, 120): that spot is 40% across, 50% down... recompute from the definition.
+        let (offset, anchor) = (vec2(150.0, 120.0), vec2(200.0, 150.0));
+        let got = anchored_offset(offset, anchor, old, new, view);
+        // The snip's corner sits at 16 in content space at both sizes (800+32 vs 1000+32 wide), so only the
+        // scale about the anchor matters: new = (offset + anchor - 16) * 1.25 + 16 - anchor.
+        assert_eq!(got, vec2((150.0 + 200.0 - 16.0) * 1.25 + 16.0 - 200.0, (120.0 + 150.0 - 16.0) * 1.25 + 16.0 - 150.0));
+    }
+
+    #[test]
+    fn anchored_offset_never_goes_negative_and_handles_a_snip_smaller_than_the_view() {
+        let view = vec2(400.0, 300.0);
+        // Zooming out about the far corner of the view would ask for a negative offset.
+        let off = anchored_offset(Vec2::ZERO, view - vec2(10.0, 10.0), vec2(1000.0, 800.0), vec2(200.0, 150.0), view);
+        assert_eq!(off, Vec2::ZERO);
+        // A snip that fits is centred, so growing it about the view centre keeps the centre.
+        let off = anchored_offset(Vec2::ZERO, view / 2.0, vec2(100.0, 100.0), vec2(200.0, 200.0), view);
+        assert_eq!(off, Vec2::ZERO);
+    }
+
+    /// Runs the canvas's scroll-area layout for one frame (viewport 400x300), optionally forcing the offset, and returns the offset it ends with.
+    fn scroll_frame(ctx: &egui::Context, shown: Vec2, force: Option<Vec2>) -> Vec2 {
+        let view = vec2(400.0, 300.0);
+        let input = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, view)), ..Default::default() };
+        let mut offset = Vec2::ZERO;
+        let mut out = ctx.run_ui(input, |ui| {
+            egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| {
+                let mut area = egui::ScrollArea::both().id_salt(SCROLL_ID).auto_shrink(false);
+                if let Some(f) = force {
+                    area = area.scroll_offset(f);
+                }
+                area.show(ui, |ui| {
+                    ui.allocate_exact_size((shown + CANVAS_MARGIN).max(view), Sense::click_and_drag());
+                });
+                offset = scroll_offset(ui);
+            });
+        });
+        out.textures_delta.clear();
+        offset
+    }
+
+    #[test]
+    fn zooming_through_the_scroll_area_leaves_the_anchored_spot_in_place() {
+        let (view, anchor) = (vec2(400.0, 300.0), vec2(120.0, 90.0));
+        let sizes = [vec2(800.0, 600.0), vec2(1000.0, 750.0), vec2(500.0, 375.0), vec2(200.0, 150.0)];
+        // The last pair grows a snip that fit the view, whose scroll range egui last measured as empty.
+        for (old, new) in [(sizes[0], sizes[1]), (sizes[1], sizes[2]), (sizes[0], sizes[2]), (sizes[3], sizes[1])] {
+            let ctx = egui::Context::default();
+            // Let egui learn the content size before scrolling, as it has by the time the user zooms.
+            for _ in 0..3 {
+                scroll_frame(&ctx, old, None);
+            }
+            scroll_frame(&ctx, old, Some(vec2(150.0, 120.0)));
+            let start = scroll_frame(&ctx, old, None);
+            let want = anchored_offset(start, anchor, old, new, view);
+            let got = scroll_frame(&ctx, new, Some(want));
+            assert!((got - want).length() < 0.5, "egui moved the offset from {want:?} to {got:?} zooming {old:?} -> {new:?}");
+        }
+    }
+
+    #[test]
+    fn zoom_label_is_a_whole_percent() {
+        assert_eq!(zoom_label(1.0), "100%");
+        assert_eq!(zoom_label(0.625), "62%");
+        assert_eq!(zoom_label(8.0), "800%");
     }
 
     /// Frames of a press-move-release on a fresh widget; returns whether `released_on` fired on any of them.
