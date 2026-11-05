@@ -1179,6 +1179,7 @@ impl App {
 
     fn picker_ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
+        self.popup_guard.begin_frame(&ctx);
         let rect = ui.max_rect();
         let video = self.mode == Mode::Video;
         let Stage::Picking(pk) = &mut self.stage else { return };
@@ -1201,6 +1202,7 @@ impl App {
         // An area in image pixels: cropped for a photo, recorded for a video.
         let mut picked: Option<Rect> = None;
         let mut whole_monitor = false;
+        let mut window_click = false;
         let mut cancel = take_escape(&ctx);
 
         match self.shape {
@@ -1247,6 +1249,7 @@ impl App {
                 painter.rect_stroke(shown.shrink(1.0), 0.0, (3.0, ACCENT), StrokeKind::Inside);
                 if released_on(&ctx, &resp) && target.width() >= 2.0 && target.height() >= 2.0 {
                     picked = Some(target);
+                    window_click = true;
                 }
             }
             Shape_::Freeform => {
@@ -1316,6 +1319,11 @@ impl App {
                         });
                     });
             });
+
+        // The shape menu closes while the bar above is drawn, after the pick was read, so the guard can only be asked now.
+        if window_click && self.popup_guard.swallows(&ctx, true) {
+            (record_area, result) = (None, None);
+        }
 
         if cancel {
             self.cancel_pick(&ctx);
@@ -2428,6 +2436,52 @@ mod tests {
         tx.send(()).unwrap();
         assert!(drain(&rx));
         assert!(!drain(&rx), "a press must be reported once");
+    }
+
+    /// One frame in the picker's order: the full-screen response is read first, the shape menu shown after it.
+    /// Returns whether a Window-mode pick survives the guard.
+    fn picker_frame(ctx: &egui::Context, guard: &mut PopupClickGuard, events: Vec<Event>, open: bool) -> bool {
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(800.0, 600.0))),
+            events,
+            ..Default::default()
+        };
+        let mut picks = false;
+        let mut out = ctx.run_ui(input, |ui| {
+            guard.begin_frame(ui.ctx());
+            let rect = ui.max_rect();
+            let resp = ui.interact(rect, ui.make_persistent_id(egui::IdSalt::new("picker")), Sense::click_and_drag());
+            let wants = released_on(ui.ctx(), &resp);
+            egui::Area::new(ui.make_persistent_id(egui::IdSalt::new("bar"))).fixed_pos(pos2(10.0, 10.0)).show(ui.ctx(), |ui| {
+                let menu = ui.button("shape");
+                egui::Popup::from_response(&menu)
+                    .open_memory(open.then_some(egui::SetOpenCommand::Bool(true)))
+                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                    .show(|ui| ui.label("options"));
+            });
+            picks = wants && !guard.swallows(ui.ctx(), true);
+        });
+        out.textures_delta.clear();
+        picks
+    }
+
+    #[test]
+    fn click_that_closes_the_shape_menu_does_not_pick_a_window() {
+        let (ctx, mut guard) = (egui::Context::default(), PopupClickGuard::default());
+        for _ in 0..3 {
+            picker_frame(&ctx, &mut guard, vec![], false);
+        }
+        picker_frame(&ctx, &mut guard, vec![], true);
+        picker_frame(&ctx, &mut guard, vec![], false);
+        assert!(egui::Popup::is_any_open(&ctx), "menu should be open before the click");
+        let at = pos2(400.0, 400.0);
+        let btn = |pressed| Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
+        picker_frame(&ctx, &mut guard, vec![Event::PointerMoved(at)], false);
+        picker_frame(&ctx, &mut guard, vec![btn(true)], false);
+        assert!(!picker_frame(&ctx, &mut guard, vec![btn(false)], false), "the dismissing click must not pick");
+        assert!(!egui::Popup::is_any_open(&ctx), "click outside should have closed the menu");
+        picker_frame(&ctx, &mut guard, vec![btn(true)], false);
+        assert!(picker_frame(&ctx, &mut guard, vec![btn(false)], false), "the next click picks as usual");
     }
 
     #[test]
