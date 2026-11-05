@@ -1164,6 +1164,11 @@ impl App {
                     bar.notes = notes;
                 }
             }
+            recorder::Event::Note(note) => {
+                if let Stage::Recording(bar) = &mut self.stage {
+                    bar.notes.push(note);
+                }
+            }
             recorder::Event::Done(result) => {
                 let notes = match std::mem::replace(&mut self.stage, Stage::Idle) {
                     Stage::Recording(bar) => bar.notes,

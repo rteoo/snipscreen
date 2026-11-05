@@ -60,6 +60,8 @@ pub struct Finished {
 pub enum Event {
     /// Recording is running; `notes` lists sound sources that couldn't start.
     Started { notes: Vec<String> },
+    /// A sound source stopped mid-recording; the rest carries on.
+    Note(String),
     Done(Result<Finished, String>),
 }
 
@@ -118,6 +120,7 @@ fn record(
         return Err("the area is too small to record".into());
     }
     let mut captures = Vec::new();
+    let mut names = Vec::new();
     let mut notes = Vec::new();
     let wanted = [
         s.system_sound.then_some((Source::System, "the computer's sound")),
@@ -125,7 +128,10 @@ fn record(
     ];
     for (source, name) in wanted.into_iter().flatten() {
         match Capture::start(source, clock) {
-            Ok(c) => captures.push(c),
+            Ok(c) => {
+                captures.push(c);
+                names.push(name);
+            }
             Err(e) => notes.push(format!("Recording without {name} ({e})")),
         }
     }
@@ -164,6 +170,11 @@ fn record(
         }
         audio::mix(&captures, &mut mixed);
         enc.audio(&mixed).map_err(werr)?;
+        for (c, name) in captures.iter().zip(&names) {
+            if let Some(e) = c.take_failure() {
+                on_event(Event::Note(format!("Lost {name} ({e}); recording continues without it")));
+            }
+        }
     }
     let seconds = clock.elapsed().as_secs_f64();
     drop(captures);
