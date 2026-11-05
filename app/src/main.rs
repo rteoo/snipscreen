@@ -1198,7 +1198,7 @@ impl App {
                 let shown = Rect::from_min_max(to_pt(target.min), to_pt(target.max));
                 dim_outside(painter, rect, shown);
                 painter.rect_stroke(shown.shrink(1.0), 0.0, (3.0, ACCENT), StrokeKind::Inside);
-                if resp.clicked() && target.width() >= 2.0 && target.height() >= 2.0 {
+                if released_on(&ctx, &resp) && target.width() >= 2.0 && target.height() >= 2.0 {
                     picked = Some(target);
                 }
             }
@@ -1793,6 +1793,13 @@ impl PopupClickGuard {
     }
 }
 
+/// True on the frame the primary button comes up over `resp`. egui reports a press held longer than
+/// ~0.8 s or moved more than ~6 pt as a drag, not a click, and a still, slow press produces no frame
+/// that marks it a drag, so `clicked` and `drag_stopped` alone miss some releases.
+fn released_on(ctx: &egui::Context, resp: &egui::Response) -> bool {
+    resp.clicked() || resp.drag_stopped() || (ctx.input(|i| i.pointer.primary_released()) && resp.contains_pointer())
+}
+
 /// Left edge of the markup group: centred in the toolbar when it fits clear of the capture and
 /// output groups, otherwise pushed right up against the capture group.
 fn markup_x(center: f32, width: f32, left_end: f32, right_start: f32) -> f32 {
@@ -1988,6 +1995,50 @@ mod tests {
         assert_eq!(countdown_secs(ms(2000)), Some(2));
         assert_eq!(countdown_secs(ms(1)), Some(1));
         assert_eq!(countdown_secs(Duration::ZERO), None);
+    }
+
+    /// Frames of a press-move-release on a fresh widget; returns whether `released_on` fired on any of them.
+    fn release_detected(hold_secs: f64, wobble: f32) -> bool {
+        let ctx = egui::Context::default();
+        let (from, to) = (pos2(100.0, 100.0), pos2(100.0 + wobble, 100.0));
+        let btn = |pos, pressed| Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
+        let frames = [
+            (0.0, vec![Event::PointerMoved(from)]),
+            (0.1, vec![btn(from, true)]),
+            (0.1 + hold_secs / 2.0, vec![Event::PointerMoved(to)]),
+            (0.1 + hold_secs, vec![btn(to, false)]),
+            (0.2 + hold_secs, vec![]),
+        ];
+        let mut seen = false;
+        for (time, events) in frames {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(800.0, 600.0))),
+                time: Some(time),
+                events,
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(input, |ui| {
+                let resp = ui.interact(ui.max_rect(), ui.make_persistent_id("picker"), Sense::click_and_drag());
+                seen |= released_on(ui.ctx(), &resp);
+            });
+            out.textures_delta.clear();
+        }
+        seen
+    }
+
+    #[test]
+    fn window_pick_registers_on_a_quick_click() {
+        assert!(release_detected(0.1, 0.0));
+    }
+
+    #[test]
+    fn window_pick_registers_on_a_slow_press() {
+        assert!(release_detected(1.5, 0.0), "held past the click duration");
+    }
+
+    #[test]
+    fn window_pick_registers_on_a_wobbly_press() {
+        assert!(release_detected(0.2, 20.0), "moved past the click distance");
     }
 
     /// Keys seen by `read_keys` in one frame after pressing `key` with `mods`.
