@@ -13,7 +13,7 @@ use windows::Win32::System::Com::StructuredStorage::PropVariantToStringAlloc;
 use windows::Win32::System::Com::{CoTaskMemFree, STGM_READ};
 use windows::Win32::Media::Audio::{
     eCapture, eConsole, eRender, IAudioCaptureClient, IAudioClient, IMMDevice, IMMDeviceEnumerator, DEVICE_STATE_ACTIVE,
-    MMDeviceEnumerator, AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_SHAREMODE_SHARED,
+    MMDeviceEnumerator, AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_E_DEVICE_INVALIDATED, AUDCLNT_SHAREMODE_SHARED,
     AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM, AUDCLNT_STREAMFLAGS_LOOPBACK,
     AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY, WAVEFORMATEX,
 };
@@ -76,6 +76,8 @@ unsafe fn device_id(d: &IMMDevice) -> Option<String> {
 pub struct Capture {
     pub samples: Arc<Mutex<VecDeque<f32>>>,
     stop: Arc<AtomicBool>,
+    /// Why the device stopped mid-recording, until the recorder takes it.
+    failure: Arc<Mutex<Option<String>>>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -84,9 +86,10 @@ impl Capture {
     pub fn start(source: Source, clock: Instant) -> Result<Self, String> {
         let samples = Arc::new(Mutex::new(VecDeque::new()));
         let stop = Arc::new(AtomicBool::new(false));
+        let failure = Arc::new(Mutex::new(None));
         let (ready_tx, ready_rx) = mpsc::channel();
         let thread = {
-            let (samples, stop) = (samples.clone(), stop.clone());
+            let (samples, stop, failure) = (samples.clone(), stop.clone(), failure.clone());
             std::thread::spawn(move || {
                 let client = match open(&source) {
                     Ok(c) => {
@@ -98,8 +101,16 @@ impl Capture {
                         return;
                     }
                 };
-                if let Err(e) = pump(&source, &client, &samples, &stop, clock) {
-                    eprintln!("{source:?} audio stopped: {e}");
+                let mut produced = 0;
+                if let Err(e) = pump(&source, &client, &samples, &stop, clock, &mut produced) {
+                    let why = if e.code() == AUDCLNT_E_DEVICE_INVALIDATED { "it was disconnected".to_string() } else { e.to_string() };
+                    *failure.lock().unwrap() = Some(why);
+                    // The other source is mixed only as far as this one has
+                    // samples, so keep this one's timeline moving with silence.
+                    while !stop.load(Ordering::Relaxed) {
+                        std::thread::sleep(Duration::from_millis(10));
+                        keep_time(&samples, &mut produced, clock.elapsed());
+                    }
                 }
                 unsafe {
                     let _ = client.0.Stop();
@@ -109,7 +120,12 @@ impl Capture {
         ready_rx
             .recv()
             .map_err(|_| "the sound device thread ended".to_string())??;
-        Ok(Self { samples, stop, thread: Some(thread) })
+        Ok(Self { samples, stop, failure, thread: Some(thread) })
+    }
+
+    /// Why the device stopped mid-recording; reported once.
+    pub fn take_failure(&self) -> Option<String> {
+        self.failure.lock().unwrap().take()
     }
 }
 
@@ -172,8 +188,8 @@ fn pump(
     samples: &Mutex<VecDeque<f32>>,
     stop: &AtomicBool,
     clock: Instant,
+    produced: &mut u64,
 ) -> windows::core::Result<()> {
-    let mut produced: u64 = 0;
     while !stop.load(Ordering::Relaxed) {
         std::thread::sleep(Duration::from_millis(10));
         unsafe {
@@ -189,31 +205,42 @@ fn pump(
                     q.extend(std::slice::from_raw_parts(data as *const f32, n));
                 }
                 drop(q);
-                produced += frames as u64;
+                *produced += frames as u64;
                 client.1.ReleaseBuffer(frames)?;
             }
         }
         // Loopback sends nothing while the computer is silent; fill the gap
         // so the sound stays in step with the picture.
         if *source == Source::System {
-            let due = (clock.elapsed().as_secs_f64() * RATE as f64) as u64;
-            let slack = RATE as u64 / 10;
-            if due > produced + slack {
-                let missing = due - produced - slack / 2;
-                samples.lock().unwrap().extend(std::iter::repeat_n(0.0, missing as usize * CHANNELS));
-                produced += missing;
-            }
+            keep_time(samples, produced, clock.elapsed());
         }
     }
     Ok(())
 }
 
+/// Pads `samples` with silence once it falls more than 100 ms behind
+/// `elapsed`, so a source that sends nothing still keeps the recording's time.
+fn keep_time(samples: &Mutex<VecDeque<f32>>, produced: &mut u64, elapsed: Duration) {
+    let due = (elapsed.as_secs_f64() * RATE as f64) as u64;
+    let slack = RATE as u64 / 10;
+    if due > *produced + slack {
+        let missing = due - *produced - slack / 2;
+        samples.lock().unwrap().extend(std::iter::repeat_n(0.0, missing as usize * CHANNELS));
+        *produced += missing;
+    }
+}
+
 /// Takes what every capture has in common and adds it together.
 pub fn mix(captures: &[Capture], out: &mut Vec<f32>) {
+    let queues: Vec<&Mutex<VecDeque<f32>>> = captures.iter().map(|c| &*c.samples).collect();
+    mix_queues(&queues, out);
+}
+
+fn mix_queues(queues: &[&Mutex<VecDeque<f32>>], out: &mut Vec<f32>) {
     out.clear();
-    let ready = captures
+    let ready = queues
         .iter()
-        .map(|c| c.samples.lock().unwrap().len())
+        .map(|q| q.lock().unwrap().len())
         .min()
         .unwrap_or(0);
     let ready = ready - ready % CHANNELS;
@@ -221,8 +248,8 @@ pub fn mix(captures: &[Capture], out: &mut Vec<f32>) {
         return;
     }
     out.resize(ready, 0.0);
-    for c in captures {
-        let mut q = c.samples.lock().unwrap();
+    for q in queues {
+        let mut q = q.lock().unwrap();
         for (o, s) in out.iter_mut().zip(q.drain(..ready)) {
             *o += s;
         }
@@ -232,6 +259,27 @@ pub fn mix(captures: &[Capture], out: &mut Vec<f32>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A device that died stops sending; its silence fill must keep mixing
+    /// going for the other source and stop the other queue from growing.
+    #[test]
+    fn dead_source_does_not_stall_the_mix() {
+        let (live, dead) = (Mutex::new(VecDeque::new()), Mutex::new(VecDeque::new()));
+        let mut dead_produced = 0;
+        let tick = RATE as usize / 100; // 10 ms of frames
+        let mut out = Vec::new();
+        let mut mixed = 0;
+        for i in 1..=1000 {
+            // 10 s of recording: the live source keeps delivering, the dead one only gets padded.
+            live.lock().unwrap().extend(std::iter::repeat_n(0.5, tick * CHANNELS));
+            keep_time(&dead, &mut dead_produced, Duration::from_millis(i * 10));
+            mix_queues(&[&live, &dead], &mut out);
+            mixed += out.len();
+            assert!(out.iter().all(|&s| s == 0.5));
+            assert!(live.lock().unwrap().len() <= (RATE as usize / 10 + tick) * CHANNELS, "live queue grew at tick {i}");
+        }
+        assert!(mixed >= (RATE as usize * 10 - RATE as usize / 10) * CHANNELS, "only {mixed} samples mixed");
+    }
 
     /// Needs sound devices; run with `cargo test -- --ignored`.
     #[test]

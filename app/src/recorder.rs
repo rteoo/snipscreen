@@ -11,8 +11,9 @@ use std::time::{Duration, Instant};
 
 use eframe::egui::{Color32, ColorImage};
 use windows::core::HSTRING;
+use windows::core::HRESULT;
 use windows::core::Interface;
-use windows::Win32::Foundation::HMODULE;
+use windows::Win32::Foundation::{E_ACCESSDENIED, HMODULE};
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
 use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, D3D11_BOX,
@@ -22,7 +23,8 @@ use windows::Win32::Graphics::Direct3D11::{
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, IDXGIFactory1, IDXGIOutput1, IDXGIOutputDuplication,
-    DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO,
+    DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_NOT_CURRENTLY_AVAILABLE, DXGI_ERROR_SESSION_DISCONNECTED,
+    DXGI_ERROR_UNSUPPORTED, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO,
 };
 use windows::Win32::Media::MediaFoundation::*;
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
@@ -55,11 +57,16 @@ pub struct Finished {
     pub seconds: f64,
     pub size: [u32; 2],
     pub first_frame: Option<ColorImage>,
+    /// Why the recording ended before the user stopped it; the video up to
+    /// that point was still saved.
+    pub stopped_early: Option<String>,
 }
 
 pub enum Event {
     /// Recording is running; `notes` lists sound sources that couldn't start.
     Started { notes: Vec<String> },
+    /// A sound source stopped mid-recording; the rest carries on.
+    Note(String),
     Done(Result<Finished, String>),
 }
 
@@ -112,12 +119,13 @@ fn record(
     on_event: &impl Fn(Event),
 ) -> Result<Finished, String> {
     let mut grab = Grabber::new(fit_area(s.area))
-        .map_err(|e| format!("couldn't read the screen: {}", e.message()))?;
+        .map_err(|e| format!("couldn't read the screen: {}", describe(&e)))?;
     let [_, _, w, h] = grab.area;
     if w < 32 || h < 32 {
         return Err("the area is too small to record".into());
     }
     let mut captures = Vec::new();
+    let mut names = Vec::new();
     let mut notes = Vec::new();
     let wanted = [
         s.system_sound.then_some((Source::System, "the computer's sound")),
@@ -125,7 +133,10 @@ fn record(
     ];
     for (source, name) in wanted.into_iter().flatten() {
         match Capture::start(source, clock) {
-            Ok(c) => captures.push(c),
+            Ok(c) => {
+                captures.push(c);
+                names.push(name);
+            }
             Err(e) => notes.push(format!("Recording without {name} ({e})")),
         }
     }
@@ -133,7 +144,7 @@ fn record(
         std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     }
     let mut enc = Encoder::new(&s.path, w as u32, h as u32, !captures.is_empty())
-        .map_err(|e| format!("couldn't start the video encoder: {}", e.message()))?;
+        .map_err(|e| format!("couldn't start the video encoder: {}", describe(&e)))?;
     on_event(Event::Started { notes });
 
     let frame_time = Duration::from_secs(1) / FPS;
@@ -142,8 +153,8 @@ fn record(
     let mut first_frame = None;
     let mut next = clock;
     let mut last_video = -1i64;
-    let werr = |e: windows::core::Error| format!("couldn't write the video: {}", e.message());
-    while !stop.load(Ordering::Relaxed) {
+    let werr = |e: windows::core::Error| format!("couldn't write the video: {}", describe(&e));
+    let stopped_early = pump(&mut enc, stop, |enc| {
         let now = Instant::now();
         if now < next {
             std::thread::sleep(next - now);
@@ -152,24 +163,71 @@ fn record(
         while next <= Instant::now() {
             next += frame_time;
         }
-        let bgra = grab.frame().map_err(|e| format!("couldn't read the screen: {}", e.message()))?;
+        let bgra = grab.frame().map_err(|e| format!("couldn't read the screen: {}", describe(&e)))?;
         if first_frame.is_none() {
             first_frame = Some(to_color_image(bgra, w as usize, h as usize));
         }
         bgra_to_nv12(bgra, w as usize, h as usize, &mut nv12);
         let t = (clock.elapsed().as_secs_f64() * TICKS as f64) as i64;
-        if t > last_video {
+        let wrote = t > last_video;
+        if wrote {
             enc.video(&nv12, t).map_err(werr)?;
             last_video = t;
         }
         audio::mix(&captures, &mut mixed);
         enc.audio(&mixed).map_err(werr)?;
-    }
+        for (c, name) in captures.iter().zip(&names) {
+            if let Some(e) = c.take_failure() {
+                on_event(Event::Note(format!("Lost {name} ({e}); recording continues without it")));
+            }
+        }
+        Ok(wrote)
+    })?;
     let seconds = clock.elapsed().as_secs_f64();
     drop(captures);
     enc.finish().map_err(werr)?;
-    Ok(Finished { path: s.path.clone(), seconds, size: [w as u32, h as u32], first_frame })
+    Ok(Finished { path: s.path.clone(), seconds, size: [w as u32, h as u32], first_frame, stopped_early })
 }
+
+/// Runs `step` (which reports whether it wrote a video frame) until `stop` is
+/// set or it fails. A failure after the first video frame ends the recording
+/// early rather than losing it: the reason comes back and the caller still
+/// finalizes the file. With no frame written there is nothing worth keeping.
+fn pump(
+    enc: &mut Encoder,
+    stop: &AtomicBool,
+    mut step: impl FnMut(&mut Encoder) -> Result<bool, String>,
+) -> Result<Option<String>, String> {
+    let mut frames = 0u64;
+    while !stop.load(Ordering::Relaxed) {
+        match step(enc) {
+            Ok(wrote) => frames += wrote as u64,
+            Err(e) if frames == 0 => return Err(e),
+            Err(e) => return Ok(Some(e)),
+        }
+    }
+    if frames == 0 {
+        return Err("nothing was recorded".into());
+    }
+    Ok(None)
+}
+
+/// `Error::empty()` reads as "The operation completed successfully." and
+/// some codes carry no text; never show either to the user.
+fn describe(e: &windows::core::Error) -> String {
+    let code = e.code().0;
+    if code == 0 {
+        return "unknown error".into();
+    }
+    let text = e.message();
+    let text = text.trim();
+    if text.is_empty() { format!("error {:#010x}", code as u32) } else { text.to_string() }
+}
+
+/// Wait between attempts to re-open a lost desktop duplication: short at
+/// first so a dismissed UAC prompt resumes quickly, then capped.
+const REOPEN_FIRST: Duration = Duration::from_millis(100);
+const REOPEN_MAX: Duration = Duration::from_secs(1);
 
 /// Reads one monitor through DXGI Desktop Duplication (GPU copy, no stalls
 /// from other windows redrawing) and draws the mouse pointer on top.
@@ -177,7 +235,12 @@ struct Grabber {
     device: ID3D11Device,
     context: ID3D11DeviceContext,
     output: IDXGIOutput1,
-    dup: IDXGIOutputDuplication,
+    /// `None` while the desktop is out of reach (UAC, lock screen, mode
+    /// change); the last image keeps being recorded until it comes back.
+    dup: Option<IDXGIOutputDuplication>,
+    /// Next attempt to re-open a lost duplication, and the wait after that.
+    reopen_at: Instant,
+    reopen_wait: Duration,
     staging: ID3D11Texture2D,
     /// Area relative to the monitor's top-left: x, y, w, h.
     local: [i32; 4],
@@ -275,7 +338,9 @@ impl Grabber {
                 device,
                 context,
                 output,
-                dup,
+                dup: Some(dup),
+                reopen_at: Instant::now(),
+                reopen_wait: REOPEN_FIRST,
                 staging,
                 local,
                 area,
@@ -290,19 +355,20 @@ impl Grabber {
     }
 
     /// Pulls a new screen image if one is ready. Waits up to `wait_ms` for it.
+    /// A lost desktop is not an error: the last image stays and re-opening is
+    /// retried on later calls.
     fn refresh(&mut self, wait_ms: u32) -> windows::core::Result<()> {
         unsafe {
+            let Some(dup) = &self.dup else { return self.reopen() };
             let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
             let mut resource = None;
-            match self.dup.AcquireNextFrame(wait_ms, &mut info, &mut resource) {
-                Ok(()) => {}
-                Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => return Ok(()),
-                Err(e) if e.code() == DXGI_ERROR_ACCESS_LOST => {
-                    // Resolution change, full-screen app, lock screen: start over.
-                    self.dup = self.output.DuplicateOutput(&self.device)?;
-                    return Ok(());
-                }
-                Err(e) => return Err(e),
+            if let Err(e) = dup.AcquireNextFrame(wait_ms, &mut info, &mut resource) {
+                return match e.code() {
+                    DXGI_ERROR_WAIT_TIMEOUT => Ok(()),
+                    // Resolution change, full-screen app, UAC, lock screen.
+                    DXGI_ERROR_ACCESS_LOST => self.lost(),
+                    _ => Err(e),
+                };
             }
             let copied = (|| {
                 // Pointer-only updates carry no new desktop image.
@@ -310,16 +376,17 @@ impl Grabber {
                     return Ok(());
                 }
                 let texture: ID3D11Texture2D = resource.ok_or_else(windows::core::Error::empty)?.cast()?;
+                let mut desktop = D3D11_TEXTURE2D_DESC::default();
+                texture.GetDesc(&mut desktop);
+                // ceiling: after a mode change the area keeps its old monitor-relative
+                // position and the encoder its size; a smaller, moved or rotated desktop
+                // records the overlapping part (the rest keeps the last image). Re-read
+                // DXGI_OUTDUPL_DESC and remap/scale if people record across display changes.
                 let [x, y, w, h] = self.local;
-                let src = D3D11_BOX {
-                    left: x as u32,
-                    top: y as u32,
-                    front: 0,
-                    right: (x + w) as u32,
-                    bottom: (y + h) as u32,
-                    back: 1,
-                };
-                self.context.CopySubresourceRegion(&self.staging, 0, 0, 0, 0, &texture, 0, Some(&src));
+                if let Some(src) = clip_box(self.local, [desktop.Width, desktop.Height]) {
+                    let (dx, dy) = ((src.left as i32 - x) as u32, (src.top as i32 - y) as u32);
+                    self.context.CopySubresourceRegion(&self.staging, 0, dx, dy, 0, &texture, 0, Some(&src));
+                }
                 let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
                 self.context.Map(&self.staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))?;
                 let row = (w * 4) as usize;
@@ -331,8 +398,42 @@ impl Grabber {
                 self.have_frame = true;
                 Ok(())
             })();
-            self.dup.ReleaseFrame()?;
+            if let Err(e) = dup.ReleaseFrame() {
+                if e.code() != DXGI_ERROR_ACCESS_LOST {
+                    return Err(e);
+                }
+                self.lost()?;
+            }
             copied
+        }
+    }
+
+    /// The Desktop Duplication docs require releasing the old duplication
+    /// before creating a new one, or `DuplicateOutput` fails.
+    fn lost(&mut self) -> windows::core::Result<()> {
+        self.dup = None;
+        self.reopen_at = Instant::now();
+        self.reopen_wait = REOPEN_FIRST;
+        self.reopen()
+    }
+
+    /// Tries to duplicate the output again once its retry time has come.
+    fn reopen(&mut self) -> windows::core::Result<()> {
+        let now = Instant::now();
+        if now < self.reopen_at {
+            return Ok(());
+        }
+        match unsafe { self.output.DuplicateOutput(&self.device) } {
+            Ok(dup) => {
+                self.dup = Some(dup);
+                Ok(())
+            }
+            Err(e) if reopen_is_transient(e.code()) => {
+                self.reopen_at = now + self.reopen_wait;
+                self.reopen_wait = next_reopen_wait(self.reopen_wait);
+                Ok(())
+            }
+            Err(e) => Err(e),
         }
     }
 
@@ -371,6 +472,36 @@ impl Drop for Grabber {
             DeleteDC(self.mem);
         }
     }
+}
+
+/// `DuplicateOutput` failures that clear up by themselves: the secure desktop
+/// (UAC, lock screen) is up, the display is mid mode change or held by a
+/// full-screen app, the session is switched away, or the per-system limit of
+/// duplications is reached for now.
+// ceiling: DXGI_ERROR_DEVICE_REMOVED (GPU reset, driver update) still ends the
+// recording; recreating the device and staging texture would cover it if that shows up.
+fn reopen_is_transient(code: HRESULT) -> bool {
+    [E_ACCESSDENIED, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_UNSUPPORTED, DXGI_ERROR_NOT_CURRENTLY_AVAILABLE, DXGI_ERROR_SESSION_DISCONNECTED].contains(&code)
+}
+
+fn next_reopen_wait(wait: Duration) -> Duration {
+    (wait * 2).min(REOPEN_MAX)
+}
+
+/// The part of `local` (x, y, w, h) inside a desktop texture of `size`, as a
+/// copy box; `None` when they don't overlap.
+fn clip_box([x, y, w, h]: [i32; 4], [tw, th]: [u32; 2]) -> Option<D3D11_BOX> {
+    let (tw, th) = (tw as i64, th as i64);
+    let (left, right) = ((x as i64).clamp(0, tw), (x as i64 + w as i64).clamp(0, tw));
+    let (top, bottom) = ((y as i64).clamp(0, th), (y as i64 + h as i64).clamp(0, th));
+    (left < right && top < bottom).then_some(D3D11_BOX {
+        left: left as u32,
+        top: top as u32,
+        front: 0,
+        right: right as u32,
+        bottom: bottom as u32,
+        back: 1,
+    })
 }
 
 fn to_color_image(bgra: &[u8], w: usize, h: usize) -> ColorImage {
@@ -542,6 +673,59 @@ mod tests {
         assert_eq!(fit_area([5, 7, 1001, 9999]), [5, 7, 1000, 4096]);
     }
 
+    #[test]
+    fn lost_desktop_errors_are_retried_not_fatal() {
+        for code in [E_ACCESSDENIED, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_UNSUPPORTED, DXGI_ERROR_NOT_CURRENTLY_AVAILABLE, DXGI_ERROR_SESSION_DISCONNECTED] {
+            assert!(reopen_is_transient(code), "{code:?} should be retried");
+        }
+        use windows::Win32::Foundation::{E_INVALIDARG, E_OUTOFMEMORY};
+        use windows::Win32::Graphics::Dxgi::DXGI_ERROR_DEVICE_REMOVED;
+        for code in [E_INVALIDARG, E_OUTOFMEMORY, DXGI_ERROR_DEVICE_REMOVED] {
+            assert!(!reopen_is_transient(code), "{code:?} should end the recording");
+        }
+    }
+
+    #[test]
+    fn reopen_wait_doubles_up_to_a_cap() {
+        let mut wait = REOPEN_FIRST;
+        let mut seen = vec![wait];
+        for _ in 0..6 {
+            wait = next_reopen_wait(wait);
+            seen.push(wait);
+        }
+        let ms: Vec<u128> = seen.iter().map(|d| d.as_millis()).collect();
+        assert_eq!(ms, [100, 200, 400, 800, 1000, 1000, 1000]);
+    }
+
+    #[test]
+    fn copy_box_stays_inside_the_desktop() {
+        let b = |b: D3D11_BOX| [b.left, b.top, b.right, b.bottom];
+        // Unchanged desktop: the whole area.
+        assert_eq!(clip_box([100, 50, 200, 100], [1920, 1080]).map(b), Some([100, 50, 300, 150]));
+        // Desktop shrank under the area: only the overlap.
+        assert_eq!(clip_box([100, 50, 200, 100], [250, 120]).map(b), Some([100, 50, 250, 120]));
+        // Desktop shrank past the area entirely: nothing to copy.
+        assert_eq!(clip_box([1600, 900, 200, 100], [1280, 720]), None);
+        assert_eq!(clip_box([100, 50, 200, 100], [0, 0]), None);
+    }
+
+    /// Needs a desktop. Takes the path a lost duplication takes and checks
+    /// frames keep coming after re-opening.
+    #[test]
+    #[ignore]
+    fn reopens_after_lost_duplication() {
+        let (w, h) = (640, 480);
+        let mut g = Grabber::new([0, 0, w, h]).expect("grabber");
+        g.frame().expect("first frame");
+        // Why the old duplication must go first: a second one is refused while it lives.
+        assert!(unsafe { g.output.DuplicateOutput(&g.device) }.is_err());
+        g.lost().expect("re-open");
+        assert!(g.dup.is_some(), "duplication should be re-opened");
+        for _ in 0..3 {
+            assert_eq!(g.frame().expect("frame after re-open").len(), (w * h * 4) as usize);
+        }
+    }
+
     /// Writes a 2 s clip of moving bars with a tone, without touching the
     /// screen or sound devices.
     #[test]
@@ -591,6 +775,51 @@ mod tests {
         assert!(b > r + 100, "left half should be blue, got {:?}", at(60, 150));
         let (r, _, b) = at(260, 150);
         assert!(r > b + 100, "right half should be red, got {:?}", at(260, 150));
+    }
+
+    /// A failure partway through must still leave a playable MP4 holding the
+    /// frames written before it.
+    #[test]
+    fn error_midway_keeps_the_video() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("target").join("test-stopped-early.mp4");
+        let (w, h) = (320u32, 240u32);
+        let mut enc = Encoder::new(&path, w, h, false).expect("encoder");
+        let bgra: Vec<u8> = (0..w * h).flat_map(|_| [230, 80, 25, 255]).collect();
+        let mut nv12 = vec![0u8; (w * h * 3 / 2) as usize];
+        bgra_to_nv12(&bgra, w as usize, h as usize, &mut nv12);
+        let mut f = 0i64;
+        let stop = AtomicBool::new(false);
+        let reason = pump(&mut enc, &stop, |enc| {
+            if f == 10 {
+                return Err("couldn't read the screen: device removed".into());
+            }
+            enc.video(&nv12, f * TICKS / FPS as i64).map_err(|e| describe(&e))?;
+            f += 1;
+            Ok(true)
+        });
+        assert_eq!(reason, Ok(Some("couldn't read the screen: device removed".to_string())));
+        enc.finish().expect("finalize after the error");
+        let px = unsafe { first_frame_bgra(&path, h as usize) }.expect("decode");
+        let i = ((120 * w + 160) * 4) as usize;
+        let (r, b) = (px[i + 2] as i32, px[i] as i32);
+        assert!(b > r + 100, "frame should be blue, got r={r} b={b}");
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn error_before_any_frame_is_a_failure() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("target").join("test-no-frames.mp4");
+        let mut enc = Encoder::new(&path, 64, 64, false).expect("encoder");
+        let stop = AtomicBool::new(false);
+        assert_eq!(pump(&mut enc, &stop, |_| Err("boom".into())), Err("boom".to_string()));
+        assert_eq!(pump(&mut enc, &AtomicBool::new(true), |_| Ok(true)), Err("nothing was recorded".to_string()));
+        drop(enc);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn blank_windows_errors_still_say_something() {
+        assert_eq!(describe(&windows::core::Error::empty()), "unknown error");
     }
 
     unsafe fn first_frame_bgra(path: &Path, height: usize) -> windows::core::Result<Vec<u8>> {
