@@ -309,6 +309,10 @@ unsafe fn set_clipboard(format: u32, bytes: &[u8]) -> Result<(), String> {
         return Err("out of memory for the clipboard".into());
     }
     let dst = GlobalLock(mem) as *mut u8;
+    if dst.is_null() {
+        GlobalFree(mem);
+        return Err("couldn't lock clipboard memory".into());
+    }
     std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len());
     GlobalUnlock(mem);
     if SetClipboardData(format, mem).is_null() {
@@ -530,6 +534,14 @@ fn wide(s: &str) -> Vec<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A zero-byte moveable block is allocated "discarded" and `GlobalLock`
+    /// returns null for it: the failure must be reported, never written
+    /// through, and it stops before touching the clipboard.
+    #[test]
+    fn unlockable_clipboard_memory_is_an_error() {
+        assert_eq!(unsafe { set_clipboard(CF_DIB as u32, &[]) }, Err("couldn't lock clipboard memory".to_string()));
+    }
 
     #[test]
     fn numbered_names_go_before_the_extension() {
