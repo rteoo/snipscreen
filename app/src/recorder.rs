@@ -1,0 +1,626 @@
+//! Screen recording to MP4 (H.264 + AAC) with Windows Media Foundation.
+
+use std::ffi::c_void;
+use std::mem::{size_of, zeroed};
+use std::path::{Path, PathBuf};
+use std::ptr::null_mut;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+
+use eframe::egui::{Color32, ColorImage};
+use windows::core::HSTRING;
+use windows::core::Interface;
+use windows::Win32::Foundation::HMODULE;
+use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
+use windows::Win32::Graphics::Direct3D11::{
+    D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, D3D11_BOX,
+    D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAPPED_SUBRESOURCE,
+    D3D11_MAP_READ, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
+};
+use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
+use windows::Win32::Graphics::Dxgi::{
+    CreateDXGIFactory1, IDXGIFactory1, IDXGIOutput1, IDXGIOutputDuplication,
+    DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO,
+};
+use windows::Win32::Media::MediaFoundation::*;
+use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
+use windows_sys::Win32::Graphics::Gdi::{
+    CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, SelectObject, BITMAPINFO,
+    BI_RGB, DIB_RGB_COLORS, HBITMAP, HDC, HGDIOBJ,
+};
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    DrawIconEx, GetCursorInfo, GetIconInfo, CURSORINFO, CURSOR_SHOWING, DI_NORMAL, ICONINFO,
+};
+
+use crate::audio::{self, Capture, Source};
+
+pub const FPS: u32 = 30;
+const TICKS: i64 = 10_000_000; // Media Foundation counts time in 100 ns ticks.
+/// Hardware H.264 encoders commonly stop at 4096 pixels per side.
+const MAX_SIDE: i32 = 4096;
+
+pub struct Settings {
+    /// Screen pixels to record: x, y, width, height.
+    pub area: [i32; 4],
+    pub system_sound: bool,
+    /// `Some(None)` records the default microphone, `Some(Some(id))` a chosen one.
+    pub microphone: Option<Option<String>>,
+    pub path: PathBuf,
+}
+
+pub struct Finished {
+    pub path: PathBuf,
+    pub seconds: f64,
+    pub size: [u32; 2],
+    pub first_frame: Option<ColorImage>,
+}
+
+pub enum Event {
+    /// Recording is running; `notes` lists sound sources that couldn't start.
+    Started { notes: Vec<String> },
+    Done(Result<Finished, String>),
+}
+
+pub struct Recording {
+    stop: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+    pub started: Instant,
+}
+
+impl Recording {
+    pub fn stop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+impl Drop for Recording {
+    fn drop(&mut self) {
+        self.stop();
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+/// Even sizes are required by H.264; oversized areas are trimmed.
+pub fn fit_area([x, y, w, h]: [i32; 4]) -> [i32; 4] {
+    [x, y, w.min(MAX_SIDE) & !1, h.min(MAX_SIDE) & !1]
+}
+
+pub fn start(settings: Settings, on_event: impl Fn(Event) + Send + 'static) -> Recording {
+    let stop = Arc::new(AtomicBool::new(false));
+    let started = Instant::now();
+    let thread = {
+        let stop = stop.clone();
+        std::thread::spawn(move || {
+            let result = record(&settings, &stop, started, &on_event);
+            if result.is_err() {
+                let _ = std::fs::remove_file(&settings.path);
+            }
+            on_event(Event::Done(result));
+        })
+    };
+    Recording { stop, thread: Some(thread), started }
+}
+
+fn record(
+    s: &Settings,
+    stop: &AtomicBool,
+    clock: Instant,
+    on_event: &impl Fn(Event),
+) -> Result<Finished, String> {
+    let mut grab = Grabber::new(fit_area(s.area))
+        .map_err(|e| format!("couldn't read the screen: {}", e.message()))?;
+    let [_, _, w, h] = grab.area;
+    if w < 32 || h < 32 {
+        return Err("the area is too small to record".into());
+    }
+    let mut captures = Vec::new();
+    let mut notes = Vec::new();
+    let wanted = [
+        s.system_sound.then_some((Source::System, "the computer's sound")),
+        s.microphone.clone().map(|id| (Source::Microphone(id), "the microphone")),
+    ];
+    for (source, name) in wanted.into_iter().flatten() {
+        match Capture::start(source, clock) {
+            Ok(c) => captures.push(c),
+            Err(e) => notes.push(format!("Recording without {name} ({e})")),
+        }
+    }
+    if let Some(dir) = s.path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    }
+    let mut enc = Encoder::new(&s.path, w as u32, h as u32, !captures.is_empty())
+        .map_err(|e| format!("couldn't start the video encoder: {}", e.message()))?;
+    on_event(Event::Started { notes });
+
+    let frame_time = Duration::from_secs(1) / FPS;
+    let mut nv12 = vec![0u8; (w * h * 3 / 2) as usize];
+    let mut mixed = Vec::new();
+    let mut first_frame = None;
+    let mut next = clock;
+    let mut last_video = -1i64;
+    let werr = |e: windows::core::Error| format!("couldn't write the video: {}", e.message());
+    while !stop.load(Ordering::Relaxed) {
+        let now = Instant::now();
+        if now < next {
+            std::thread::sleep(next - now);
+        }
+        // Skip ticks we've fallen behind on rather than bunching frames up.
+        while next <= Instant::now() {
+            next += frame_time;
+        }
+        let bgra = grab.frame().map_err(|e| format!("couldn't read the screen: {}", e.message()))?;
+        if first_frame.is_none() {
+            first_frame = Some(to_color_image(bgra, w as usize, h as usize));
+        }
+        bgra_to_nv12(bgra, w as usize, h as usize, &mut nv12);
+        let t = (clock.elapsed().as_secs_f64() * TICKS as f64) as i64;
+        if t > last_video {
+            enc.video(&nv12, t).map_err(werr)?;
+            last_video = t;
+        }
+        audio::mix(&captures, &mut mixed);
+        enc.audio(&mixed).map_err(werr)?;
+    }
+    let seconds = clock.elapsed().as_secs_f64();
+    drop(captures);
+    enc.finish().map_err(werr)?;
+    Ok(Finished { path: s.path.clone(), seconds, size: [w as u32, h as u32], first_frame })
+}
+
+/// Reads one monitor through DXGI Desktop Duplication (GPU copy, no stalls
+/// from other windows redrawing) and draws the mouse pointer on top.
+struct Grabber {
+    device: ID3D11Device,
+    context: ID3D11DeviceContext,
+    output: IDXGIOutput1,
+    dup: IDXGIOutputDuplication,
+    staging: ID3D11Texture2D,
+    /// Area relative to the monitor's top-left: x, y, w, h.
+    local: [i32; 4],
+    /// The same area on the desktop.
+    area: [i32; 4],
+    /// Last screen image without the pointer, BGRA rows.
+    clean: Vec<u8>,
+    have_frame: bool,
+    mem: HDC,
+    bitmap: HBITMAP,
+    old: HGDIOBJ,
+    pixels: *mut u8,
+}
+
+impl Grabber {
+    /// Uses the monitor holding the area's centre and trims the area to it.
+    // ceiling: one monitor per recording; spanning monitors would need one
+    // duplication per output stitched together.
+    fn new(area: [i32; 4]) -> windows::core::Result<Self> {
+        let [x, y, w, h] = area;
+        let (cx, cy) = (x + w / 2, y + h / 2);
+        unsafe {
+            let factory: IDXGIFactory1 = CreateDXGIFactory1()?;
+            let mut found = None;
+            let mut a = 0;
+            'search: while let Ok(adapter) = factory.EnumAdapters1(a) {
+                let mut o = 0;
+                while let Ok(output) = adapter.EnumOutputs(o) {
+                    let r = output.GetDesc()?.DesktopCoordinates;
+                    if cx >= r.left && cx < r.right && cy >= r.top && cy < r.bottom {
+                        found = Some((adapter, output, r));
+                        break 'search;
+                    }
+                    o += 1;
+                }
+                a += 1;
+            }
+            let (adapter, output, mon) = found.ok_or_else(windows::core::Error::empty)?;
+            let left = x.max(mon.left);
+            let top = y.max(mon.top);
+            let right = (x + w).min(mon.right);
+            let bottom = (y + h).min(mon.bottom);
+            let area = fit_area([left, top, right - left, bottom - top]);
+            let local = [area[0] - mon.left, area[1] - mon.top, area[2], area[3]];
+
+            let (mut device, mut context) = (None, None);
+            D3D11CreateDevice(
+                &adapter,
+                D3D_DRIVER_TYPE_UNKNOWN,
+                HMODULE::default(),
+                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                None,
+                D3D11_SDK_VERSION,
+                Some(&mut device),
+                None,
+                Some(&mut context),
+            )?;
+            let device = device.ok_or_else(windows::core::Error::empty)?;
+            let context = context.ok_or_else(windows::core::Error::empty)?;
+            let output: IDXGIOutput1 = output.cast()?;
+            let dup = output.DuplicateOutput(&device)?;
+            let desc = D3D11_TEXTURE2D_DESC {
+                Width: area[2] as u32,
+                Height: area[3] as u32,
+                MipLevels: 1,
+                ArraySize: 1,
+                Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Usage: D3D11_USAGE_STAGING,
+                BindFlags: 0,
+                CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+                MiscFlags: 0,
+            };
+            let mut staging = None;
+            device.CreateTexture2D(&desc, None, Some(&mut staging))?;
+            let staging = staging.ok_or_else(windows::core::Error::empty)?;
+
+            // A memory bitmap to draw the pointer into with GDI.
+            let mem = CreateCompatibleDC(null_mut());
+            let mut bi: BITMAPINFO = zeroed();
+            bi.bmiHeader.biSize = size_of::<windows_sys::Win32::Graphics::Gdi::BITMAPINFOHEADER>() as u32;
+            bi.bmiHeader.biWidth = area[2];
+            bi.bmiHeader.biHeight = -area[3]; // top-down rows
+            bi.bmiHeader.biPlanes = 1;
+            bi.bmiHeader.biBitCount = 32;
+            bi.bmiHeader.biCompression = BI_RGB;
+            let mut pixels: *mut c_void = null_mut();
+            let bitmap = CreateDIBSection(mem, &bi, DIB_RGB_COLORS, &mut pixels, null_mut(), 0);
+            if bitmap.is_null() || pixels.is_null() {
+                DeleteDC(mem);
+                return Err(windows::core::Error::empty());
+            }
+            let old = SelectObject(mem, bitmap);
+            Ok(Self {
+                device,
+                context,
+                output,
+                dup,
+                staging,
+                local,
+                area,
+                clean: vec![0; (area[2] * area[3] * 4) as usize],
+                have_frame: false,
+                mem,
+                bitmap,
+                old,
+                pixels: pixels as *mut u8,
+            })
+        }
+    }
+
+    /// Pulls a new screen image if one is ready. Waits up to `wait_ms` for it.
+    fn refresh(&mut self, wait_ms: u32) -> windows::core::Result<()> {
+        unsafe {
+            let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
+            let mut resource = None;
+            match self.dup.AcquireNextFrame(wait_ms, &mut info, &mut resource) {
+                Ok(()) => {}
+                Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => return Ok(()),
+                Err(e) if e.code() == DXGI_ERROR_ACCESS_LOST => {
+                    // Resolution change, full-screen app, lock screen: start over.
+                    self.dup = self.output.DuplicateOutput(&self.device)?;
+                    return Ok(());
+                }
+                Err(e) => return Err(e),
+            }
+            let copied = (|| {
+                // Pointer-only updates carry no new desktop image.
+                if info.LastPresentTime == 0 && self.have_frame {
+                    return Ok(());
+                }
+                let texture: ID3D11Texture2D = resource.ok_or_else(windows::core::Error::empty)?.cast()?;
+                let [x, y, w, h] = self.local;
+                let src = D3D11_BOX {
+                    left: x as u32,
+                    top: y as u32,
+                    front: 0,
+                    right: (x + w) as u32,
+                    bottom: (y + h) as u32,
+                    back: 1,
+                };
+                self.context.CopySubresourceRegion(&self.staging, 0, 0, 0, 0, &texture, 0, Some(&src));
+                let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+                self.context.Map(&self.staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))?;
+                let row = (w * 4) as usize;
+                for r in 0..h as usize {
+                    let from = (mapped.pData as *const u8).add(r * mapped.RowPitch as usize);
+                    std::ptr::copy_nonoverlapping(from, self.clean[r * row..].as_mut_ptr(), row);
+                }
+                self.context.Unmap(&self.staging, 0);
+                self.have_frame = true;
+                Ok(())
+            })();
+            self.dup.ReleaseFrame()?;
+            copied
+        }
+    }
+
+    /// The area as BGRA rows, with the mouse pointer drawn in.
+    fn frame(&mut self) -> windows::core::Result<&[u8]> {
+        self.refresh(if self.have_frame { 0 } else { 500 })?;
+        let [x, y, w, h] = self.area;
+        unsafe {
+            let len = (w * h * 4) as usize;
+            std::ptr::copy_nonoverlapping(self.clean.as_ptr(), self.pixels, len);
+            let mut ci: CURSORINFO = zeroed();
+            ci.cbSize = size_of::<CURSORINFO>() as u32;
+            if GetCursorInfo(&mut ci) != 0 && ci.flags & CURSOR_SHOWING != 0 {
+                let mut ii: ICONINFO = zeroed();
+                if GetIconInfo(ci.hCursor, &mut ii) != 0 {
+                    let (hx, hy) = (ii.xHotspot as i32, ii.yHotspot as i32);
+                    if !ii.hbmMask.is_null() {
+                        DeleteObject(ii.hbmMask);
+                    }
+                    if !ii.hbmColor.is_null() {
+                        DeleteObject(ii.hbmColor);
+                    }
+                    DrawIconEx(self.mem, ci.ptScreenPos.x - x - hx, ci.ptScreenPos.y - y - hy, ci.hCursor, 0, 0, 0, null_mut(), DI_NORMAL);
+                }
+            }
+            Ok(std::slice::from_raw_parts(self.pixels, len))
+        }
+    }
+}
+
+impl Drop for Grabber {
+    fn drop(&mut self) {
+        unsafe {
+            SelectObject(self.mem, self.old);
+            DeleteObject(self.bitmap);
+            DeleteDC(self.mem);
+        }
+    }
+}
+
+fn to_color_image(bgra: &[u8], w: usize, h: usize) -> ColorImage {
+    let pixels = bgra.as_chunks::<4>().0.iter().map(|p| Color32::from_rgb(p[2], p[1], p[0])).collect();
+    ColorImage::new([w, h], pixels)
+}
+
+/// BGRA → NV12 with BT.709 limited-range colours, the H.264 norm for HD.
+fn bgra_to_nv12(bgra: &[u8], w: usize, h: usize, out: &mut [u8]) {
+    let (luma, chroma) = out.split_at_mut(w * h);
+    for (src, dst) in bgra.chunks_exact(w * 4).zip(luma.chunks_exact_mut(w)) {
+        for (p, y) in src.as_chunks::<4>().0.iter().zip(dst.iter_mut()) {
+            let (b, g, r) = (p[0] as i32, p[1] as i32, p[2] as i32);
+            *y = (((47 * r + 157 * g + 16 * b + 128) >> 8) + 16) as u8;
+        }
+    }
+    for cy in 0..h / 2 {
+        let row0 = &bgra[cy * 2 * w * 4..][..w * 4];
+        let row1 = &bgra[(cy * 2 + 1) * w * 4..][..w * 4];
+        let dst = &mut chroma[cy * w..][..w];
+        for cx in 0..w / 2 {
+            let i = cx * 8;
+            let sum = |o: usize| {
+                row0[i + o] as i32 + row0[i + 4 + o] as i32 + row1[i + o] as i32 + row1[i + 4 + o] as i32
+            };
+            let (b, g, r) = ((sum(0) + 2) >> 2, (sum(1) + 2) >> 2, (sum(2) + 2) >> 2);
+            dst[cx * 2] = (((-26 * r - 86 * g + 112 * b + 128) >> 8) + 128).clamp(0, 255) as u8;
+            dst[cx * 2 + 1] = (((112 * r - 102 * g - 10 * b + 128) >> 8) + 128).clamp(0, 255) as u8;
+        }
+    }
+}
+
+struct Encoder {
+    writer: IMFSinkWriter,
+    video: u32,
+    audio: Option<u32>,
+    frame_bytes: u32,
+    audio_frames: i64,
+}
+
+impl Encoder {
+    fn new(path: &Path, w: u32, h: u32, with_audio: bool) -> windows::core::Result<Self> {
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+            MFStartup(MF_VERSION, MFSTARTUP_FULL)?;
+            let mut attrs = None;
+            MFCreateAttributes(&mut attrs, 2)?;
+            let attrs = attrs.ok_or_else(windows::core::Error::empty)?;
+            attrs.SetUINT32(&MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, 1)?;
+            attrs.SetUINT32(&MF_SINK_WRITER_DISABLE_THROTTLING, 1)?;
+            let writer = MFCreateSinkWriterFromURL(&HSTRING::from(path.as_os_str()), None, &attrs)?;
+
+            let size = ((w as u64) << 32) | h as u64;
+            let rate = ((FPS as u64) << 32) | 1;
+            let square = (1u64 << 32) | 1;
+            let out = MFCreateMediaType()?;
+            out.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
+            out.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_H264)?;
+            // About 0.12 bits per pixel per frame: crisp text, modest files.
+            out.SetUINT32(&MF_MT_AVG_BITRATE, ((w * h) as f64 * FPS as f64 * 0.12) as u32)?;
+            out.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
+            out.SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_High.0 as u32)?;
+            out.SetUINT64(&MF_MT_FRAME_SIZE, size)?;
+            out.SetUINT64(&MF_MT_FRAME_RATE, rate)?;
+            out.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, square)?;
+            let video = writer.AddStream(&out)?;
+
+            let input = MFCreateMediaType()?;
+            input.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
+            input.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_NV12)?;
+            input.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
+            input.SetUINT32(&MF_MT_DEFAULT_STRIDE, w)?;
+            input.SetUINT32(&MF_MT_YUV_MATRIX, MFVideoTransferMatrix_BT709.0 as u32)?;
+            input.SetUINT32(&MF_MT_VIDEO_NOMINAL_RANGE, MFNominalRange_16_235.0 as u32)?;
+            input.SetUINT64(&MF_MT_FRAME_SIZE, size)?;
+            input.SetUINT64(&MF_MT_FRAME_RATE, rate)?;
+            input.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, square)?;
+            writer.SetInputMediaType(video, &input, None)?;
+
+            let audio = if with_audio {
+                let out = MFCreateMediaType()?;
+                out.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Audio)?;
+                out.SetGUID(&MF_MT_SUBTYPE, &MFAudioFormat_AAC)?;
+                out.SetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE, 16)?;
+                out.SetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND, audio::RATE)?;
+                out.SetUINT32(&MF_MT_AUDIO_NUM_CHANNELS, audio::CHANNELS as u32)?;
+                out.SetUINT32(&MF_MT_AUDIO_AVG_BYTES_PER_SECOND, 24_000)?; // 192 kbit/s
+                let stream = writer.AddStream(&out)?;
+                let pcm = MFCreateMediaType()?;
+                pcm.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Audio)?;
+                pcm.SetGUID(&MF_MT_SUBTYPE, &MFAudioFormat_PCM)?;
+                pcm.SetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE, 16)?;
+                pcm.SetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND, audio::RATE)?;
+                pcm.SetUINT32(&MF_MT_AUDIO_NUM_CHANNELS, audio::CHANNELS as u32)?;
+                pcm.SetUINT32(&MF_MT_AUDIO_BLOCK_ALIGNMENT, audio::CHANNELS as u32 * 2)?;
+                pcm.SetUINT32(&MF_MT_AUDIO_AVG_BYTES_PER_SECOND, audio::RATE * audio::CHANNELS as u32 * 2)?;
+                writer.SetInputMediaType(stream, &pcm, None)?;
+                Some(stream)
+            } else {
+                None
+            };
+            writer.BeginWriting()?;
+            Ok(Self { writer, video, audio, frame_bytes: w * h * 3 / 2, audio_frames: 0 })
+        }
+    }
+
+    fn write(&self, stream: u32, bytes: &[u8], time: i64, duration: i64) -> windows::core::Result<()> {
+        unsafe {
+            let buffer = MFCreateMemoryBuffer(bytes.len() as u32)?;
+            let mut dst = null_mut();
+            buffer.Lock(&mut dst, None, None)?;
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len());
+            buffer.Unlock()?;
+            buffer.SetCurrentLength(bytes.len() as u32)?;
+            let sample = MFCreateSample()?;
+            sample.AddBuffer(&buffer)?;
+            sample.SetSampleTime(time)?;
+            sample.SetSampleDuration(duration)?;
+            self.writer.WriteSample(stream, &sample)
+        }
+    }
+
+    fn video(&mut self, nv12: &[u8], time: i64) -> windows::core::Result<()> {
+        debug_assert_eq!(nv12.len() as u32, self.frame_bytes);
+        self.write(self.video, nv12, time, TICKS / FPS as i64)
+    }
+
+    /// Interleaved stereo f32; time comes from the sample count so the
+    /// sound track never drifts from its own clock.
+    fn audio(&mut self, samples: &[f32]) -> windows::core::Result<()> {
+        let Some(stream) = self.audio else { return Ok(()) };
+        if samples.is_empty() {
+            return Ok(());
+        }
+        let pcm: Vec<u8> = samples
+            .iter()
+            .flat_map(|s| ((s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16).to_le_bytes())
+            .collect();
+        let frames = (samples.len() / audio::CHANNELS) as i64;
+        let time = self.audio_frames * TICKS / audio::RATE as i64;
+        let duration = frames * TICKS / audio::RATE as i64;
+        self.audio_frames += frames;
+        self.write(stream, &pcm, time, duration)
+    }
+
+    fn finish(self) -> windows::core::Result<()> {
+        unsafe { self.writer.Finalize() }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nv12_white_and_black() {
+        let (w, h) = (4, 2);
+        let mut bgra = vec![255u8; w * h * 4];
+        bgra[..8].fill(0); // two black pixels top-left
+        let mut out = vec![0u8; w * h * 3 / 2];
+        bgra_to_nv12(&bgra, w, h, &mut out);
+        assert_eq!(out[0], 16, "black luma");
+        assert_eq!(out[3], 235, "white luma");
+        assert!(out[w * h..].iter().all(|&c| (126..=130).contains(&c)), "grey has neutral chroma");
+    }
+
+    #[test]
+    fn area_is_even_and_bounded() {
+        assert_eq!(fit_area([5, 7, 1001, 9999]), [5, 7, 1000, 4096]);
+    }
+
+    /// Writes a 2 s clip of moving bars with a tone, without touching the
+    /// screen or sound devices.
+    #[test]
+    fn encodes_synthetic_mp4() {
+        // Kept in the build folder so the clip can be inspected by hand.
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("target").join("test-synthetic.mp4");
+        let (w, h) = (320u32, 240u32);
+        let mut enc = Encoder::new(&path, w, h, true).expect("encoder");
+        let mut nv12 = vec![0u8; (w * h * 3 / 2) as usize];
+        for f in 0..(2 * FPS) {
+            let bgra: Vec<u8> = (0..w * h)
+                .flat_map(|i| {
+                    // White band on top (to check which way is up), then
+                    // blue and red halves sliding sideways.
+                    if i / w < 24 {
+                        return [255, 255, 255, 255];
+                    }
+                    let x = (i % w + f * 8) % w;
+                    let v = if x < w / 2 { 230 } else { 30 };
+                    [v, 80, 255 - v, 255]
+                })
+                .collect();
+            bgra_to_nv12(&bgra, w as usize, h as usize, &mut nv12);
+            enc.video(&nv12, f as i64 * TICKS / FPS as i64).unwrap();
+            let n = audio::RATE as usize / FPS as usize;
+            let tone: Vec<f32> = (0..n * 2)
+                .map(|i| {
+                    let t = (f as usize * n + i / 2) as f32 / audio::RATE as f32;
+                    (t * 440.0 * std::f32::consts::TAU).sin() * 0.3
+                })
+                .collect();
+            enc.audio(&tone).unwrap();
+        }
+        enc.finish().unwrap();
+        let len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        assert!(len > 10_000, "mp4 is only {len} bytes");
+
+        // Decode the first frame back and check colours and orientation.
+        let px = unsafe { first_frame_bgra(&path, h as usize) }.expect("decode");
+        let at = |x: u32, y: u32| {
+            let i = ((y * w + x) * 4) as usize;
+            (px[i + 2] as i32, px[i + 1] as i32, px[i] as i32)
+        };
+        let (r, g, b) = at(160, 8);
+        assert!(r > 220 && g > 220 && b > 220, "top band should be white, got {:?}", (r, g, b));
+        let (r, _, b) = at(60, 150);
+        assert!(b > r + 100, "left half should be blue, got {:?}", at(60, 150));
+        let (r, _, b) = at(260, 150);
+        assert!(r > b + 100, "right half should be red, got {:?}", at(260, 150));
+    }
+
+    unsafe fn first_frame_bgra(path: &Path, height: usize) -> windows::core::Result<Vec<u8>> {
+        unsafe {
+            let mut attrs = None;
+            MFCreateAttributes(&mut attrs, 1)?;
+            let attrs = attrs.unwrap();
+            attrs.SetUINT32(&MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, 1)?;
+            let reader = MFCreateSourceReaderFromURL(&HSTRING::from(path.as_os_str()), &attrs)?;
+            let stream = MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32;
+            let want = MFCreateMediaType()?;
+            want.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
+            want.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_RGB32)?;
+            reader.SetCurrentMediaType(stream, None, &want)?;
+            let got = reader.GetCurrentMediaType(stream)?;
+            let stride = got.GetUINT32(&MF_MT_DEFAULT_STRIDE).map(|s| s as i32).unwrap_or(-1);
+            let mut sample = None;
+            let (mut actual, mut flags, mut time) = (0u32, 0u32, 0i64);
+            reader.ReadSample(stream, 0, Some(&mut actual), Some(&mut flags), Some(&mut time), Some(&mut sample))?;
+            let buffer = sample.unwrap().ConvertToContiguousBuffer()?;
+            let (mut ptr, mut len) = (null_mut(), 0u32);
+            buffer.Lock(&mut ptr, None, Some(&mut len))?;
+            let mut px = std::slice::from_raw_parts(ptr, len as usize).to_vec();
+            buffer.Unlock()?;
+            if stride < 0 {
+                // Bottom-up rows: flip so row 0 is the top.
+                let row = px.len() / height;
+                px = px.chunks_exact(row).rev().flatten().copied().collect();
+            }
+            Ok(px)
+        }
+    }
+}

@@ -1,0 +1,5 @@
+pixel before="1d1f1a"
+pixel inside after="1d1f1a" on dashes="e8e8e8"
+area=[300, 300, 640, 360] bar=[434, 236, 372, 52] outline=Some([296, 296, 648, 368])
+end idle=false
+end idle=false
