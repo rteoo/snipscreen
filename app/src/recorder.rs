@@ -687,10 +687,9 @@ impl Encoder {
         unsafe {
             let mf = MediaFoundation::start()?;
             let mut attrs = None;
-            MFCreateAttributes(&mut attrs, 2)?;
+            MFCreateAttributes(&mut attrs, 1)?;
             let attrs = attrs.ok_or_else(windows::core::Error::empty)?;
             attrs.SetUINT32(&MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, 1)?;
-            attrs.SetUINT32(&MF_SINK_WRITER_DISABLE_THROTTLING, 1)?;
             let writer = MFCreateSinkWriterFromURL(&HSTRING::from(path.as_os_str()), None, &attrs)?;
 
             let size = ((w as u64) << 32) | h as u64;
@@ -747,6 +746,9 @@ impl Encoder {
         }
     }
 
+    /// The sink writer is left throttled: while the encoder is behind,
+    /// `WriteSample` blocks rather than queueing without bound, and the
+    /// recording loop then skips the ticks it missed (drops frames).
     fn write(&self, stream: u32, bytes: &[u8], time: i64, duration: i64) -> windows::core::Result<()> {
         unsafe {
             let buffer = MFCreateMemoryBuffer(bytes.len() as u32)?;
@@ -950,6 +952,35 @@ mod tests {
         }
     }
 
+    /// Needs a desktop and sound devices. A 3 s recording of the real screen
+    /// with system sound runs in real time and keeps close to 30 fps with
+    /// the sink writer throttled.
+    #[test]
+    #[ignore]
+    fn records_the_desktop_in_real_time() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("target").join("test-realtime.mp4");
+        let _ = std::fs::remove_file(&path);
+        let settings = Settings { area: [0, 0, 1280, 720], system_sound: true, microphone: None, path: path.clone() };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut rec = start(settings, move |e| {
+            if let Event::Done(r) = e {
+                let _ = tx.send(r);
+            }
+        });
+        std::thread::sleep(Duration::from_secs(3));
+        rec.stop();
+        let done = rx.recv_timeout(Duration::from_secs(10)).expect("recording should finish").expect("recording");
+        drop(rec);
+        let (frames, span) = unsafe { count_video_frames(&done.path) }.expect("decode");
+        std::fs::remove_file(&done.path).unwrap();
+        assert!((2.9..4.0).contains(&done.seconds), "took {} s", done.seconds);
+        // The clock starts before the grabber and encoder are set up, so
+        // measure the rate over the frames themselves.
+        assert!(span > 1.5, "video spans only {span:.2} s");
+        let fps = (frames - 1) as f64 / span;
+        assert!(fps > 27.0, "{frames} frames over {span:.2} s ({fps:.1} fps)");
+    }
+
     /// Writes a 2 s clip of moving bars with a tone, without touching the
     /// screen or sound devices.
     #[test]
@@ -1094,6 +1125,29 @@ mod tests {
         for e in [GrabError::NoDevice, GrabError::NoBitmap, GrabError::Win(windows::core::Error::empty())] {
             let text = e.to_string();
             assert!(text.len() > 10 && !text.contains("completed successfully"), "{text}");
+        }
+    }
+
+    /// Number of video frames and the seconds they span, first to last.
+    unsafe fn count_video_frames(path: &Path) -> windows::core::Result<(u32, f64)> {
+        let _mf = MediaFoundation::start()?;
+        unsafe {
+            let reader = MFCreateSourceReaderFromURL(&HSTRING::from(path.as_os_str()), None)?;
+            let stream = MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32;
+            let (mut frames, mut first, mut last) = (0, None, 0i64);
+            loop {
+                let mut sample = None;
+                let (mut flags, mut time) = (0u32, 0i64);
+                reader.ReadSample(stream, 0, None, Some(&mut flags), Some(&mut time), Some(&mut sample))?;
+                if sample.is_some() {
+                    frames += 1;
+                    first.get_or_insert(time);
+                    last = time;
+                }
+                if flags & MF_SOURCE_READERF_ENDOFSTREAM.0 as u32 != 0 {
+                    return Ok((frames, (last - first.unwrap_or(last)) as f64 / TICKS as f64));
+                }
+            }
         }
     }
 
