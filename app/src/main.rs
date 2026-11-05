@@ -195,6 +195,7 @@ struct App {
     zoom: Option<f32>,
     /// Minimum window width last sent to the OS, so the command goes out only on change.
     min_width: f32,
+    popup_guard: PopupClickGuard,
 
     auto_copy: bool,
     auto_save: bool,
@@ -257,6 +258,7 @@ impl App {
             crop: None,
             zoom: None,
             min_width: MIN_WINDOW_W,
+            popup_guard: PopupClickGuard::default(),
             auto_copy: true,
             auto_save: true,
             pick_on_launch: screenshot.is_none(),
@@ -517,6 +519,7 @@ impl eframe::App for App {
         } else if matches!(self.stage, Stage::Recording(_)) {
             self.rec_bar_ui(ui);
         } else {
+            self.popup_guard.begin_frame(&ctx);
             self.shortcuts(&ctx);
             self.toolbar(ui);
             egui::CentralPanel::default()
@@ -901,7 +904,9 @@ impl App {
             let pointer = resp.interact_pointer_pos().or(resp.hover_pos());
             // Drags are noticed a few pixels after the button goes down; start where it went down.
             let origin = ctx.input(|i| i.pointer.press_origin()).or(pointer);
+            let swallowed = self.popup_guard.swallows(&ctx, resp.clicked());
             match self.tool {
+                _ if swallowed => {}
                 Tool::Pen | Tool::Highlighter => {
                     let (ink, (color, width)) = if self.tool == Tool::Pen {
                         (Ink::Pen, self.pen)
@@ -1538,6 +1543,27 @@ fn main() -> eframe::Result {
     )
 }
 
+/// A popup that closes on a click outside lets that click through to whatever lies beneath it.
+/// This notices when a canvas click only dismissed a popup, so it doesn't also draw.
+#[derive(Default)]
+struct PopupClickGuard {
+    open_at_press: bool,
+}
+
+impl PopupClickGuard {
+    /// Call once per frame before any popup is shown: the press that starts a click sees the popups as they were.
+    fn begin_frame(&mut self, ctx: &egui::Context) {
+        if ctx.input(|i| i.pointer.any_pressed()) {
+            self.open_at_press = egui::Popup::is_any_open(ctx);
+        }
+    }
+
+    /// True for a click that was open at the press and is closed now. Drags leave the popup open, so they still draw.
+    fn swallows(&self, ctx: &egui::Context, clicked: bool) -> bool {
+        clicked && self.open_at_press && !egui::Popup::is_any_open(ctx)
+    }
+}
+
 /// Left edge of the markup group: centred in the toolbar when it fits clear of the capture and
 /// output groups, otherwise pushed right up against the capture group.
 fn markup_x(center: f32, width: f32, left_end: f32, right_start: f32) -> f32 {
@@ -1687,6 +1713,53 @@ mod tests {
         assert_eq!(markup_x(500.0, 200.0, 100.0, 900.0), 400.0);
         assert_eq!(markup_x(500.0, 300.0, 100.0, 600.0), 284.0, "pushed left by the output group");
         assert_eq!(markup_x(500.0, 800.0, 100.0, 1000.0), 116.0, "pulled right by the capture group");
+    }
+
+    /// One frame of a toolbar with a click-outside popup over a canvas; returns whether the canvas would draw.
+    fn popup_frame(ctx: &egui::Context, guard: &mut PopupClickGuard, events: Vec<Event>, open: bool) -> bool {
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(800.0, 600.0))),
+            events,
+            ..Default::default()
+        };
+        let mut draws = false;
+        let mut out = ctx.run_ui(input, |ui| {
+            guard.begin_frame(ui.ctx());
+            egui::Panel::top("t").show(ui, |ui| {
+                let pen = ui.button("pen");
+                egui::Popup::from_response(&pen)
+                    .open_memory(open.then_some(egui::SetOpenCommand::Bool(true)))
+                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                    .show(|ui| ui.label("options"));
+            });
+            egui::CentralPanel::default().show(ui, |ui| {
+                let resp = ui.allocate_response(ui.available_size(), Sense::click_and_drag());
+                draws = (resp.clicked() || resp.drag_started()) && !guard.swallows(ui.ctx(), resp.clicked());
+            });
+        });
+        out.textures_delta.clear();
+        draws
+    }
+
+    fn click(ctx: &egui::Context, guard: &mut PopupClickGuard, at: Pos2) -> bool {
+        let btn = |pressed| Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
+        popup_frame(ctx, guard, vec![Event::PointerMoved(at)], false);
+        popup_frame(ctx, guard, vec![btn(true)], false);
+        popup_frame(ctx, guard, vec![btn(false)], false)
+    }
+
+    #[test]
+    fn click_that_closes_a_popup_does_not_draw() {
+        let (ctx, mut guard) = (egui::Context::default(), PopupClickGuard::default());
+        for _ in 0..3 {
+            popup_frame(&ctx, &mut guard, vec![], false);
+        }
+        popup_frame(&ctx, &mut guard, vec![], true);
+        popup_frame(&ctx, &mut guard, vec![], false);
+        assert!(egui::Popup::is_any_open(&ctx), "popup should be open before the click");
+        assert!(!click(&ctx, &mut guard, pos2(400.0, 400.0)), "the dismissing click must not reach the canvas");
+        assert!(!egui::Popup::is_any_open(&ctx), "click outside should have closed the popup");
+        assert!(click(&ctx, &mut guard, pos2(400.0, 400.0)), "the next click draws as usual");
     }
 
     #[test]
