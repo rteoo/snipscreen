@@ -166,7 +166,32 @@ enum Stage {
     Recording(Box<RecBar>),
 }
 
-const BAR: Vec2 = vec2(372.0, 52.0);
+
+// Recording bar controls, left to right: Start, clock, mic, mic menu, system sound, divider, close, and the "!" warning (shown only when there are notes, but always budgeted for).
+const REC_START_W: f32 = 104.0;
+const REC_CLOCK_W: f32 = 84.0;
+const REC_CHEVRON_W: f32 = 16.0;
+const REC_WARN_W: f32 = 12.0;
+const REC_ROW: [f32; 8] = [REC_START_W, REC_CLOCK_W, BTN.x, REC_CHEVRON_W, BTN.x, DIVIDER_W, BTN.x, REC_WARN_W];
+const BAR_PAD: f32 = 8.0;
+const BAR_BORDER: f32 = 1.0;
+/// Spare room so rounding to whole pixels at fractional scales never clips a control.
+const BAR_SLACK: f32 = 6.0;
+const BAR: Vec2 = vec2(
+    row_width(&REC_ROW) + 2.0 * (BAR_PAD + BAR_BORDER) + BAR_SLACK,
+    BTN.y + 2.0 * (BAR_PAD + BAR_BORDER) + BAR_SLACK,
+);
+
+/// Width of `items` laid out in a row with `GAP` between them.
+const fn row_width(items: &[f32]) -> f32 {
+    let mut total = GAP * (items.len() - 1) as f32;
+    let mut i = 0;
+    while i < items.len() {
+        total += items[i];
+        i += 1;
+    }
+    total
+}
 /// Extra bar height while a message is showing under the controls.
 const BAR_NOTE_H: f32 = 28.0;
 /// How long a message stays up once something is drawing it.
@@ -1387,11 +1412,11 @@ impl App {
                 });
         }
         egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(TOOLBAR_BG).stroke((1.0, OUTLINE)).inner_margin(egui::Margin::symmetric(8, 8)))
+            .frame(egui::Frame::new().fill(TOOLBAR_BG).stroke((BAR_BORDER, OUTLINE)).inner_margin(egui::Margin::symmetric(BAR_PAD as i8, BAR_PAD as i8)))
             .show(ui, |ui| {
                 ui.spacing_mut().item_spacing = vec2(GAP, 0.0);
                 ui.horizontal_centered(|ui| {
-                    let (rect, resp) = ui.allocate_exact_size(vec2(104.0, BTN.y), Sense::click());
+                    let (rect, resp) = ui.allocate_exact_size(vec2(REC_START_W, BTN.y), Sense::click());
                     let p = ui.painter();
                     let fill = if resp.hovered() && !saving { ACCENT.gamma_multiply(0.9) } else { ACCENT };
                     p.rect_filled(rect, 4.0, if saving { ICON_OFF } else { fill });
@@ -1408,7 +1433,7 @@ impl App {
                     }
 
                     let clock = format!("{:02}:{:02}:{:02}", elapsed / 3600, elapsed / 60 % 60, elapsed % 60);
-                    let (t, _) = ui.allocate_exact_size(vec2(84.0, BTN.y), Sense::hover());
+                    let (t, _) = ui.allocate_exact_size(vec2(REC_CLOCK_W, BTN.y), Sense::hover());
                     ui.painter().text(t.center(), Align2::CENTER_CENTER, clock, FontId::monospace(14.0), ICON);
 
                     let mic_icon = if self.record_mic { Icon::Mic } else { Icon::MicOff };
@@ -1416,7 +1441,7 @@ impl App {
                     if icon_button(ui, mic_icon, None, false, !recording, mic_tip).clicked() {
                         self.record_mic = !self.record_mic;
                     }
-                    let (chev, chev_resp) = ui.allocate_exact_size(vec2(16.0, BTN.y), if recording { Sense::hover() } else { Sense::click() });
+                    let (chev, chev_resp) = ui.allocate_exact_size(vec2(REC_CHEVRON_W, BTN.y), if recording { Sense::hover() } else { Sense::click() });
                     icons::paint(ui.painter(), Rect::from_center_size(chev.center(), vec2(12.0, 12.0)), Icon::Chevron, if recording { ICON_OFF } else { ICON }, None);
                     if chev_resp.clicked() {
                         self.mics = audio::microphones();
@@ -1453,7 +1478,9 @@ impl App {
                         if recording { stop = true } else { close = true }
                     }
                     if !notes.is_empty() {
-                        ui.label(RichText::new("!").strong().color(ACCENT)).on_hover_text(&notes);
+                        let (warn, resp) = ui.allocate_exact_size(vec2(REC_WARN_W, BTN.y), Sense::hover());
+                        ui.painter().text(warn.center(), Align2::CENTER_CENTER, "!", FontId::proportional(14.0), ACCENT);
+                        resp.on_hover_text(&notes);
                     }
                 });
             });
@@ -1903,6 +1930,17 @@ fn bar_position(area: [i32; 4], work: [i32; 4], bw: i32, bh: i32) -> (i32, i32) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recording_bar_fits_every_control_at_fractional_scales() {
+        let need = row_width(&REC_ROW) + 2.0 * (BAR_PAD + BAR_BORDER);
+        let need_h = BTN.y + 2.0 * (BAR_PAD + BAR_BORDER);
+        for ppp in [1.0_f32, 1.25, 1.5, 1.75, 2.0, 2.25, 3.0] {
+            // What the window really gets: whole pixels, back in points.
+            let (w, h) = ((BAR.x * ppp).round() / ppp, (BAR.y * ppp).round() / ppp);
+            assert!(w >= need + 2.0 && h >= need_h + 2.0, "bar {w}x{h} at {ppp}x is too small for {need}x{need_h}");
+        }
+    }
 
     #[test]
     fn note_clock_starts_when_first_drawn() {
