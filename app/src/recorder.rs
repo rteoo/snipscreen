@@ -63,8 +63,10 @@ pub struct Finished {
 }
 
 pub enum Event {
-    /// Recording is running; `notes` lists sound sources that couldn't start.
-    Started { notes: Vec<String> },
+    /// Recording is running. `area` is the desktop rectangle actually being
+    /// recorded (x, y, w, h), which can be smaller than the one asked for;
+    /// `notes` says why, and lists sound sources that couldn't start.
+    Started { area: [i32; 4], notes: Vec<String> },
     /// A sound source stopped mid-recording; the rest carries on.
     Note(String),
     Done(Result<Finished, String>),
@@ -127,6 +129,9 @@ fn record(
     let mut captures = Vec::new();
     let mut names = Vec::new();
     let mut notes = Vec::new();
+    if grab.area != fit_area(s.area) {
+        notes.push("Only the part on one screen is recorded".to_string());
+    }
     let wanted = [
         s.system_sound.then_some((Source::System, "the computer's sound")),
         s.microphone.clone().map(|id| (Source::Microphone(id), "the microphone")),
@@ -145,7 +150,7 @@ fn record(
     }
     let mut enc = Encoder::new(&s.path, w as u32, h as u32, !captures.is_empty())
         .map_err(|e| format!("couldn't start the video encoder: {}", describe(&e)))?;
-    on_event(Event::Started { notes });
+    on_event(Event::Started { area: grab.area, notes });
 
     let frame_time = Duration::from_secs(1) / FPS;
     let mut nv12 = vec![0u8; (w * h * 3 / 2) as usize];
@@ -279,11 +284,7 @@ impl Grabber {
                 a += 1;
             }
             let (adapter, output, mon) = found.ok_or_else(windows::core::Error::empty)?;
-            let left = x.max(mon.left);
-            let top = y.max(mon.top);
-            let right = (x + w).min(mon.right);
-            let bottom = (y + h).min(mon.bottom);
-            let area = fit_area([left, top, right - left, bottom - top]);
+            let area = on_monitor(area, [mon.left, mon.top, mon.right, mon.bottom]);
             let local = [area[0] - mon.left, area[1] - mon.top, area[2], area[3]];
 
             let (mut device, mut context) = (None, None);
@@ -472,6 +473,14 @@ impl Drop for Grabber {
             DeleteDC(self.mem);
         }
     }
+}
+
+/// The part of `area` (x, y, w, h) on the monitor `[left, top, right, bottom]`,
+/// trimmed to a size the encoder takes.
+fn on_monitor([x, y, w, h]: [i32; 4], [ml, mt, mr, mb]: [i32; 4]) -> [i32; 4] {
+    let (left, top) = (x.max(ml), y.max(mt));
+    let (right, bottom) = ((x + w).min(mr), (y + h).min(mb));
+    fit_area([left, top, right - left, bottom - top])
 }
 
 /// `DuplicateOutput` failures that clear up by themselves: the secure desktop
@@ -671,6 +680,17 @@ mod tests {
     #[test]
     fn area_is_even_and_bounded() {
         assert_eq!(fit_area([5, 7, 1001, 9999]), [5, 7, 1000, 4096]);
+    }
+
+    #[test]
+    fn area_is_trimmed_to_its_monitor() {
+        let mon = [0, 0, 1920, 1080];
+        // Inside: only the even trim.
+        assert_eq!(on_monitor([101, 51, 301, 201], mon), [101, 51, 300, 200]);
+        // Hanging off the right onto a second monitor: cut at the edge.
+        assert_eq!(on_monitor([1700, 100, 600, 400], mon), [1700, 100, 220, 400]);
+        // A monitor left of and above the primary has negative coordinates.
+        assert_eq!(on_monitor([-300, -200, 500, 500], [-1280, -1024, 0, 0]), [-300, -200, 300, 200]);
     }
 
     #[test]

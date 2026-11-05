@@ -1260,8 +1260,10 @@ impl App {
 
     fn on_record_event(&mut self, ctx: &egui::Context, event: recorder::Event) {
         match event {
-            recorder::Event::Started { notes } => {
+            recorder::Event::Started { area, notes } => {
                 if let Stage::Recording(bar) = &mut self.stage {
+                    // The outline and bar follow what is actually recorded.
+                    bar.area = area;
                     bar.notes = notes;
                 }
             }
