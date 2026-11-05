@@ -96,9 +96,28 @@ impl Drop for Recording {
     }
 }
 
-/// Even sizes are required by H.264; oversized areas are trimmed.
+/// H.264 level 5.1/5.2 frame size limit in 16×16 macroblocks (4096×2304).
+/// The encoders here took 4096×2880 and 4096×4096 too (level 6 territory),
+/// but level 5.2 is the largest frame players and hardware decoders broadly
+/// accept, so a recording past it may encode fine and then not play.
+const MAX_MACROBLOCKS: i32 = 36_864;
+
+/// Even sizes are required by H.264; oversized areas are trimmed: each side
+/// to `MAX_SIDE`, then the shorter side until the frame fits `MAX_MACROBLOCKS`.
+// ceiling: trimming cuts off the right or bottom of a 5K/6K area; scale the
+// frames down instead if people record whole screens that large.
 pub fn fit_area([x, y, w, h]: [i32; 4]) -> [i32; 4] {
-    [x, y, w.min(MAX_SIDE) & !1, h.min(MAX_SIDE) & !1]
+    let (mut w, mut h) = (w.min(MAX_SIDE) & !1, h.min(MAX_SIDE) & !1);
+    let mbs = |side: i32| (side + 15) / 16;
+    if w > 0 && h > 0 && mbs(w) * mbs(h) > MAX_MACROBLOCKS {
+        // The shorter side gives way: a 5K or 6K screen then keeps 16:9 at 4096×2304.
+        if w > h {
+            h = h.min(MAX_MACROBLOCKS / mbs(w) * 16) & !1;
+        } else {
+            w = w.min(MAX_MACROBLOCKS / mbs(h) * 16) & !1;
+        }
+    }
+    [x, y, w, h]
 }
 
 pub fn start(settings: Settings, on_event: impl Fn(Event) + Send + 'static) -> Recording {
@@ -770,6 +789,23 @@ mod tests {
     #[test]
     fn area_is_even_and_bounded() {
         assert_eq!(fit_area([5, 7, 1001, 9999]), [5, 7, 1000, 4096]);
+        // 4K fits as it is.
+        assert_eq!(fit_area([0, 0, 3840, 2160]), [0, 0, 3840, 2160]);
+        assert_eq!(fit_area([0, 0, 4096, 2304]), [0, 0, 4096, 2304]);
+    }
+
+    #[test]
+    fn area_stays_within_h264_frame_size() {
+        // 5K and 6K screens keep 16:9: landscape loses the bottom, portrait the right.
+        assert_eq!(fit_area([0, 0, 5120, 2880]), [0, 0, 4096, 2304]);
+        assert_eq!(fit_area([0, 0, 6016, 3384]), [0, 0, 4096, 2304]);
+        assert_eq!(fit_area([0, 0, 2880, 5120]), [0, 0, 2304, 4096]);
+        assert_eq!(fit_area([0, 0, 4096, 4000]), [0, 0, 4096, 2304]);
+        assert_eq!(fit_area([0, 0, 4000, 2600]), [0, 0, 4000, 2352]);
+        for [_, _, w, h] in [fit_area([0, 0, 4095, 4095]), fit_area([0, 0, 3001, 3999]), fit_area([0, 0, 4000, 2600])] {
+            assert!(w % 2 == 0 && h % 2 == 0, "{w}x{h} must be even");
+            assert!(((w + 15) / 16) * ((h + 15) / 16) <= MAX_MACROBLOCKS, "{w}x{h} is over the limit");
+        }
     }
 
     #[test]
@@ -992,6 +1028,24 @@ mod tests {
         let len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
         std::fs::remove_file(&path).unwrap();
         assert!(len > 500, "mp4 is only {len} bytes");
+    }
+
+    /// The largest frame `fit_area` lets through (a 5K screen) encodes and
+    /// decodes back at full size.
+    #[test]
+    fn largest_area_encodes() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("target").join("test-largest.mp4");
+        let [_, _, w, h] = fit_area([0, 0, 5120, 2880]);
+        let (w, h) = (w as u32, h as u32);
+        let mut enc = Encoder::new(&path, w, h, false).expect("encoder at the size limit");
+        let nv12 = vec![100u8; (w * h * 3 / 2) as usize];
+        for f in 0..3 {
+            enc.video(&nv12, f * TICKS / FPS as i64).expect("frame at the size limit");
+        }
+        enc.finish().expect("finalize at the size limit");
+        let px = unsafe { first_frame_bgra(&path, h as usize) }.expect("decode");
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(px.len(), (w * h * 4) as usize);
     }
 
     #[test]
