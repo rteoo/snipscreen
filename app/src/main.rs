@@ -167,7 +167,30 @@ enum Stage {
 }
 
 const BAR: Vec2 = vec2(372.0, 52.0);
+/// Extra bar height while a message is showing under the controls.
+const BAR_NOTE_H: f32 = 28.0;
+/// How long a message stays up once something is drawing it.
+const NOTE_SECS: f64 = 4.0;
 const FRAME_TITLE: &str = "Snipscreen recording area";
+
+/// A message for the user. Its clock starts the first time a view draws it, so
+/// one raised while the picker or the recording bar owns the window (nothing
+/// draws it there) is still on screen when the normal window comes back.
+struct Note {
+    msg: String,
+    until: Option<f64>,
+}
+
+impl Note {
+    fn new(msg: String) -> Self {
+        Self { msg, until: None }
+    }
+
+    /// Starts the clock on the first call; false once it has run out.
+    fn visible(&mut self, now: f64) -> bool {
+        now <= *self.until.get_or_insert(now + NOTE_SECS)
+    }
+}
 
 struct ScreenshotJob {
     path: PathBuf,
@@ -187,7 +210,7 @@ struct App {
     hotkey_note: Option<String>,
     note_tx: Sender<String>,
     note_rx: Receiver<String>,
-    note: Option<(String, f64)>,
+    note: Option<Note>,
     /// Window corner before the picker took over the screen, in pixels.
     restore_corner: Option<[i32; 2]>,
     /// Frames left in which to put the returning window back on screen.
@@ -519,8 +542,23 @@ impl App {
     }
 
     fn say(&mut self, ctx: &egui::Context, msg: String) {
-        self.note = Some((msg, ctx.input(|i| i.time) + 4.0));
-        ctx.request_repaint_after(Duration::from_secs_f32(4.1));
+        self.note = Some(Note::new(msg));
+        ctx.request_repaint();
+    }
+
+    /// The message to draw right now, if any; the first draw starts its clock.
+    fn live_note(&mut self, ctx: &egui::Context) -> Option<String> {
+        let now = ctx.input(|i| i.time);
+        let note = self.note.as_mut()?;
+        let first_draw = note.until.is_none();
+        if !note.visible(now) {
+            self.note = None;
+            return None;
+        }
+        if first_draw {
+            ctx.request_repaint_after(Duration::from_secs_f64(NOTE_SECS + 0.1));
+        }
+        Some(note.msg.clone())
     }
 }
 
@@ -578,7 +616,10 @@ impl eframe::App for App {
                         self.empty_state(ui);
                     }
                 });
-            self.toast(&ctx, video_top);
+            // The window is hidden while waiting; a message shown now would be gone before anyone saw it.
+            if !matches!(self.stage, Stage::Waiting) {
+                self.toast(&ctx, video_top);
+            }
         }
         self.drive_screenshot(&ctx);
     }
@@ -874,11 +915,7 @@ impl App {
 
     /// `video_top` is the top of the content area while the video view is showing.
     fn toast(&mut self, ctx: &egui::Context, video_top: Option<f32>) {
-        let now = ctx.input(|i| i.time);
-        if self.note.as_ref().is_some_and(|(_, until)| now > *until) {
-            self.note = None;
-        }
-        let Some((msg, _)) = &self.note else { return };
+        let Some(msg) = self.live_note(ctx) else { return };
         let (align, offset) = toast_anchor(video_top);
         egui::Area::new(egui::Id::unique("toast"))
             .anchor(align, offset)
@@ -1316,11 +1353,13 @@ impl App {
     fn rec_bar_ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         let hwnd = self.hwnd as HWND;
+        let message = self.live_note(&ctx);
         let Stage::Recording(bar) = &mut self.stage else { return };
 
         // Sit just above the area, or inside its top edge when there's no room.
         let ppp = ctx.input(|i| i.viewport().native_pixels_per_point).unwrap_or(1.0);
-        let (bw, bh) = ((BAR.x * ppp).round() as i32, (BAR.y * ppp).round() as i32);
+        let bar_h = if message.is_some() { BAR.y + BAR_NOTE_H } else { BAR.y };
+        let (bw, bh) = ((BAR.x * ppp).round() as i32, (bar_h * ppp).round() as i32);
         let [x, y, w, h] = bar.area;
         let work = win::work_area_at(x + w / 2, y + h / 2);
         let (bx, by) = bar_position(bar.area, work, bw, bh);
@@ -1339,6 +1378,14 @@ impl App {
             close = true;
         }
 
+        if let Some(m) = &message {
+            egui::Panel::bottom("rec_note")
+                .frame(egui::Frame::new().fill(TOOLBAR_BG).inner_margin(egui::Margin::symmetric(12, 6)))
+                .show_separator_line(false)
+                .show(ui, |ui| {
+                    ui.add(egui::Label::new(RichText::new(m).color(ICON)).truncate());
+                });
+        }
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(TOOLBAR_BG).stroke((1.0, OUTLINE)).inner_margin(egui::Margin::symmetric(8, 8)))
             .show(ui, |ui| {
@@ -1856,6 +1903,15 @@ fn bar_position(area: [i32; 4], work: [i32; 4], bw: i32, bh: i32) -> (i32, i32) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn note_clock_starts_when_first_drawn() {
+        let mut n = Note::new("x".into());
+        // Raised at t=0 but only drawn from t=100: it still gets its full time.
+        assert!(n.visible(100.0));
+        assert!(n.visible(100.0 + NOTE_SECS));
+        assert!(!n.visible(100.0 + NOTE_SECS + 0.01));
+    }
 
     #[test]
     fn toast_leaves_the_video_buttons_alone() {
