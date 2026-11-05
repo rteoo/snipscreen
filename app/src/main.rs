@@ -9,7 +9,7 @@ mod win;
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use eframe::egui::{
     self, pos2, vec2, Align, Align2, Color32, ColorImage, CornerRadius, CursorIcon, Event, FontId,
@@ -91,6 +91,12 @@ impl Shape_ {
 
 const DELAYS: [u64; 4] = [0, 3, 5, 10];
 
+/// Whole seconds to show for a delay with `left` still to run, counting
+/// 3, 2, 1; `None` once it has run out.
+fn countdown_secs(left: Duration) -> Option<u64> {
+    (!left.is_zero()).then(|| left.as_secs() + u64::from(left.subsec_nanos() > 0))
+}
+
 fn delay_label(s: u64) -> String {
     if s == 0 { "No delay".into() } else { format!("{s} seconds") }
 }
@@ -152,6 +158,8 @@ struct VideoResult {
 
 enum Stage {
     Idle,
+    /// Delay running with the window still visible, so it can show the countdown.
+    Counting { end: Instant },
     /// Window hidden; the screen is about to be copied.
     Waiting,
     Picking(Box<Picker>),
@@ -279,23 +287,54 @@ impl App {
     }
 
     fn start_snip(&mut self, ctx: &egui::Context) {
-        if !matches!(self.stage, Stage::Idle) {
+        if !matches!(self.stage, Stage::Idle | Stage::Counting { .. }) {
             return;
         }
+        let delay = if self.mode == Mode::Photo { self.delay } else { 0 };
+        if delay == 0 {
+            self.hide_and_grab(ctx);
+            return;
+        }
+        // Pressing New / Ctrl+N / the hotkey during the countdown starts it over.
+        self.stage = Stage::Counting { end: Instant::now() + Duration::from_secs(delay) };
+        // On top and un-minimized without taking focus, so a hotkey snip from
+        // another app still shows the countdown without disturbing what is on screen.
+        win::restore_inactive(self.hwnd as HWND);
+        ctx.send_viewport_cmd(ViewportCommand::WindowLevel(WindowLevel::AlwaysOnTop));
+        ctx.request_repaint();
+    }
+
+    /// Hides the window, waits for its hide animation, then copies the screen.
+    fn hide_and_grab(&mut self, ctx: &egui::Context) {
         self.restore_corner = win::window_corner(self.hwnd as HWND);
         ctx.send_viewport_cmd(ViewportCommand::Visible(false));
         self.stage = Stage::Waiting;
-        let delay = if self.mode == Mode::Photo { self.delay } else { 0 };
-        let (tx, ctx, wait) = (
-            self.grab_tx.clone(),
-            ctx.clone(),
-            Duration::from_secs(delay) + HIDE_SETTLE,
-        );
+        let (tx, ctx) = (self.grab_tx.clone(), ctx.clone());
         std::thread::spawn(move || {
-            std::thread::sleep(wait);
+            std::thread::sleep(HIDE_SETTLE);
             let _ = tx.send(win::grab_screen());
             ctx.request_repaint();
         });
+    }
+
+    /// Advances the delay countdown: Esc cancels, the last second hides the window.
+    fn tick_countdown(&mut self, ctx: &egui::Context) {
+        let Stage::Counting { end } = self.stage else { return };
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.cancel_countdown(ctx);
+            return;
+        }
+        let left = end.saturating_duration_since(Instant::now());
+        match countdown_secs(left) {
+            None => self.hide_and_grab(ctx),
+            // Wake when the displayed number is due to change.
+            Some(s) => ctx.request_repaint_after(left - Duration::from_secs(s - 1) + Duration::from_millis(1)),
+        }
+    }
+
+    fn cancel_countdown(&mut self, ctx: &egui::Context) {
+        self.stage = Stage::Idle;
+        self.show_window(ctx);
     }
 
     fn on_grab(&mut self, ctx: &egui::Context, grab: Result<win::Grab, String>) {
@@ -509,6 +548,7 @@ impl eframe::App for App {
         if let Ok(grab) = self.grab_rx.try_recv() {
             self.on_grab(ctx, grab);
         }
+        self.tick_countdown(ctx);
         self.reveal_picker(ctx);
         self.settle_window(ctx);
     }
@@ -526,7 +566,9 @@ impl eframe::App for App {
             egui::CentralPanel::default()
                 .frame(egui::Frame::new().fill(ui.style().visuals.extreme_bg_color))
                 .show(ui, |ui| {
-                    if self.doc.is_some() {
+                    if let Stage::Counting { end } = self.stage {
+                        self.countdown_view(ui, end);
+                    } else if self.doc.is_some() {
                         self.canvas(ui);
                     } else if self.video.is_some() {
                         self.video_view(ui);
@@ -846,6 +888,20 @@ impl App {
                     .inner_margin(egui::Margin::symmetric(14, 8))
                     .show(ui, |ui| ui.label(RichText::new(msg.as_str()).color(ICON)));
             });
+    }
+
+    fn countdown_view(&mut self, ui: &mut egui::Ui, end: Instant) {
+        let secs = countdown_secs(end.saturating_duration_since(Instant::now())).unwrap_or(0);
+        ui.with_layout(Layout::top_down(Align::Center), |ui| {
+            ui.add_space((ui.available_height() * 0.5 - 60.0).max(8.0));
+            ui.label(RichText::new(format!("Snipping in {secs}…")).size(28.0).strong());
+            ui.add_space(6.0);
+            ui.label(RichText::new("The window hides when the countdown ends.").weak());
+            ui.add_space(12.0);
+            if ui.button("Cancel (Esc)").clicked() {
+                self.cancel_countdown(ui.ctx());
+            }
+        });
     }
 
     fn empty_state(&mut self, ui: &mut egui::Ui) {
@@ -1785,6 +1841,17 @@ fn bar_position(area: [i32; 4], work: [i32; 4], bw: i32, bh: i32) -> (i32, i32) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn countdown_shows_whole_seconds_rounded_up() {
+        let ms = Duration::from_millis;
+        assert_eq!(countdown_secs(ms(3000)), Some(3));
+        assert_eq!(countdown_secs(ms(2999)), Some(3));
+        assert_eq!(countdown_secs(ms(2001)), Some(3));
+        assert_eq!(countdown_secs(ms(2000)), Some(2));
+        assert_eq!(countdown_secs(ms(1)), Some(1));
+        assert_eq!(countdown_secs(Duration::ZERO), None);
+    }
 
     /// Keys seen by `read_keys` in one frame after pressing `key` with `mods`.
     fn press(key: Key, mods: Modifiers) -> Keys {

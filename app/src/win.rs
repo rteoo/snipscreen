@@ -32,7 +32,7 @@ use windows_sys::Win32::UI::Shell::{FOLDERID_Pictures, FOLDERID_Videos, SHGetKno
 use windows_sys::Win32::System::Com::CoTaskMemFree;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     EnumWindows, FindWindowW, GetClientRect, GetCursorPos, GetWindowPlacement, WINDOWPLACEMENT, SetWindowDisplayAffinity, WDA_EXCLUDEFROMCAPTURE, WDA_NONE, GetMessageW, GetSystemMetrics, GetWindowLongW, GetWindowRect,
-    GetWindowTextLengthW, IsIconic, IsWindowVisible, SetWindowPos, GWL_EXSTYLE, MSG,
+    GetWindowTextLengthW, IsIconic, ShowWindow, SW_SHOWNOACTIVATE, IsWindowVisible, SetWindowPos, GWL_EXSTYLE, MSG,
     SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SWP_NOACTIVATE,
     SWP_NOSIZE, SWP_NOZORDER, WM_HOTKEY, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT,
 };
@@ -216,6 +216,16 @@ pub fn window_corner(hwnd: HWND) -> Option<[i32; 2]> {
         }
         let r = wp.rcNormalPosition;
         Some(workspace_to_screen([r.left, r.top], [mi.rcWork.left - mi.rcMonitor.left, mi.rcWork.top - mi.rcMonitor.top]))
+    }
+}
+
+/// Un-minimizes the window without activating it, so a hotkey snip from another
+/// app can show its countdown without taking focus.
+pub fn restore_inactive(hwnd: HWND) {
+    unsafe {
+        if IsIconic(hwnd) != 0 {
+            ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        }
     }
 }
 
