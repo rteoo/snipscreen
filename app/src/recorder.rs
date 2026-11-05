@@ -123,8 +123,7 @@ fn record(
     clock: Instant,
     on_event: &impl Fn(Event),
 ) -> Result<Finished, String> {
-    let mut grab = Grabber::new(fit_area(s.area))
-        .map_err(|e| format!("couldn't read the screen: {}", describe(&e)))?;
+    let mut grab = Grabber::new(fit_area(s.area)).map_err(|e| format!("couldn't read the screen: {e}"))?;
     let [_, _, w, h] = grab.area;
     if w < 32 || h < 32 {
         return Err("the area is too small to record".into());
@@ -232,6 +231,37 @@ fn describe(e: &windows::core::Error) -> String {
     if text.is_empty() { format!("error {:#010x}", code as u32) } else { text.to_string() }
 }
 
+/// Why a `Grabber` could not be set up. Failures that Windows reports with no
+/// error code (a missing monitor, a failed allocation) get their own wording
+/// here instead of `Error::empty()`'s empty text.
+#[derive(Debug)]
+enum GrabError {
+    Win(windows::core::Error),
+    /// The area's centre is not on any monitor.
+    NoMonitor,
+    /// The graphics driver gave back no device or context.
+    NoDevice,
+    /// The memory bitmap for drawing the pointer could not be allocated.
+    NoBitmap,
+}
+
+impl From<windows::core::Error> for GrabError {
+    fn from(e: windows::core::Error) -> Self {
+        Self::Win(e)
+    }
+}
+
+impl std::fmt::Display for GrabError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Win(e) => f.write_str(&describe(e)),
+            Self::NoMonitor => f.write_str("the area isn't on any screen"),
+            Self::NoDevice => f.write_str("the graphics driver didn't provide a device"),
+            Self::NoBitmap => f.write_str("not enough memory for the recording buffer"),
+        }
+    }
+}
+
 /// Wait between attempts to re-open a lost desktop duplication: short at
 /// first so a dismissed UAC prompt resumes quickly, then capped.
 const REOPEN_FIRST: Duration = Duration::from_millis(100);
@@ -271,7 +301,7 @@ impl Grabber {
     /// Uses the monitor holding the area's centre and trims the area to it.
     // ceiling: one monitor per recording; spanning monitors would need one
     // duplication per output stitched together.
-    fn new(area: [i32; 4]) -> windows::core::Result<Self> {
+    fn new(area: [i32; 4]) -> Result<Self, GrabError> {
         let [x, y, w, h] = area;
         let (cx, cy) = (x + w / 2, y + h / 2);
         unsafe {
@@ -290,7 +320,7 @@ impl Grabber {
                 }
                 a += 1;
             }
-            let (adapter, output, mon) = found.ok_or_else(windows::core::Error::empty)?;
+            let (adapter, output, mon) = found.ok_or(GrabError::NoMonitor)?;
             let area = on_monitor(area, [mon.left, mon.top, mon.right, mon.bottom]);
             let local = [area[0] - mon.left, area[1] - mon.top, area[2], area[3]];
 
@@ -306,8 +336,8 @@ impl Grabber {
                 None,
                 Some(&mut context),
             )?;
-            let device = device.ok_or_else(windows::core::Error::empty)?;
-            let context = context.ok_or_else(windows::core::Error::empty)?;
+            let device = device.ok_or(GrabError::NoDevice)?;
+            let context = context.ok_or(GrabError::NoDevice)?;
             let output: IDXGIOutput1 = output.cast()?;
             let dup = output.DuplicateOutput(&device)?;
             let rotation = dup.GetDesc().Rotation;
@@ -327,7 +357,7 @@ impl Grabber {
             let bitmap = CreateDIBSection(mem, &bi, DIB_RGB_COLORS, &mut pixels, null_mut(), 0);
             if bitmap.is_null() || pixels.is_null() {
                 DeleteDC(mem);
-                return Err(windows::core::Error::empty());
+                return Err(GrabError::NoBitmap);
             }
             let old = SelectObject(mem, bitmap);
             Ok(Self {
@@ -952,6 +982,18 @@ mod tests {
     #[test]
     fn blank_windows_errors_still_say_something() {
         assert_eq!(describe(&windows::core::Error::empty()), "unknown error");
+    }
+
+    #[test]
+    fn grabber_setup_failures_say_what_went_wrong() {
+        // Nowhere near any monitor: no device is needed to find that out.
+        let err = Grabber::new([-200_000, -200_000, 100, 100]).err().expect("an area off every screen must be refused");
+        assert!(matches!(err, GrabError::NoMonitor), "{err:?}");
+        assert_eq!(err.to_string(), "the area isn't on any screen");
+        for e in [GrabError::NoDevice, GrabError::NoBitmap, GrabError::Win(windows::core::Error::empty())] {
+            let text = e.to_string();
+            assert!(text.len() > 10 && !text.contains("completed successfully"), "{text}");
+        }
     }
 
     unsafe fn first_frame_bgra(path: &Path, height: usize) -> windows::core::Result<Vec<u8>> {
