@@ -741,10 +741,7 @@ impl App {
         let icon = Rect::from_center_size(rect.left_center() + vec2(20.0, 0.0), vec2(18.0, 18.0));
         icons::paint(p, icon, Icon::Plus, ACCENT, None);
         p.text(rect.left_center() + vec2(36.0, 0.0), Align2::LEFT_CENTER, "New", FontId::proportional(14.0), ICON);
-        let tip = match self.mode {
-            Mode::Photo => "New snip (Ctrl+N, or Alt+Shift+S anywhere)",
-            Mode::Video => "New recording (Ctrl+N, or Alt+Shift+S anywhere)",
-        };
+        let tip = new_tooltip(self.mode, self.hotkey_rx.is_some(), self.hotkey_note.as_deref());
         if resp.on_hover_text(tip).clicked() {
             self.start_snip(&ctx);
         }
@@ -1852,6 +1849,20 @@ fn icon_button(ui: &mut egui::Ui, icon: Icon, ink: Option<Color32>, selected: bo
     resp.on_hover_text(tip)
 }
 
+/// The New button's tooltip; the global shortcut is only advertised while it is registered.
+/// `note` is why it isn't (none in a screenshot run, which never tries).
+fn new_tooltip(mode: Mode, hotkey_registered: bool, note: Option<&str>) -> String {
+    let what = match mode {
+        Mode::Photo => "New snip",
+        Mode::Video => "New recording",
+    };
+    match (hotkey_registered, note) {
+        (true, _) => format!("{what} (Ctrl+N, or Alt+Shift+S anywhere)"),
+        (false, Some(why)) => format!("{what} (Ctrl+N). {why}"),
+        (false, None) => format!("{what} (Ctrl+N)"),
+    }
+}
+
 /// Where the toast sits: bottom centre, except over the video view, whose Play
 /// and "Show in folder" buttons live down there, so it drops from the top of the content instead.
 fn toast_anchor(video_top: Option<f32>) -> (Align2, Vec2) {
@@ -1949,6 +1960,15 @@ mod tests {
         assert!(n.visible(100.0));
         assert!(n.visible(100.0 + NOTE_SECS));
         assert!(!n.visible(100.0 + NOTE_SECS + 0.01));
+    }
+
+    #[test]
+    fn new_tooltip_only_promises_a_registered_hotkey() {
+        assert_eq!(new_tooltip(Mode::Photo, true, None), "New snip (Ctrl+N, or Alt+Shift+S anywhere)");
+        assert_eq!(new_tooltip(Mode::Video, true, None), "New recording (Ctrl+N, or Alt+Shift+S anywhere)");
+        let taken = new_tooltip(Mode::Photo, false, Some("Alt+Shift+S is already used by another app"));
+        assert_eq!(taken, "New snip (Ctrl+N). Alt+Shift+S is already used by another app");
+        assert!(!new_tooltip(Mode::Video, false, None).contains("Alt+Shift+S"));
     }
 
     #[test]
