@@ -541,6 +541,7 @@ impl App {
         self.crop = None;
         self.drawing = None;
         self.zoom = None;
+        self.key_zoom = 1.0;
         self.place_window(ctx, self.window_size_for(ctx));
         let Some(doc) = &self.doc else { return };
         let image = doc.image.clone();
@@ -688,7 +689,11 @@ impl App {
     fn shortcuts(&mut self, ctx: &egui::Context) {
         // Popups close themselves on Esc and a focused button activates itself on Enter, so those keys are left to them.
         let (popup_open, focused) = (egui::Popup::is_any_open(ctx), ctx.memory(|m| m.focused().is_some()));
-        let Keys { new, save, undo, redo, copy, enter, esc, zoom_in, zoom_out, zoom_fit } = ctx.input_mut(|i| read_keys(i, popup_open, focused));
+        let mut keys = ctx.input_mut(|i| read_keys(i, popup_open, focused));
+        if matches!(self.stage, Stage::Counting { .. }) {
+            keys = keys.during_countdown();
+        }
+        let Keys { new, save, undo, redo, copy, enter, esc, zoom_in, zoom_out, zoom_fit } = keys;
         if new {
             self.start_snip(ctx);
         }
@@ -1917,6 +1922,14 @@ struct Keys {
     zoom_fit: bool,
 }
 
+impl Keys {
+    /// The countdown owns the window until it ends: New restarts it and Esc cancels it (see `tick_countdown`);
+    /// everything else would edit, save or zoom a snip that is about to be replaced.
+    fn during_countdown(self) -> Keys {
+        Keys { new: self.new, esc: self.esc, ..Keys::default() }
+    }
+}
+
 /// Esc is grabbed system-wide only while a countdown is running.
 fn wants_escape_hotkey(stage: &Stage) -> bool {
     matches!(stage, Stage::Counting { .. })
@@ -2417,6 +2430,16 @@ mod tests {
         assert_eq!(auto_note(err("busy"), None).as_deref(), Some("Couldn't copy: busy"));
         assert_eq!(auto_note(None, err("disk full")).as_deref(), Some("Couldn't auto-save: disk full"));
         assert_eq!(auto_note(err("busy"), err("disk full")).as_deref(), Some("Couldn't copy: busy · Couldn't auto-save: disk full"));
+    }
+
+    #[test]
+    fn only_new_and_esc_act_during_a_countdown() {
+        let all = Keys { new: true, save: true, undo: true, redo: true, copy: true, enter: true, esc: true, zoom_in: true, zoom_out: true, zoom_fit: true };
+        assert_eq!(all.during_countdown(), Keys { new: true, esc: true, ..Default::default() });
+        for keys in [press(Key::S, Modifiers::COMMAND), press(Key::Z, Modifiers::COMMAND), press(Key::Enter, Modifiers::NONE), press(Key::Plus, Modifiers::COMMAND)] {
+            assert_eq!(keys.during_countdown(), Keys::default());
+        }
+        assert_eq!(press(Key::N, Modifiers::COMMAND).during_countdown(), Keys { new: true, ..Default::default() });
     }
 
     #[test]
