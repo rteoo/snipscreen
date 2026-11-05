@@ -218,7 +218,7 @@ fn record(
     })?;
     let seconds = clock.elapsed().as_secs_f64();
     drop(captures);
-    enc.finish().map_err(werr)?;
+    enc.finish().map_err(|e| finalize_failed(&e, stopped_early.as_deref()))?;
     Ok(Finished { path: s.path.clone(), seconds, size: [w as u32, h as u32], first_frame, stopped_early })
 }
 
@@ -243,6 +243,16 @@ fn pump(
         return Err("nothing was recorded".into());
     }
     Ok(None)
+}
+
+/// Why the file couldn't be finished, with the reason the recording had
+/// already stopped early, if it had: that is usually the cause of both.
+fn finalize_failed(e: &windows::core::Error, stopped_early: Option<&str>) -> String {
+    let failed = format!("couldn't write the video: {}", describe(e));
+    match stopped_early {
+        Some(why) => format!("the recording stopped early ({why}), then {failed}"),
+        None => failed,
+    }
 }
 
 /// `Error::empty()` reads as "The operation completed successfully." and
@@ -1279,6 +1289,15 @@ mod tests {
         assert_eq!(pump(&mut enc, &AtomicBool::new(true), |_| Ok(true)), Err("nothing was recorded".to_string()));
         drop(enc);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn failed_finalize_keeps_the_early_stop_reason() {
+        use windows::Win32::Foundation::E_FAIL;
+        let e = windows::core::Error::from(E_FAIL);
+        let text = finalize_failed(&e, Some("couldn't read the screen: device removed"));
+        assert!(text.starts_with("the recording stopped early (couldn't read the screen: device removed), then couldn't write the video: "), "{text}");
+        assert_eq!(finalize_failed(&e, None), format!("couldn't write the video: {}", describe(&e)));
     }
 
     #[test]
