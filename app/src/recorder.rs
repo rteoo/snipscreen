@@ -11,8 +11,9 @@ use std::time::{Duration, Instant};
 
 use eframe::egui::{Color32, ColorImage};
 use windows::core::HSTRING;
+use windows::core::HRESULT;
 use windows::core::Interface;
-use windows::Win32::Foundation::HMODULE;
+use windows::Win32::Foundation::{E_ACCESSDENIED, HMODULE};
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
 use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, D3D11_BOX,
@@ -22,7 +23,8 @@ use windows::Win32::Graphics::Direct3D11::{
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, IDXGIFactory1, IDXGIOutput1, IDXGIOutputDuplication,
-    DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO,
+    DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_NOT_CURRENTLY_AVAILABLE, DXGI_ERROR_SESSION_DISCONNECTED,
+    DXGI_ERROR_UNSUPPORTED, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO,
 };
 use windows::Win32::Media::MediaFoundation::*;
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
@@ -222,13 +224,23 @@ fn describe(e: &windows::core::Error) -> String {
     if text.is_empty() { format!("error {:#010x}", code as u32) } else { text.to_string() }
 }
 
+/// Wait between attempts to re-open a lost desktop duplication: short at
+/// first so a dismissed UAC prompt resumes quickly, then capped.
+const REOPEN_FIRST: Duration = Duration::from_millis(100);
+const REOPEN_MAX: Duration = Duration::from_secs(1);
+
 /// Reads one monitor through DXGI Desktop Duplication (GPU copy, no stalls
 /// from other windows redrawing) and draws the mouse pointer on top.
 struct Grabber {
     device: ID3D11Device,
     context: ID3D11DeviceContext,
     output: IDXGIOutput1,
-    dup: IDXGIOutputDuplication,
+    /// `None` while the desktop is out of reach (UAC, lock screen, mode
+    /// change); the last image keeps being recorded until it comes back.
+    dup: Option<IDXGIOutputDuplication>,
+    /// Next attempt to re-open a lost duplication, and the wait after that.
+    reopen_at: Instant,
+    reopen_wait: Duration,
     staging: ID3D11Texture2D,
     /// Area relative to the monitor's top-left: x, y, w, h.
     local: [i32; 4],
@@ -326,7 +338,9 @@ impl Grabber {
                 device,
                 context,
                 output,
-                dup,
+                dup: Some(dup),
+                reopen_at: Instant::now(),
+                reopen_wait: REOPEN_FIRST,
                 staging,
                 local,
                 area,
@@ -341,19 +355,20 @@ impl Grabber {
     }
 
     /// Pulls a new screen image if one is ready. Waits up to `wait_ms` for it.
+    /// A lost desktop is not an error: the last image stays and re-opening is
+    /// retried on later calls.
     fn refresh(&mut self, wait_ms: u32) -> windows::core::Result<()> {
         unsafe {
+            let Some(dup) = &self.dup else { return self.reopen() };
             let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
             let mut resource = None;
-            match self.dup.AcquireNextFrame(wait_ms, &mut info, &mut resource) {
-                Ok(()) => {}
-                Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => return Ok(()),
-                Err(e) if e.code() == DXGI_ERROR_ACCESS_LOST => {
-                    // Resolution change, full-screen app, lock screen: start over.
-                    self.dup = self.output.DuplicateOutput(&self.device)?;
-                    return Ok(());
-                }
-                Err(e) => return Err(e),
+            if let Err(e) = dup.AcquireNextFrame(wait_ms, &mut info, &mut resource) {
+                return match e.code() {
+                    DXGI_ERROR_WAIT_TIMEOUT => Ok(()),
+                    // Resolution change, full-screen app, UAC, lock screen.
+                    DXGI_ERROR_ACCESS_LOST => self.lost(),
+                    _ => Err(e),
+                };
             }
             let copied = (|| {
                 // Pointer-only updates carry no new desktop image.
@@ -361,16 +376,17 @@ impl Grabber {
                     return Ok(());
                 }
                 let texture: ID3D11Texture2D = resource.ok_or_else(windows::core::Error::empty)?.cast()?;
+                let mut desktop = D3D11_TEXTURE2D_DESC::default();
+                texture.GetDesc(&mut desktop);
+                // ceiling: after a mode change the area keeps its old monitor-relative
+                // position and the encoder its size; a smaller, moved or rotated desktop
+                // records the overlapping part (the rest keeps the last image). Re-read
+                // DXGI_OUTDUPL_DESC and remap/scale if people record across display changes.
                 let [x, y, w, h] = self.local;
-                let src = D3D11_BOX {
-                    left: x as u32,
-                    top: y as u32,
-                    front: 0,
-                    right: (x + w) as u32,
-                    bottom: (y + h) as u32,
-                    back: 1,
-                };
-                self.context.CopySubresourceRegion(&self.staging, 0, 0, 0, 0, &texture, 0, Some(&src));
+                if let Some(src) = clip_box(self.local, [desktop.Width, desktop.Height]) {
+                    let (dx, dy) = ((src.left as i32 - x) as u32, (src.top as i32 - y) as u32);
+                    self.context.CopySubresourceRegion(&self.staging, 0, dx, dy, 0, &texture, 0, Some(&src));
+                }
                 let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
                 self.context.Map(&self.staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))?;
                 let row = (w * 4) as usize;
@@ -382,8 +398,42 @@ impl Grabber {
                 self.have_frame = true;
                 Ok(())
             })();
-            self.dup.ReleaseFrame()?;
+            if let Err(e) = dup.ReleaseFrame() {
+                if e.code() != DXGI_ERROR_ACCESS_LOST {
+                    return Err(e);
+                }
+                self.lost()?;
+            }
             copied
+        }
+    }
+
+    /// The Desktop Duplication docs require releasing the old duplication
+    /// before creating a new one, or `DuplicateOutput` fails.
+    fn lost(&mut self) -> windows::core::Result<()> {
+        self.dup = None;
+        self.reopen_at = Instant::now();
+        self.reopen_wait = REOPEN_FIRST;
+        self.reopen()
+    }
+
+    /// Tries to duplicate the output again once its retry time has come.
+    fn reopen(&mut self) -> windows::core::Result<()> {
+        let now = Instant::now();
+        if now < self.reopen_at {
+            return Ok(());
+        }
+        match unsafe { self.output.DuplicateOutput(&self.device) } {
+            Ok(dup) => {
+                self.dup = Some(dup);
+                Ok(())
+            }
+            Err(e) if reopen_is_transient(e.code()) => {
+                self.reopen_at = now + self.reopen_wait;
+                self.reopen_wait = next_reopen_wait(self.reopen_wait);
+                Ok(())
+            }
+            Err(e) => Err(e),
         }
     }
 
@@ -422,6 +472,36 @@ impl Drop for Grabber {
             DeleteDC(self.mem);
         }
     }
+}
+
+/// `DuplicateOutput` failures that clear up by themselves: the secure desktop
+/// (UAC, lock screen) is up, the display is mid mode change or held by a
+/// full-screen app, the session is switched away, or the per-system limit of
+/// duplications is reached for now.
+// ceiling: DXGI_ERROR_DEVICE_REMOVED (GPU reset, driver update) still ends the
+// recording; recreating the device and staging texture would cover it if that shows up.
+fn reopen_is_transient(code: HRESULT) -> bool {
+    [E_ACCESSDENIED, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_UNSUPPORTED, DXGI_ERROR_NOT_CURRENTLY_AVAILABLE, DXGI_ERROR_SESSION_DISCONNECTED].contains(&code)
+}
+
+fn next_reopen_wait(wait: Duration) -> Duration {
+    (wait * 2).min(REOPEN_MAX)
+}
+
+/// The part of `local` (x, y, w, h) inside a desktop texture of `size`, as a
+/// copy box; `None` when they don't overlap.
+fn clip_box([x, y, w, h]: [i32; 4], [tw, th]: [u32; 2]) -> Option<D3D11_BOX> {
+    let (tw, th) = (tw as i64, th as i64);
+    let (left, right) = ((x as i64).clamp(0, tw), (x as i64 + w as i64).clamp(0, tw));
+    let (top, bottom) = ((y as i64).clamp(0, th), (y as i64 + h as i64).clamp(0, th));
+    (left < right && top < bottom).then_some(D3D11_BOX {
+        left: left as u32,
+        top: top as u32,
+        front: 0,
+        right: right as u32,
+        bottom: bottom as u32,
+        back: 1,
+    })
 }
 
 fn to_color_image(bgra: &[u8], w: usize, h: usize) -> ColorImage {
@@ -591,6 +671,59 @@ mod tests {
     #[test]
     fn area_is_even_and_bounded() {
         assert_eq!(fit_area([5, 7, 1001, 9999]), [5, 7, 1000, 4096]);
+    }
+
+    #[test]
+    fn lost_desktop_errors_are_retried_not_fatal() {
+        for code in [E_ACCESSDENIED, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_UNSUPPORTED, DXGI_ERROR_NOT_CURRENTLY_AVAILABLE, DXGI_ERROR_SESSION_DISCONNECTED] {
+            assert!(reopen_is_transient(code), "{code:?} should be retried");
+        }
+        use windows::Win32::Foundation::{E_INVALIDARG, E_OUTOFMEMORY};
+        use windows::Win32::Graphics::Dxgi::DXGI_ERROR_DEVICE_REMOVED;
+        for code in [E_INVALIDARG, E_OUTOFMEMORY, DXGI_ERROR_DEVICE_REMOVED] {
+            assert!(!reopen_is_transient(code), "{code:?} should end the recording");
+        }
+    }
+
+    #[test]
+    fn reopen_wait_doubles_up_to_a_cap() {
+        let mut wait = REOPEN_FIRST;
+        let mut seen = vec![wait];
+        for _ in 0..6 {
+            wait = next_reopen_wait(wait);
+            seen.push(wait);
+        }
+        let ms: Vec<u128> = seen.iter().map(|d| d.as_millis()).collect();
+        assert_eq!(ms, [100, 200, 400, 800, 1000, 1000, 1000]);
+    }
+
+    #[test]
+    fn copy_box_stays_inside_the_desktop() {
+        let b = |b: D3D11_BOX| [b.left, b.top, b.right, b.bottom];
+        // Unchanged desktop: the whole area.
+        assert_eq!(clip_box([100, 50, 200, 100], [1920, 1080]).map(b), Some([100, 50, 300, 150]));
+        // Desktop shrank under the area: only the overlap.
+        assert_eq!(clip_box([100, 50, 200, 100], [250, 120]).map(b), Some([100, 50, 250, 120]));
+        // Desktop shrank past the area entirely: nothing to copy.
+        assert_eq!(clip_box([1600, 900, 200, 100], [1280, 720]), None);
+        assert_eq!(clip_box([100, 50, 200, 100], [0, 0]), None);
+    }
+
+    /// Needs a desktop. Takes the path a lost duplication takes and checks
+    /// frames keep coming after re-opening.
+    #[test]
+    #[ignore]
+    fn reopens_after_lost_duplication() {
+        let (w, h) = (640, 480);
+        let mut g = Grabber::new([0, 0, w, h]).expect("grabber");
+        g.frame().expect("first frame");
+        // Why the old duplication must go first: a second one is refused while it lives.
+        assert!(unsafe { g.output.DuplicateOutput(&g.device) }.is_err());
+        g.lost().expect("re-open");
+        assert!(g.dup.is_some(), "duplication should be re-opened");
+        for _ in 0..3 {
+            assert_eq!(g.frame().expect("frame after re-open").len(), (w * h * 4) as usize);
+        }
     }
 
     /// Writes a 2 s clip of moving bars with a tone, without touching the
