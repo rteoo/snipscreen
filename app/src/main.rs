@@ -39,6 +39,8 @@ const MIN_WINDOW_H: f32 = 240.0;
 const MIN_EDIT_W: f32 = 850.0;
 /// Clear space kept between the toolbar groups.
 const GROUP_GAP: f32 = 16.0;
+const MIN_ZOOM: f32 = 0.05;
+const MAX_ZOOM: f32 = 8.0;
 /// Snip zoom change per Ctrl+Plus / Ctrl+Minus press.
 const ZOOM_STEP: f32 = 1.25;
 /// Empty space kept around the snip inside the scrolling canvas, in points.
@@ -1063,7 +1065,7 @@ impl App {
         let zoom_delta = wheel_zoom * std::mem::replace(&mut self.key_zoom, 1.0);
         let old_zoom = self.zoom.unwrap_or(fit);
         if zoom_delta != 1.0 {
-            self.zoom = Some((old_zoom * zoom_delta).clamp(0.05, 8.0));
+            self.zoom = Some(clamp_zoom(old_zoom * zoom_delta, fit));
         }
         let zoom = self.zoom.unwrap_or(fit);
         let shown = natural * zoom;
@@ -1870,6 +1872,12 @@ fn anchored_offset(offset: Vec2, anchor: Vec2, old_shown: Vec2, new_shown: Vec2,
     (snip_corner(new_shown) + on_snip * new_shown - anchor).max(Vec2::ZERO)
 }
 
+/// Explicit zoom limits. The floor gives way to a smaller fit, so zooming out from a very large
+/// snip never jumps up to the floor and enlarges it.
+fn clamp_zoom(zoom: f32, fit: f32) -> f32 {
+    zoom.clamp(MIN_ZOOM.min(fit), MAX_ZOOM)
+}
+
 fn zoom_label(zoom: f32) -> String {
     // Zoom 1.0 is one screen pixel per snip pixel.
     format!("{:.0}%", zoom * 100.0)
@@ -2459,6 +2467,17 @@ mod tests {
         tx.send(()).unwrap();
         assert!(drain(&rx));
         assert!(!drain(&rx), "a press must be reported once");
+    }
+
+    #[test]
+    fn zoom_out_never_enlarges_a_snip_that_fits_below_the_floor() {
+        // Fit 3%: the 5% floor would make zooming out grow the snip.
+        let fit = 0.03;
+        assert!(clamp_zoom(fit / ZOOM_STEP, fit) <= fit);
+        assert_eq!(clamp_zoom(fit * ZOOM_STEP, fit), fit * ZOOM_STEP, "zooming in works as usual");
+        // Normal fit: the floor and ceiling hold.
+        assert_eq!(clamp_zoom(0.01, 0.5), MIN_ZOOM);
+        assert_eq!(clamp_zoom(100.0, 0.5), MAX_ZOOM);
     }
 
     /// One frame in the picker's order: the full-screen response is read first, the shape menu shown after it.
