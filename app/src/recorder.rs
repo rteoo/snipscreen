@@ -257,7 +257,7 @@ fn finalize_failed(e: &windows::core::Error, stopped_early: Option<&str>) -> Str
 
 /// `Error::empty()` reads as "The operation completed successfully." and
 /// some codes carry no text; never show either to the user.
-fn describe(e: &windows::core::Error) -> String {
+pub(crate) fn describe(e: &windows::core::Error) -> String {
     let code = e.code().0;
     if code == 0 {
         return "unknown error".into();

@@ -145,8 +145,12 @@ impl Drop for Capture {
 
 struct Client(IAudioClient, IAudioCaptureClient);
 
+/// What failed and why, never with Windows' text left blank.
+fn fail(what: &str, e: windows::core::Error) -> String {
+    format!("{what}: {}", crate::recorder::describe(&e))
+}
+
 fn open(source: &Source) -> Result<Client, String> {
-    let fail = |what: &str, e: windows::core::Error| format!("{what}: {}", e.message());
     unsafe {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
         let devices: IMMDeviceEnumerator =
@@ -346,6 +350,13 @@ mod tests {
             assert!(live.lock().unwrap().len() <= (RATE as usize / 10 + tick) * CHANNELS, "live queue grew at tick {i}");
         }
         assert!(mixed >= (RATE as usize * 10 - RATE as usize / 10) * CHANNELS, "only {mixed} samples mixed");
+    }
+
+    #[test]
+    fn device_errors_without_text_still_say_something() {
+        assert_eq!(fail("set up device", windows::core::Error::empty()), "set up device: unknown error");
+        let text = fail("set up device", windows::core::Error::from_hresult(windows::core::HRESULT(0x8889_0000u32 as i32)));
+        assert!(text.len() > "set up device: ".len() + 3, "{text}");
     }
 
     #[test]
