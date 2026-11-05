@@ -368,7 +368,7 @@ impl App {
     /// Advances the delay countdown: Esc cancels, the last second hides the window.
     fn tick_countdown(&mut self, ctx: &egui::Context) {
         let Stage::Counting { end } = self.stage else { return };
-        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        if take_escape(ctx) {
             self.cancel_countdown(ctx);
             return;
         }
@@ -652,7 +652,9 @@ impl eframe::App for App {
 
 impl App {
     fn shortcuts(&mut self, ctx: &egui::Context) {
-        let Keys { new, save, undo, redo, copy, enter, esc, zoom_in, zoom_out, zoom_fit } = ctx.input_mut(read_keys);
+        // Popups close themselves on Esc and a focused button activates itself on Enter, so those keys are left to them.
+        let (popup_open, focused) = (egui::Popup::is_any_open(ctx), ctx.memory(|m| m.focused().is_some()));
+        let Keys { new, save, undo, redo, copy, enter, esc, zoom_in, zoom_out, zoom_fit } = ctx.input_mut(|i| read_keys(i, popup_open, focused));
         if new {
             self.start_snip(ctx);
         }
@@ -1154,7 +1156,7 @@ impl App {
         // An area in image pixels: cropped for a photo, recorded for a video.
         let mut picked: Option<Rect> = None;
         let mut whole_monitor = false;
-        let mut cancel = ctx.input(|i| i.key_pressed(Key::Escape));
+        let mut cancel = take_escape(&ctx);
 
         match self.shape {
             Shape_::Rectangle => {
@@ -1396,7 +1398,7 @@ impl App {
         let (mut start, mut stop, mut close) = (false, false, false);
         let saving = bar.saving;
         let notes = bar.notes.join("\n");
-        if !recording && ctx.input(|i| i.key_pressed(Key::Escape)) {
+        if !recording && take_escape(&ctx) {
             close = true;
         }
 
@@ -1832,7 +1834,19 @@ struct Keys {
     zoom_fit: bool,
 }
 
-fn read_keys(i: &mut egui::InputState) -> Keys {
+/// Esc cancels the innermost thing: an open popup or menu closes itself on Esc, so while one is open
+/// the key is left alone, and otherwise it is consumed so only one action reacts to it.
+fn take_escape(ctx: &egui::Context) -> bool {
+    let popup_open = egui::Popup::is_any_open(ctx);
+    ctx.input_mut(|i| escape_for_app(i, popup_open))
+}
+
+fn escape_for_app(i: &mut egui::InputState, popup_open: bool) -> bool {
+    !popup_open && i.consume_key(Modifiers::NONE, Key::Escape)
+}
+
+/// `popup_open`: a popup or menu is showing. `focused`: a widget holds keyboard focus.
+fn read_keys(i: &mut egui::InputState, popup_open: bool, focused: bool) -> Keys {
     let cmd = |k| KeyboardShortcut::new(Modifiers::COMMAND, k);
     // egui ignores an extra Shift when matching, so Ctrl+Shift+Z must be
     // consumed before Ctrl+Z or it would undo.
@@ -1846,8 +1860,9 @@ fn read_keys(i: &mut egui::InputState) -> Keys {
         redo: redo_shift | i.consume_shortcut(&cmd(Key::Y)),
         // egui turns Ctrl+C into a Copy event rather than a key press.
         copy: i.events.iter().any(|e| matches!(e, Event::Copy)),
-        enter: i.key_pressed(Key::Enter),
-        esc: i.key_pressed(Key::Escape),
+        // Enter applies the crop only when nothing else claims it: with a button focused it activates that button.
+        enter: !popup_open && !focused && i.consume_key(Modifiers::NONE, Key::Enter),
+        esc: escape_for_app(i, popup_open),
         zoom_in: zoom_in_plus | zoom_in_equals,
         zoom_out: i.consume_shortcut(&cmd(Key::Minus)),
         zoom_fit: i.consume_shortcut(&cmd(Key::Num0)),
@@ -2072,15 +2087,59 @@ mod tests {
 
     /// Keys seen by `read_keys` in one frame after pressing `key` with `mods`.
     fn press(key: Key, mods: Modifiers) -> Keys {
+        press_in(key, mods, false, false)
+    }
+
+    /// Like `press`, with a popup open and/or a widget focused.
+    fn press_in(key: Key, mods: Modifiers, popup_open: bool, focused: bool) -> Keys {
         let ctx = egui::Context::default();
         let input = egui::RawInput {
             events: vec![Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: mods }],
             ..Default::default()
         };
         let mut keys = Keys::default();
-        let mut out = ctx.run_ui(input, |ui| keys = ui.ctx().input_mut(read_keys));
+        let mut out = ctx.run_ui(input, |ui| keys = ui.ctx().input_mut(|i| read_keys(i, popup_open, focused)));
         out.textures_delta.clear();
         keys
+    }
+
+    #[test]
+    fn esc_and_enter_act_when_nothing_else_wants_them() {
+        assert_eq!(press(Key::Escape, Modifiers::NONE), Keys { esc: true, ..Default::default() });
+        assert_eq!(press(Key::Enter, Modifiers::NONE), Keys { enter: true, ..Default::default() });
+    }
+
+    #[test]
+    fn esc_is_left_to_an_open_popup() {
+        assert_eq!(press_in(Key::Escape, Modifiers::NONE, true, false), Keys::default());
+    }
+
+    #[test]
+    fn enter_is_left_to_an_open_popup_or_a_focused_widget() {
+        assert_eq!(press_in(Key::Enter, Modifiers::NONE, true, false), Keys::default());
+        assert_eq!(press_in(Key::Enter, Modifiers::NONE, false, true), Keys::default());
+    }
+
+    #[test]
+    fn esc_still_cancels_with_a_widget_focused() {
+        // egui drops keyboard focus on Esc itself, so a focused button must not hold the key back.
+        assert_eq!(press_in(Key::Escape, Modifiers::NONE, false, true), Keys { esc: true, ..Default::default() });
+    }
+
+    #[test]
+    fn esc_is_consumed_so_a_second_reader_does_not_also_act() {
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            events: vec![Event::Key { key: Key::Escape, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE }],
+            ..Default::default()
+        };
+        let (mut first, mut second) = (false, false);
+        let mut out = ctx.run_ui(input, |ui| {
+            first = take_escape(ui.ctx());
+            second = take_escape(ui.ctx());
+        });
+        out.textures_delta.clear();
+        assert!(first && !second);
     }
 
     #[test]
@@ -2148,6 +2207,38 @@ mod tests {
         assert!(!click(&ctx, &mut guard, pos2(400.0, 400.0)), "the dismissing click must not reach the canvas");
         assert!(!egui::Popup::is_any_open(&ctx), "click outside should have closed the popup");
         assert!(click(&ctx, &mut guard, pos2(400.0, 400.0)), "the next click draws as usual");
+    }
+
+    #[test]
+    fn esc_closes_an_open_popup_first_and_cancels_only_on_the_next_press() {
+        let ctx = egui::Context::default();
+        let esc = || Event::Key { key: Key::Escape, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE };
+        // Same order as `ui`: the shortcut reader runs before the toolbar shows the popup.
+        let frame = |events: Vec<Event>, open: bool| {
+            let input = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(800.0, 600.0))), events, ..Default::default() };
+            let mut cancels = false;
+            let mut out = ctx.run_ui(input, |ui| {
+                cancels = take_escape(ui.ctx());
+                egui::Panel::top("t").show(ui, |ui| {
+                    let b = ui.button("menu");
+                    egui::Popup::from_response(&b)
+                        .open_memory(open.then_some(egui::SetOpenCommand::Bool(true)))
+                        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                        .show(|ui| ui.label("options"));
+                });
+            });
+            out.textures_delta.clear();
+            cancels
+        };
+        for _ in 0..3 {
+            frame(vec![], false);
+        }
+        frame(vec![], true);
+        frame(vec![], false);
+        assert!(egui::Popup::is_any_open(&ctx), "popup should be open");
+        assert!(!frame(vec![esc()], false), "first Esc belongs to the popup");
+        assert!(!egui::Popup::is_any_open(&ctx), "and it closed the popup");
+        assert!(frame(vec![esc()], false), "second Esc cancels");
     }
 
     #[test]
