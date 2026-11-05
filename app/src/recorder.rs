@@ -20,7 +20,10 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAPPED_SUBRESOURCE,
     D3D11_MAP_READ, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
 };
-use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
+use windows::Win32::Graphics::Dxgi::Common::{
+    DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_MODE_ROTATION, DXGI_MODE_ROTATION_ROTATE180, DXGI_MODE_ROTATION_ROTATE270,
+    DXGI_MODE_ROTATION_ROTATE90, DXGI_SAMPLE_DESC,
+};
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, IDXGIFactory1, IDXGIOutput1, IDXGIOutputDuplication,
     DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_NOT_CURRENTLY_AVAILABLE, DXGI_ERROR_SESSION_DISCONNECTED,
@@ -246,7 +249,11 @@ struct Grabber {
     /// Next attempt to re-open a lost duplication, and the wait after that.
     reopen_at: Instant,
     reopen_wait: Duration,
+    /// How the monitor is turned; duplication hands over its image unturned.
+    rotation: DXGI_MODE_ROTATION,
+    /// CPU-readable copy of the area as it lies in the unturned image, and its size.
     staging: ID3D11Texture2D,
+    staging_size: [i32; 2],
     /// Area relative to the monitor's top-left: x, y, w, h.
     local: [i32; 4],
     /// The same area on the desktop.
@@ -303,21 +310,9 @@ impl Grabber {
             let context = context.ok_or_else(windows::core::Error::empty)?;
             let output: IDXGIOutput1 = output.cast()?;
             let dup = output.DuplicateOutput(&device)?;
-            let desc = D3D11_TEXTURE2D_DESC {
-                Width: area[2] as u32,
-                Height: area[3] as u32,
-                MipLevels: 1,
-                ArraySize: 1,
-                Format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
-                Usage: D3D11_USAGE_STAGING,
-                BindFlags: 0,
-                CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
-                MiscFlags: 0,
-            };
-            let mut staging = None;
-            device.CreateTexture2D(&desc, None, Some(&mut staging))?;
-            let staging = staging.ok_or_else(windows::core::Error::empty)?;
+            let rotation = dup.GetDesc().Rotation;
+            let [_, _, sw, sh] = texture_rect(local, rotation, [0, 0]);
+            let staging = make_staging(&device, [sw, sh])?;
 
             // A memory bitmap to draw the pointer into with GDI.
             let mem = CreateCompatibleDC(null_mut());
@@ -342,7 +337,9 @@ impl Grabber {
                 dup: Some(dup),
                 reopen_at: Instant::now(),
                 reopen_wait: REOPEN_FIRST,
+                rotation,
                 staging,
+                staging_size: [sw, sh],
                 local,
                 area,
                 clean: vec![0; (area[2] * area[3] * 4) as usize],
@@ -380,21 +377,26 @@ impl Grabber {
                 let mut desktop = D3D11_TEXTURE2D_DESC::default();
                 texture.GetDesc(&mut desktop);
                 // ceiling: after a mode change the area keeps its old monitor-relative
-                // position and the encoder its size; a smaller, moved or rotated desktop
-                // records the overlapping part (the rest keeps the last image). Re-read
-                // DXGI_OUTDUPL_DESC and remap/scale if people record across display changes.
-                let [x, y, w, h] = self.local;
-                if let Some(src) = clip_box(self.local, [desktop.Width, desktop.Height]) {
-                    let (dx, dy) = ((src.left as i32 - x) as u32, (src.top as i32 - y) as u32);
+                // position and the encoder its size; a smaller, moved or newly turned
+                // desktop records the overlapping part (the rest keeps the last image).
+                // Remap/scale the area if people record across display changes.
+                let [_, _, w, h] = self.local;
+                let rect = texture_rect(self.local, self.rotation, [desktop.Width, desktop.Height]);
+                let [rx, ry, rw, rh] = rect;
+                if [rw, rh] != self.staging_size {
+                    // The monitor was turned between portrait and landscape.
+                    self.staging = make_staging(&self.device, [rw, rh])?;
+                    self.staging_size = [rw, rh];
+                }
+                if let Some(src) = clip_box(rect, [desktop.Width, desktop.Height]) {
+                    let (dx, dy) = ((src.left as i32 - rx) as u32, (src.top as i32 - ry) as u32);
                     self.context.CopySubresourceRegion(&self.staging, 0, dx, dy, 0, &texture, 0, Some(&src));
                 }
                 let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
                 self.context.Map(&self.staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))?;
-                let row = (w * 4) as usize;
-                for r in 0..h as usize {
-                    let from = (mapped.pData as *const u8).add(r * mapped.RowPitch as usize);
-                    std::ptr::copy_nonoverlapping(from, self.clean[r * row..].as_mut_ptr(), row);
-                }
+                let pitch = mapped.RowPitch as usize;
+                let src = std::slice::from_raw_parts(mapped.pData as *const u8, pitch * (rh as usize - 1) + rw as usize * 4);
+                unrotate(src, pitch, self.rotation, w as usize, h as usize, &mut self.clean);
                 self.context.Unmap(&self.staging, 0);
                 self.have_frame = true;
                 Ok(())
@@ -426,6 +428,7 @@ impl Grabber {
         }
         match unsafe { self.output.DuplicateOutput(&self.device) } {
             Ok(dup) => {
+                self.rotation = unsafe { dup.GetDesc() }.Rotation;
                 self.dup = Some(dup);
                 Ok(())
             }
@@ -511,6 +514,58 @@ fn clip_box([x, y, w, h]: [i32; 4], [tw, th]: [u32; 2]) -> Option<D3D11_BOX> {
         bottom: bottom as u32,
         back: 1,
     })
+}
+
+fn make_staging(device: &ID3D11Device, [w, h]: [i32; 2]) -> windows::core::Result<ID3D11Texture2D> {
+    let desc = D3D11_TEXTURE2D_DESC {
+        Width: w as u32,
+        Height: h as u32,
+        MipLevels: 1,
+        ArraySize: 1,
+        Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Usage: D3D11_USAGE_STAGING,
+        BindFlags: 0,
+        CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+        MiscFlags: 0,
+    };
+    let mut staging = None;
+    unsafe { device.CreateTexture2D(&desc, None, Some(&mut staging))? };
+    staging.ok_or_else(windows::core::Error::empty)
+}
+
+/// Where the area `local` (x, y, w, h on the monitor as people see it) lies
+/// in the unturned duplication image of size `[tw, th]`, as x, y, w, h. The
+/// mapping follows Microsoft's Desktop Duplication sample: turned 90°, the
+/// desktop's top-left pixel sits at the image's bottom-left.
+fn texture_rect([x, y, w, h]: [i32; 4], rotation: DXGI_MODE_ROTATION, [tw, th]: [u32; 2]) -> [i32; 4] {
+    let (tw, th) = (tw as i32, th as i32);
+    match rotation {
+        DXGI_MODE_ROTATION_ROTATE90 => [y, th - x - w, h, w],
+        DXGI_MODE_ROTATION_ROTATE180 => [tw - x - w, th - y - h, w, h],
+        DXGI_MODE_ROTATION_ROTATE270 => [tw - y - h, x, h, w],
+        _ => [x, y, w, h],
+    }
+}
+
+/// Copies the area out of `src` (its `texture_rect`, rows `pitch` bytes
+/// apart, BGRA) into `dst` as upright `w`×`h` BGRA rows.
+fn unrotate(src: &[u8], pitch: usize, rotation: DXGI_MODE_ROTATION, w: usize, h: usize, dst: &mut [u8]) {
+    let turned = matches!(rotation, DXGI_MODE_ROTATION_ROTATE90 | DXGI_MODE_ROTATION_ROTATE180 | DXGI_MODE_ROTATION_ROTATE270);
+    for (y, out) in dst.chunks_exact_mut(w * 4).take(h).enumerate() {
+        if !turned {
+            out.copy_from_slice(&src[y * pitch..][..w * 4]);
+            continue;
+        }
+        for (x, px) in out.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            let (sx, sy) = match rotation {
+                DXGI_MODE_ROTATION_ROTATE90 => (y, w - 1 - x),
+                DXGI_MODE_ROTATION_ROTATE180 => (w - 1 - x, h - 1 - y),
+                _ => (h - 1 - y, x),
+            };
+            px.copy_from_slice(&src[sy * pitch + sx * 4..][..4]);
+        }
+    }
 }
 
 fn to_color_image(bgra: &[u8], w: usize, h: usize) -> ColorImage {
@@ -727,6 +782,63 @@ mod tests {
         // Desktop shrank past the area entirely: nothing to copy.
         assert_eq!(clip_box([1600, 900, 200, 100], [1280, 720]), None);
         assert_eq!(clip_box([100, 50, 200, 100], [0, 0]), None);
+    }
+
+    /// A 7×5 desktop with every pixel numbered, handed over unturned the way
+    /// the Desktop Duplication sample describes for each rotation.
+    fn unturned(rotation: DXGI_MODE_ROTATION) -> (Vec<u32>, [u32; 2]) {
+        let (dw, dh) = (7usize, 5usize);
+        let size = if matches!(rotation, DXGI_MODE_ROTATION_ROTATE90 | DXGI_MODE_ROTATION_ROTATE270) { [dh, dw] } else { [dw, dh] };
+        let mut tex = vec![0u32; dw * dh];
+        for ty in 0..size[1] {
+            for tx in 0..size[0] {
+                // The sample's texture → desktop mapping (SetDirtyVert).
+                let (dx, dy) = match rotation {
+                    DXGI_MODE_ROTATION_ROTATE90 => (dw - 1 - ty, tx),
+                    DXGI_MODE_ROTATION_ROTATE180 => (dw - 1 - tx, dh - 1 - ty),
+                    DXGI_MODE_ROTATION_ROTATE270 => (ty, dh - 1 - tx),
+                    _ => (tx, ty),
+                };
+                tex[ty * size[0] + tx] = (dy * dw + dx) as u32;
+            }
+        }
+        (tex, [size[0] as u32, size[1] as u32])
+    }
+
+    #[test]
+    fn turned_monitors_record_upright() {
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_MODE_ROTATION_IDENTITY;
+        let local = [2, 1, 4, 3]; // x, y, w, h on the 7×5 desktop as seen
+        for rotation in [DXGI_MODE_ROTATION_IDENTITY, DXGI_MODE_ROTATION_ROTATE90, DXGI_MODE_ROTATION_ROTATE180, DXGI_MODE_ROTATION_ROTATE270] {
+            let (tex, size) = unturned(rotation);
+            let [rx, ry, rw, rh] = texture_rect(local, rotation, size);
+            // What CopySubresourceRegion would put in the staging texture, with padded rows.
+            let pitch = rw as usize * 4 + 8;
+            let mut staging = vec![0u8; pitch * rh as usize];
+            for sy in 0..rh as usize {
+                for sx in 0..rw as usize {
+                    let v = tex[(ry as usize + sy) * size[0] as usize + rx as usize + sx];
+                    staging[sy * pitch + sx * 4..][..4].copy_from_slice(&v.to_le_bytes());
+                }
+            }
+            let mut clean = vec![0u8; 4 * 3 * 4];
+            unrotate(&staging, pitch, rotation, 4, 3, &mut clean);
+            let got: Vec<u32> = clean.as_chunks::<4>().0.iter().map(|p| u32::from_le_bytes(*p)).collect();
+            let want: Vec<u32> = (1..4).flat_map(|y| (2..6).map(move |x| y * 7 + x)).collect();
+            assert_eq!(got, want, "{rotation:?}");
+        }
+    }
+
+    #[test]
+    fn turned_area_maps_into_the_unturned_image() {
+        // A 1080×1920 portrait monitor arrives as a 1920×1080 image.
+        let local = [100, 200, 300, 400];
+        assert_eq!(texture_rect(local, DXGI_MODE_ROTATION_ROTATE90, [1920, 1080]), [200, 1080 - 100 - 300, 400, 300]);
+        assert_eq!(texture_rect(local, DXGI_MODE_ROTATION_ROTATE270, [1920, 1080]), [1920 - 200 - 400, 100, 400, 300]);
+        assert_eq!(texture_rect(local, DXGI_MODE_ROTATION_ROTATE180, [1920, 1080]), [1920 - 100 - 300, 1080 - 200 - 400, 300, 400]);
+        // Size isn't needed for the unturned cases, or to know the staging size.
+        assert_eq!(texture_rect(local, DXGI_MODE_ROTATION(0), [0, 0]), local);
+        assert_eq!(texture_rect(local, DXGI_MODE_ROTATION_ROTATE90, [0, 0])[2..], [400, 300]);
     }
 
     /// Needs a desktop. Takes the path a lost duplication takes and checks
