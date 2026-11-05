@@ -39,6 +39,8 @@ const MIN_WINDOW_H: f32 = 240.0;
 const MIN_EDIT_W: f32 = 850.0;
 /// Clear space kept between the toolbar groups.
 const GROUP_GAP: f32 = 16.0;
+/// Snip zoom change per Ctrl+Plus / Ctrl+Minus press.
+const ZOOM_STEP: f32 = 1.25;
 const DIM: Color32 = Color32::from_black_alpha(120);
 /// Time for the window's hide animation to finish before the screen is copied.
 const HIDE_SETTLE: Duration = Duration::from_millis(250);
@@ -196,6 +198,8 @@ struct App {
     /// Minimum window width last sent to the OS, so the command goes out only on change.
     min_width: f32,
     popup_guard: PopupClickGuard,
+    /// Zoom factor requested from the keyboard this frame; `canvas` applies it.
+    key_zoom: f32,
 
     auto_copy: bool,
     auto_save: bool,
@@ -259,6 +263,7 @@ impl App {
             zoom: None,
             min_width: MIN_WINDOW_W,
             popup_guard: PopupClickGuard::default(),
+            key_zoom: 1.0,
             auto_copy: true,
             auto_save: true,
             pick_on_launch: screenshot.is_none(),
@@ -541,7 +546,7 @@ impl eframe::App for App {
 
 impl App {
     fn shortcuts(&mut self, ctx: &egui::Context) {
-        let Keys { new, save, undo, redo, copy, enter, esc } = ctx.input_mut(read_keys);
+        let Keys { new, save, undo, redo, copy, enter, esc, zoom_in, zoom_out, zoom_fit } = ctx.input_mut(read_keys);
         if new {
             self.start_snip(ctx);
         }
@@ -570,6 +575,11 @@ impl App {
         }
         if esc {
             self.crop = None;
+        }
+        if zoom_fit {
+            self.zoom = None;
+        } else if zoom_in != zoom_out {
+            self.key_zoom = if zoom_in { ZOOM_STEP } else { 1.0 / ZOOM_STEP };
         }
     }
 
@@ -878,8 +888,9 @@ impl App {
         let natural = px_size / ppp;
         let view = ui.available_size();
         let fit = ((view - vec2(32.0, 32.0)) / natural).min_elem().clamp(0.02, 1.0);
-        let zoom_delta = ui.input(|i| i.zoom_delta());
-        if zoom_delta != 1.0 && ui.rect_contains_pointer(ui.max_rect()) {
+        let wheel_zoom = if ui.rect_contains_pointer(ui.max_rect()) { ui.input(|i| i.zoom_delta()) } else { 1.0 };
+        let zoom_delta = wheel_zoom * std::mem::replace(&mut self.key_zoom, 1.0);
+        if zoom_delta != 1.0 {
             self.zoom = Some((self.zoom.unwrap_or(fit) * zoom_delta).clamp(0.05, 8.0));
         }
         let zoom = self.zoom.unwrap_or(fit);
@@ -1488,6 +1499,8 @@ fn window_hwnd(cc: &eframe::CreationContext<'_>) -> isize {
 
 fn style(ctx: &egui::Context) {
     ctx.set_theme(egui::Theme::Dark);
+    // Ctrl+Plus/Minus/0 zoom the snip (see `read_keys`), not egui's whole UI.
+    ctx.options_mut(|o| o.zoom_with_keyboard = false);
     ctx.style_mut_of(egui::Theme::Dark, |s| {
         s.spacing.button_padding = vec2(10.0, 5.0);
         s.spacing.interact_size.y = 30.0;
@@ -1580,6 +1593,9 @@ struct Keys {
     copy: bool,
     enter: bool,
     esc: bool,
+    zoom_in: bool,
+    zoom_out: bool,
+    zoom_fit: bool,
 }
 
 fn read_keys(i: &mut egui::InputState) -> Keys {
@@ -1587,6 +1603,8 @@ fn read_keys(i: &mut egui::InputState) -> Keys {
     // egui ignores an extra Shift when matching, so Ctrl+Shift+Z must be
     // consumed before Ctrl+Z or it would undo.
     let redo_shift = i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::SHIFT, Key::Z));
+    let zoom_in_plus = i.consume_shortcut(&cmd(Key::Plus));
+    let zoom_in_equals = i.consume_shortcut(&cmd(Key::Equals));
     Keys {
         new: i.consume_shortcut(&cmd(Key::N)),
         save: i.consume_shortcut(&cmd(Key::S)),
@@ -1596,6 +1614,9 @@ fn read_keys(i: &mut egui::InputState) -> Keys {
         copy: i.events.iter().any(|e| matches!(e, Event::Copy)),
         enter: i.key_pressed(Key::Enter),
         esc: i.key_pressed(Key::Escape),
+        zoom_in: zoom_in_plus | zoom_in_equals,
+        zoom_out: i.consume_shortcut(&cmd(Key::Minus)),
+        zoom_fit: i.consume_shortcut(&cmd(Key::Num0)),
     }
 }
 
@@ -1765,6 +1786,20 @@ mod tests {
     #[test]
     fn ctrl_shift_z_redoes() {
         assert_eq!(press(Key::Z, Modifiers::COMMAND | Modifiers::SHIFT), Keys { redo: true, ..Default::default() });
+    }
+
+    #[test]
+    fn ctrl_plus_equals_minus_and_zero_zoom_the_snip() {
+        assert_eq!(press(Key::Plus, Modifiers::COMMAND), Keys { zoom_in: true, ..Default::default() });
+        assert_eq!(press(Key::Equals, Modifiers::COMMAND), Keys { zoom_in: true, ..Default::default() });
+        assert_eq!(press(Key::Minus, Modifiers::COMMAND), Keys { zoom_out: true, ..Default::default() });
+        assert_eq!(press(Key::Num0, Modifiers::COMMAND), Keys { zoom_fit: true, ..Default::default() });
+    }
+
+    #[test]
+    fn zoom_keys_need_ctrl() {
+        assert_eq!(press(Key::Minus, Modifiers::NONE), Keys::default());
+        assert_eq!(press(Key::Num0, Modifiers::NONE), Keys::default());
     }
 
     #[test]
