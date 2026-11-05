@@ -563,6 +563,7 @@ impl eframe::App for App {
             self.popup_guard.begin_frame(&ctx);
             self.shortcuts(&ctx);
             self.toolbar(ui);
+            let mut video_top = None;
             egui::CentralPanel::default()
                 .frame(egui::Frame::new().fill(ui.style().visuals.extreme_bg_color))
                 .show(ui, |ui| {
@@ -571,12 +572,13 @@ impl eframe::App for App {
                     } else if self.doc.is_some() {
                         self.canvas(ui);
                     } else if self.video.is_some() {
+                        video_top = Some(ui.max_rect().top());
                         self.video_view(ui);
                     } else {
                         self.empty_state(ui);
                     }
                 });
-            self.toast(&ctx);
+            self.toast(&ctx, video_top);
         }
         self.drive_screenshot(&ctx);
     }
@@ -870,14 +872,16 @@ impl App {
         });
     }
 
-    fn toast(&mut self, ctx: &egui::Context) {
+    /// `video_top` is the top of the content area while the video view is showing.
+    fn toast(&mut self, ctx: &egui::Context, video_top: Option<f32>) {
         let now = ctx.input(|i| i.time);
         if self.note.as_ref().is_some_and(|(_, until)| now > *until) {
             self.note = None;
         }
         let Some((msg, _)) = &self.note else { return };
+        let (align, offset) = toast_anchor(video_top);
         egui::Area::new(egui::Id::unique("toast"))
-            .anchor(Align2::CENTER_BOTTOM, vec2(0.0, -20.0))
+            .anchor(align, offset)
             .order(egui::Order::Foreground)
             .interactable(false)
             .show(ctx, |ui| {
@@ -1774,6 +1778,15 @@ fn icon_button(ui: &mut egui::Ui, icon: Icon, ink: Option<Color32>, selected: bo
     resp.on_hover_text(tip)
 }
 
+/// Where the toast sits: bottom centre, except over the video view, whose Play
+/// and "Show in folder" buttons live down there, so it drops from the top of the content instead.
+fn toast_anchor(video_top: Option<f32>) -> (Align2, Vec2) {
+    match video_top {
+        Some(top) => (Align2::CENTER_TOP, vec2(0.0, top + 8.0)),
+        None => (Align2::CENTER_BOTTOM, vec2(0.0, -20.0)),
+    }
+}
+
 /// Icon plus a small chevron; `badge` writes a number by the icon (timer seconds).
 fn dropdown(ui: &mut egui::Ui, icon: Icon, badge: Option<u64>) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(vec2(52.0, BTN.y), Sense::click());
@@ -1843,6 +1856,14 @@ fn bar_position(area: [i32; 4], work: [i32; 4], bw: i32, bh: i32) -> (i32, i32) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn toast_leaves_the_video_buttons_alone() {
+        assert_eq!(toast_anchor(None), (Align2::CENTER_BOTTOM, vec2(0.0, -20.0)));
+        let (align, offset) = toast_anchor(Some(48.0));
+        assert_eq!(align, Align2::CENTER_TOP);
+        assert!(offset.y > 48.0, "below the toolbar");
+    }
 
     #[test]
     fn countdown_shows_whole_seconds_rounded_up() {
