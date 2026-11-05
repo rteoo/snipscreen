@@ -533,7 +533,7 @@ impl App {
         let ppp = ctx.pixels_per_point();
         let monitor = ctx.input(|i| i.viewport().monitor_size).unwrap_or(vec2(1920.0, 1080.0));
         let snip = vec2(size[0], size[1]) / ppp;
-        (snip + vec2(48.0, 120.0)).clamp(vec2(MIN_EDIT_W, 440.0), (monitor * 0.85).max(vec2(MIN_EDIT_W, 440.0)))
+        edit_window_size(snip, monitor)
     }
 
     fn finish(&mut self, ctx: &egui::Context, image: ColorImage) {
@@ -743,7 +743,8 @@ impl App {
 
     /// With a snip open the toolbar needs room for all three groups; without one the window may shrink further.
     fn sync_min_width(&mut self, ctx: &egui::Context) {
-        let want = if self.doc.is_some() { MIN_EDIT_W } else { MIN_WINDOW_W };
+        let monitor_w = ctx.input(|i| i.viewport().monitor_size).map_or(f32::INFINITY, |m| m.x);
+        let want = if self.doc.is_some() { edit_min_width(monitor_w) } else { MIN_WINDOW_W };
         if want != self.min_width {
             self.min_width = want;
             ctx.send_viewport_cmd(ViewportCommand::MinInnerSize(vec2(want, MIN_WINDOW_H)));
@@ -1913,6 +1914,19 @@ fn released_on(ctx: &egui::Context, resp: &egui::Response) -> bool {
     resp.clicked() || resp.drag_stopped() || (ctx.input(|i| i.pointer.primary_released()) && resp.contains_pointer())
 }
 
+/// Narrowest editing window: wide enough for all three toolbar groups, but never wider than the
+/// monitor, where a window that cannot be reached edge to edge is worse than a crowded toolbar
+/// (`markup_x` packs the groups against each other when space runs short).
+fn edit_min_width(monitor_w: f32) -> f32 {
+    MIN_EDIT_W.min(monitor_w.max(MIN_WINDOW_W))
+}
+
+/// Window size that shows a snip of `snip` points with its chrome, kept within 85% of the monitor.
+fn edit_window_size(snip: Vec2, monitor: Vec2) -> Vec2 {
+    let min = vec2(edit_min_width(monitor.x), 440.0);
+    (snip + vec2(48.0, 120.0)).clamp(min, (monitor * 0.85).max(min))
+}
+
 /// Left edge of the markup group: centred in the toolbar when it fits clear of the capture and
 /// output groups, otherwise pushed right up against the capture group.
 fn markup_x(center: f32, width: f32, left_end: f32, right_start: f32) -> f32 {
@@ -2482,6 +2496,31 @@ mod tests {
         // Normal fit: the floor and ceiling hold.
         assert_eq!(clamp_zoom(0.01, 0.5), MIN_ZOOM);
         assert_eq!(clamp_zoom(100.0, 0.5), MAX_ZOOM);
+    }
+
+    #[test]
+    fn editing_window_fits_a_narrow_monitor() {
+        // 1280 px panel at 175% scaling is 731 pt wide.
+        let monitor = vec2(731.0, 411.0);
+        let size = edit_window_size(vec2(2000.0, 1000.0), monitor);
+        assert!(size.x <= monitor.x, "window must fit the monitor width, got {}", size.x);
+        assert_eq!(edit_min_width(731.0), 731.0);
+        assert_eq!(edit_min_width(1920.0), MIN_EDIT_W, "a wide monitor keeps the full toolbar width");
+        assert_eq!(edit_min_width(300.0), MIN_WINDOW_W, "never below the plain window minimum");
+        // Wide monitors are unchanged: snip plus chrome, clamped to 85% of the monitor.
+        let wide = vec2(1920.0, 1080.0);
+        assert_eq!(edit_window_size(vec2(100.0, 100.0), wide), vec2(MIN_EDIT_W, 440.0));
+        assert_eq!(edit_window_size(vec2(5000.0, 5000.0), wide), wide * 0.85);
+    }
+
+    #[test]
+    fn markup_group_survives_a_window_narrower_than_the_toolbar() {
+        let (left_end, out_w, width) = (12.0 + 298.0, 133.0, 350.0);
+        for window in [520.0_f32, 600.0, 731.0] {
+            let row_end = window - 12.0;
+            let x = markup_x((12.0 + row_end) / 2.0, width, left_end, row_end - out_w);
+            assert!(x.is_finite() && x >= left_end + GROUP_GAP, "packs against the capture group at {window}");
+        }
     }
 
     #[test]
