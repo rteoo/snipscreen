@@ -13,7 +13,8 @@ use windows::Win32::System::Com::StructuredStorage::PropVariantToStringAlloc;
 use windows::Win32::System::Com::{CoTaskMemFree, STGM_READ};
 use windows::Win32::Media::Audio::{
     eCapture, eConsole, eRender, IAudioCaptureClient, IAudioClient, IMMDevice, IMMDeviceEnumerator, DEVICE_STATE_ACTIVE,
-    MMDeviceEnumerator, AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_E_DEVICE_INVALIDATED, AUDCLNT_SHAREMODE_SHARED,
+    MMDeviceEnumerator, AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY, AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR,
+    AUDCLNT_E_DEVICE_INVALIDATED, AUDCLNT_SHAREMODE_SHARED,
     AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM, AUDCLNT_STREAMFLAGS_LOOPBACK,
     AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY, WAVEFORMATEX,
 };
@@ -22,6 +23,10 @@ use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_ALL, 
 pub const RATE: u32 = 48_000;
 pub const CHANNELS: usize = 2;
 const WAVE_FORMAT_IEEE_FLOAT: u16 = 3;
+/// How far a source may wander from the recording clock before it is
+/// pulled back; less than this is timestamp jitter. 40 ms is under what
+/// people notice as lip-sync error.
+const DRIFT: i64 = RATE as i64 / 25;
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Source {
@@ -190,23 +195,44 @@ fn pump(
     clock: Instant,
     produced: &mut u64,
 ) -> windows::core::Result<()> {
+    // Devices start delivering after a warm-up (a Bluetooth headset can take
+    // seconds), so the first packet is placed by its capture time rather than
+    // by count, and so is the first one after a gap the device reports.
+    let mut synced = false;
     while !stop.load(Ordering::Relaxed) {
         std::thread::sleep(Duration::from_millis(10));
         unsafe {
-            while client.1.GetNextPacketSize()? > 0 {
-                let mut data = std::ptr::null_mut();
-                let (mut frames, mut flags) = (0u32, 0u32);
-                client.1.GetBuffer(&mut data, &mut frames, &mut flags, None, None)?;
-                let n = frames as usize * CHANNELS;
-                let mut q = samples.lock().unwrap();
-                if flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0 || data.is_null() {
-                    q.extend(std::iter::repeat_n(0.0, n));
-                } else {
-                    q.extend(std::slice::from_raw_parts(data as *const f32, n));
+            if client.1.GetNextPacketSize()? > 0 {
+                // Packet timestamps are performance-counter time; read that
+                // counter next to the recording clock to relate the two.
+                let now_qpc = qpc_now();
+                let now = clock.elapsed();
+                while client.1.GetNextPacketSize()? > 0 {
+                    let mut data = std::ptr::null_mut();
+                    let (mut frames, mut flags, mut qpc) = (0u32, 0u32, 0u64);
+                    client.1.GetBuffer(&mut data, &mut frames, &mut flags, None, Some(&mut qpc))?;
+                    let resync = !synced || flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY.0 as u32 != 0;
+                    let at = if flags & AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR.0 as u32 == 0 && qpc != 0 {
+                        Some(frame_at(now, now_qpc, qpc))
+                    } else {
+                        // No usable timestamp: take the packet as just arrived.
+                        resync.then(|| frame_at(now, 0, 0) - frames as i64)
+                    };
+                    let (pad, skip) = at.map_or((0, 0), |at| place(*produced, at, frames as u64, resync));
+                    synced = true;
+                    let kept = frames as usize - skip as usize;
+                    let mut q = samples.lock().unwrap();
+                    q.extend(std::iter::repeat_n(0.0, pad as usize * CHANNELS));
+                    if flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0 || data.is_null() {
+                        q.extend(std::iter::repeat_n(0.0, kept * CHANNELS));
+                    } else {
+                        let all = std::slice::from_raw_parts(data as *const f32, frames as usize * CHANNELS);
+                        q.extend(&all[skip as usize * CHANNELS..]);
+                    }
+                    drop(q);
+                    *produced += pad + kept as u64;
+                    client.1.ReleaseBuffer(frames)?;
                 }
-                drop(q);
-                *produced += frames as u64;
-                client.1.ReleaseBuffer(frames)?;
             }
         }
         // Loopback sends nothing while the computer is silent; fill the gap
@@ -216,6 +242,48 @@ fn pump(
         }
     }
     Ok(())
+}
+
+// The `windows` crate only exposes these behind a feature this crate doesn't enable.
+#[link(name = "kernel32")]
+extern "system" {
+    fn QueryPerformanceCounter(count: *mut i64) -> i32;
+    fn QueryPerformanceFrequency(frequency: *mut i64) -> i32;
+}
+
+/// The performance counter in 100 ns units, the scale WASAPI stamps packets in.
+fn qpc_now() -> u64 {
+    let (mut count, mut frequency) = (0i64, 0i64);
+    // Both always succeed on Windows XP and later.
+    unsafe {
+        QueryPerformanceCounter(&mut count);
+        QueryPerformanceFrequency(&mut frequency);
+    }
+    (count as u128 * 10_000_000 / frequency as u128) as u64
+}
+
+/// The recording frame a packet's first sample belongs at, from its capture
+/// time `qpc` and a counter reading `now_qpc` taken at recording time `now`
+/// (counters in 100 ns units).
+fn frame_at(now: Duration, now_qpc: u64, qpc: u64) -> i64 {
+    let t = (now.as_nanos() / 100) as i64 - (now_qpc as i64 - qpc as i64);
+    (t * RATE as i64).div_euclid(10_000_000)
+}
+
+/// Lines a packet of `frames` up with the recording clock: the frames of
+/// silence to queue before it and the frames of it to drop. `at` is where its
+/// first frame belongs and `produced` how far the queue has got. Within
+/// `DRIFT` the sample count is trusted, unless `resync` (first packet, or a
+/// gap the device reported) asks for an exact fit.
+fn place(produced: u64, at: i64, frames: u64, resync: bool) -> (u64, u64) {
+    let off = at - produced as i64;
+    if !resync && off.abs() <= DRIFT {
+        (0, 0)
+    } else if off >= 0 {
+        (off as u64, 0)
+    } else {
+        (0, off.unsigned_abs().min(frames))
+    }
 }
 
 /// Pads `samples` with silence once it falls more than 100 ms behind
@@ -279,6 +347,56 @@ mod tests {
             assert!(live.lock().unwrap().len() <= (RATE as usize / 10 + tick) * CHANNELS, "live queue grew at tick {i}");
         }
         assert!(mixed >= (RATE as usize * 10 - RATE as usize / 10) * CHANNELS, "only {mixed} samples mixed");
+    }
+
+    #[test]
+    fn packet_time_maps_onto_the_recording_clock() {
+        // Captured 250 ms before a reading taken 1 s into the recording.
+        let now_qpc = 123_456_789_000;
+        assert_eq!(frame_at(Duration::from_secs(1), now_qpc, now_qpc - 2_500_000), RATE as i64 * 3 / 4);
+        // Captured before the recording began.
+        assert_eq!(frame_at(Duration::from_millis(100), now_qpc, now_qpc - 2_000_000), -(RATE as i64) / 10);
+    }
+
+    #[test]
+    fn late_starting_source_is_padded_to_the_clock() {
+        // A microphone whose first packet was captured 300 ms in: 300 ms of silence first.
+        let at = RATE as i64 * 3 / 10;
+        assert_eq!(place(0, at, 480, true), (at as u64, 0));
+        // Later packets that follow on within jitter are queued as they come.
+        assert_eq!(place(at as u64 + 480, at + 480 + 30, 480, false), (0, 0));
+        assert_eq!(place(at as u64 + 480, at + 480 - 30, 480, false), (0, 0));
+    }
+
+    #[test]
+    fn gaps_and_drift_are_pulled_back_to_the_clock() {
+        // The device reports a 200 ms glitch: silence covers it.
+        assert_eq!(place(48_000, 48_000 + 9_600, 480, true), (9_600, 0));
+        // Even a small reported gap is filled exactly.
+        assert_eq!(place(48_000, 48_010, 480, true), (10, 0));
+        // Drift past the limit without a flag is corrected too.
+        assert_eq!(place(48_000, 48_000 + DRIFT + 1, 480, false), (DRIFT as u64 + 1, 0));
+        // A packet overlapping what is already queued loses the overlap...
+        assert_eq!(place(48_000, 48_000 - 100, 480, true), (0, 100));
+        // ...or is dropped whole when it lies entirely in the past.
+        assert_eq!(place(48_000, 40_000, 480, true), (0, 480));
+        assert_eq!(place(1_000, -500, 480, true), (0, 480));
+    }
+
+    /// Needs a microphone; run with `cargo test -- --ignored`. The recording
+    /// began half a second before the device opened, so its sound must be
+    /// queued from half a second in.
+    #[test]
+    #[ignore]
+    fn microphone_starts_on_the_recording_clock() {
+        let clock = Instant::now() - Duration::from_millis(500);
+        let cap = Capture::start(Source::Microphone(None), clock).expect("open microphone");
+        std::thread::sleep(Duration::from_millis(1000));
+        let got = cap.samples.lock().unwrap().len() as i64 / CHANNELS as i64;
+        let due = (clock.elapsed().as_secs_f64() * RATE as f64) as i64;
+        drop(cap);
+        // Behind by no more than the device's buffering.
+        assert!(got <= due && got > due - RATE as i64 / 10, "{got} frames queued, {due} due");
     }
 
     /// Needs sound devices; run with `cargo test -- --ignored`.

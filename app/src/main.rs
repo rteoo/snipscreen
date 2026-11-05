@@ -9,7 +9,7 @@ mod win;
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use eframe::egui::{
     self, pos2, vec2, Align, Align2, Color32, ColorImage, CornerRadius, CursorIcon, Event, FontId,
@@ -17,7 +17,7 @@ use eframe::egui::{
     TextureHandle, TextureOptions, Vec2, ViewportCommand, WindowLevel,
 };
 use icons::Icon;
-use markup::{Doc, Ink, Stroke};
+use markup::{Doc, Ink, PxRect, Stroke};
 use windows_sys::Win32::Foundation::HWND;
 
 const ACCENT: Color32 = Color32::from_rgb(0xff, 0xb6, 0x34);
@@ -32,6 +32,15 @@ const ICON_OFF: Color32 = Color32::from_rgb(0x6b, 0x6b, 0x6b);
 const BTN: Vec2 = vec2(36.0, 34.0);
 const GAP: f32 = 4.0;
 const DIVIDER_W: f32 = 13.0;
+/// Narrowest window that fits the capture, markup (with the crop buttons) and output groups side by side.
+const MIN_WINDOW_W: f32 = 520.0;
+const MIN_WINDOW_H: f32 = 240.0;
+/// Measured: capture group ~298 + markup with crop buttons 350 + output group 133 + 2 gaps + 24 toolbar margin = 837.
+const MIN_EDIT_W: f32 = 850.0;
+/// Clear space kept between the toolbar groups.
+const GROUP_GAP: f32 = 16.0;
+/// Snip zoom change per Ctrl+Plus / Ctrl+Minus press.
+const ZOOM_STEP: f32 = 1.25;
 const DIM: Color32 = Color32::from_black_alpha(120);
 /// Time for the window's hide animation to finish before the screen is copied.
 const HIDE_SETTLE: Duration = Duration::from_millis(250);
@@ -81,6 +90,12 @@ impl Shape_ {
 }
 
 const DELAYS: [u64; 4] = [0, 3, 5, 10];
+
+/// Whole seconds to show for a delay with `left` still to run, counting
+/// 3, 2, 1; `None` once it has run out.
+fn countdown_secs(left: Duration) -> Option<u64> {
+    (!left.is_zero()).then(|| left.as_secs() + u64::from(left.subsec_nanos() > 0))
+}
 
 fn delay_label(s: u64) -> String {
     if s == 0 { "No delay".into() } else { format!("{s} seconds") }
@@ -143,6 +158,8 @@ struct VideoResult {
 
 enum Stage {
     Idle,
+    /// Delay running with the window still visible, so it can show the countdown.
+    Counting { end: Instant },
     /// Window hidden; the screen is about to be copied.
     Waiting,
     Picking(Box<Picker>),
@@ -177,7 +194,7 @@ struct App {
     settle: u8,
 
     doc: Option<Doc>,
-    texture: Option<(TextureHandle, u64)>,
+    texture: Option<CanvasTex>,
     tool: Tool,
     pen: (Color32, f32),
     highlighter: (Color32, f32),
@@ -186,6 +203,11 @@ struct App {
     crop: Option<(Pos2, Pos2)>,
     /// `None` fits the snip to the window; otherwise 1.0 is one screen pixel per pixel.
     zoom: Option<f32>,
+    /// Minimum window width last sent to the OS, so the command goes out only on change.
+    min_width: f32,
+    popup_guard: PopupClickGuard,
+    /// Zoom factor requested from the keyboard this frame; `canvas` applies it.
+    key_zoom: f32,
 
     auto_copy: bool,
     auto_save: bool,
@@ -247,6 +269,9 @@ impl App {
             erase_marked: false,
             crop: None,
             zoom: None,
+            min_width: MIN_WINDOW_W,
+            popup_guard: PopupClickGuard::default(),
+            key_zoom: 1.0,
             auto_copy: true,
             auto_save: true,
             pick_on_launch: screenshot.is_none(),
@@ -262,23 +287,54 @@ impl App {
     }
 
     fn start_snip(&mut self, ctx: &egui::Context) {
-        if !matches!(self.stage, Stage::Idle) {
+        if !matches!(self.stage, Stage::Idle | Stage::Counting { .. }) {
             return;
         }
+        let delay = if self.mode == Mode::Photo { self.delay } else { 0 };
+        if delay == 0 {
+            self.hide_and_grab(ctx);
+            return;
+        }
+        // Pressing New / Ctrl+N / the hotkey during the countdown starts it over.
+        self.stage = Stage::Counting { end: Instant::now() + Duration::from_secs(delay) };
+        // On top and un-minimized without taking focus, so a hotkey snip from
+        // another app still shows the countdown without disturbing what is on screen.
+        win::restore_inactive(self.hwnd as HWND);
+        ctx.send_viewport_cmd(ViewportCommand::WindowLevel(WindowLevel::AlwaysOnTop));
+        ctx.request_repaint();
+    }
+
+    /// Hides the window, waits for its hide animation, then copies the screen.
+    fn hide_and_grab(&mut self, ctx: &egui::Context) {
         self.restore_corner = win::window_corner(self.hwnd as HWND);
         ctx.send_viewport_cmd(ViewportCommand::Visible(false));
         self.stage = Stage::Waiting;
-        let delay = if self.mode == Mode::Photo { self.delay } else { 0 };
-        let (tx, ctx, wait) = (
-            self.grab_tx.clone(),
-            ctx.clone(),
-            Duration::from_secs(delay) + HIDE_SETTLE,
-        );
+        let (tx, ctx) = (self.grab_tx.clone(), ctx.clone());
         std::thread::spawn(move || {
-            std::thread::sleep(wait);
+            std::thread::sleep(HIDE_SETTLE);
             let _ = tx.send(win::grab_screen());
             ctx.request_repaint();
         });
+    }
+
+    /// Advances the delay countdown: Esc cancels, the last second hides the window.
+    fn tick_countdown(&mut self, ctx: &egui::Context) {
+        let Stage::Counting { end } = self.stage else { return };
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.cancel_countdown(ctx);
+            return;
+        }
+        let left = end.saturating_duration_since(Instant::now());
+        match countdown_secs(left) {
+            None => self.hide_and_grab(ctx),
+            // Wake when the displayed number is due to change.
+            Some(s) => ctx.request_repaint_after(left - Duration::from_secs(s - 1) + Duration::from_millis(1)),
+        }
+    }
+
+    fn cancel_countdown(&mut self, ctx: &egui::Context) {
+        self.stage = Stage::Idle;
+        self.show_window(ctx);
     }
 
     fn on_grab(&mut self, ctx: &egui::Context, grab: Result<win::Grab, String>) {
@@ -392,7 +448,7 @@ impl App {
         let ppp = ctx.pixels_per_point();
         let monitor = ctx.input(|i| i.viewport().monitor_size).unwrap_or(vec2(1920.0, 1080.0));
         let snip = vec2(size[0], size[1]) / ppp;
-        (snip + vec2(48.0, 120.0)).clamp(vec2(760.0, 440.0), (monitor * 0.85).max(vec2(760.0, 440.0)))
+        (snip + vec2(48.0, 120.0)).clamp(vec2(MIN_EDIT_W, 440.0), (monitor * 0.85).max(vec2(MIN_EDIT_W, 440.0)))
     }
 
     fn finish(&mut self, ctx: &egui::Context, image: ColorImage) {
@@ -407,28 +463,24 @@ impl App {
         self.place_window(ctx, self.window_size_for(ctx));
         let Some(doc) = &self.doc else { return };
         let image = doc.image.clone();
-        if self.auto_copy {
-            self.copy_in_background(ctx, image.clone(), false);
+        if !self.auto_copy && !self.auto_save {
+            return;
         }
-        if self.auto_save {
-            match win::pictures_dir() {
-                Some(dir) => {
-                    let path = dir.join("Screenshots").join(format!("Snip {}.png", win::timestamp()));
-                    let (tx, ctx) = (self.note_tx.clone(), ctx.clone());
-                    let copied = self.auto_copy;
-                    std::thread::spawn(move || {
-                        let msg = match win::save_png(&path, &image) {
-                            Ok(()) if copied => "Copied, and saved to Pictures\\Screenshots".to_string(),
-                            Ok(()) => "Saved to Pictures\\Screenshots".to_string(),
-                            Err(e) => format!("Couldn't auto-save: {e}"),
-                        };
-                        let _ = tx.send(msg);
-                        ctx.request_repaint();
-                    });
-                }
-                None => self.say(ctx, "Couldn't find your Pictures folder to auto-save".into()),
+        // One worker does both jobs so the toast can report what each really did.
+        let save_path = self.auto_save.then(|| {
+            win::pictures_dir()
+                .map(|dir| dir.join("Screenshots").join(format!("Snip {}.png", win::timestamp())))
+                .ok_or_else(|| "couldn't find your Pictures folder".to_string())
+        });
+        let (copy, tx, ctx, hwnd) = (self.auto_copy, self.note_tx.clone(), ctx.clone(), self.hwnd);
+        std::thread::spawn(move || {
+            let copied = copy.then(|| win::copy_image(hwnd as HWND, &image));
+            let saved = save_path.map(|path| path.and_then(|p| win::save_png(&p, &image)));
+            if let Some(msg) = auto_note(copied, saved) {
+                let _ = tx.send(msg);
+                ctx.request_repaint();
             }
-        }
+        });
     }
 
     fn copy_in_background(&self, ctx: &egui::Context, image: Arc<ColorImage>, announce: bool) {
@@ -496,6 +548,7 @@ impl eframe::App for App {
         if let Ok(grab) = self.grab_rx.try_recv() {
             self.on_grab(ctx, grab);
         }
+        self.tick_countdown(ctx);
         self.reveal_picker(ctx);
         self.settle_window(ctx);
     }
@@ -507,12 +560,15 @@ impl eframe::App for App {
         } else if matches!(self.stage, Stage::Recording(_)) {
             self.rec_bar_ui(ui);
         } else {
+            self.popup_guard.begin_frame(&ctx);
             self.shortcuts(&ctx);
             self.toolbar(ui);
             egui::CentralPanel::default()
                 .frame(egui::Frame::new().fill(ui.style().visuals.extreme_bg_color))
                 .show(ui, |ui| {
-                    if self.doc.is_some() {
+                    if let Stage::Counting { end } = self.stage {
+                        self.countdown_view(ui, end);
+                    } else if self.doc.is_some() {
                         self.canvas(ui);
                     } else if self.video.is_some() {
                         self.video_view(ui);
@@ -528,7 +584,7 @@ impl eframe::App for App {
 
 impl App {
     fn shortcuts(&mut self, ctx: &egui::Context) {
-        let Keys { new, save, undo, redo, copy, enter, esc } = ctx.input_mut(read_keys);
+        let Keys { new, save, undo, redo, copy, enter, esc, zoom_in, zoom_out, zoom_fit } = ctx.input_mut(read_keys);
         if new {
             self.start_snip(ctx);
         }
@@ -558,6 +614,11 @@ impl App {
         if esc {
             self.crop = None;
         }
+        if zoom_fit {
+            self.zoom = None;
+        } else if zoom_in != zoom_out {
+            self.key_zoom = if zoom_in { ZOOM_STEP } else { 1.0 / ZOOM_STEP };
+        }
     }
 
     fn apply_crop(&mut self) {
@@ -567,7 +628,17 @@ impl App {
         }
     }
 
+    /// With a snip open the toolbar needs room for all three groups; without one the window may shrink further.
+    fn sync_min_width(&mut self, ctx: &egui::Context) {
+        let want = if self.doc.is_some() { MIN_EDIT_W } else { MIN_WINDOW_W };
+        if want != self.min_width {
+            self.min_width = want;
+            ctx.send_viewport_cmd(ViewportCommand::MinInnerSize(vec2(want, MIN_WINDOW_H)));
+        }
+    }
+
     fn toolbar(&mut self, ui: &mut egui::Ui) {
+        self.sync_min_width(&ui.ctx().clone());
         egui::Panel::top("toolbar")
             .frame(egui::Frame::new().fill(TOOLBAR_BG).inner_margin(egui::Margin::symmetric(12, 6)))
             .show(ui, |ui| {
@@ -586,7 +657,7 @@ impl App {
 
                 if self.doc.is_some() {
                     let width = self.markup_width();
-                    let x = (row.center().x - width / 2.0).min(right_start - 16.0 - width).max(left_end + 16.0);
+                    let x = markup_x(row.center().x, width, left_end, right_start);
                     let mid_rect = Rect::from_min_size(pos2(x, row.min.y), vec2(width + 1.0, BTN.y));
                     let mut mid = ui.new_child(egui::UiBuilder::new().max_rect(mid_rect).layout(Layout::left_to_right(Align::Center)));
                     self.markup_controls(&mut mid);
@@ -819,6 +890,20 @@ impl App {
             });
     }
 
+    fn countdown_view(&mut self, ui: &mut egui::Ui, end: Instant) {
+        let secs = countdown_secs(end.saturating_duration_since(Instant::now())).unwrap_or(0);
+        ui.with_layout(Layout::top_down(Align::Center), |ui| {
+            ui.add_space((ui.available_height() * 0.5 - 60.0).max(8.0));
+            ui.label(RichText::new(format!("Snipping in {secs}…")).size(28.0).strong());
+            ui.add_space(6.0);
+            ui.label(RichText::new("The window hides when the countdown ends.").weak());
+            ui.add_space(12.0);
+            if ui.button("Cancel (Esc)").clicked() {
+                self.cancel_countdown(ui.ctx());
+            }
+        });
+    }
+
     fn empty_state(&mut self, ui: &mut egui::Ui) {
         ui.with_layout(Layout::top_down(Align::Center), |ui| {
             ui.add_space((ui.available_height() * 0.5 - 50.0).max(8.0));
@@ -844,19 +929,35 @@ impl App {
     fn canvas(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         let Some(doc) = &mut self.doc else { return };
-        if self.texture.as_ref().is_none_or(|(_, rev)| *rev != doc.image_rev) {
-            let tex = ctx.load_texture("snip", doc.image.clone(), TextureOptions::LINEAR);
-            self.texture = Some((tex, doc.image_rev));
+        let rev = (doc.image_rev, doc.ink_rev);
+        if self.texture.as_ref().is_none_or(|c| c.rev != rev) {
+            // ceiling: erase/undo re-flatten the whole snip (~150 ms for 20 long strokes on 4K); burn per-stroke tiles if erasing feels sticky.
+            let shown = if doc.strokes.is_empty() { doc.image.clone() } else { Arc::new(doc.flatten()) };
+            match &mut self.texture {
+                Some(c) => {
+                    c.tex.set(shown.clone(), TextureOptions::LINEAR);
+                    if c.rev.0 != rev.0 {
+                        c.live = None;
+                    }
+                    c.shown = shown;
+                    c.rev = rev;
+                }
+                None => {
+                    let tex = ctx.load_texture("snip", shown.clone(), TextureOptions::LINEAR);
+                    self.texture = Some(CanvasTex { tex, shown, rev, live: None });
+                }
+            }
         }
-        let Some((tex, _)) = &self.texture else { return };
+        let Some(canvas) = &mut self.texture else { return };
 
         let ppp = ctx.pixels_per_point();
         let px_size = vec2(doc.size()[0] as f32, doc.size()[1] as f32);
         let natural = px_size / ppp;
         let view = ui.available_size();
         let fit = ((view - vec2(32.0, 32.0)) / natural).min_elem().clamp(0.02, 1.0);
-        let zoom_delta = ui.input(|i| i.zoom_delta());
-        if zoom_delta != 1.0 && ui.rect_contains_pointer(ui.max_rect()) {
+        let wheel_zoom = if ui.rect_contains_pointer(ui.max_rect()) { ui.input(|i| i.zoom_delta()) } else { 1.0 };
+        let zoom_delta = wheel_zoom * std::mem::replace(&mut self.key_zoom, 1.0);
+        if zoom_delta != 1.0 {
             self.zoom = Some((self.zoom.unwrap_or(fit) * zoom_delta).clamp(0.05, 8.0));
         }
         let zoom = self.zoom.unwrap_or(fit);
@@ -871,17 +972,15 @@ impl App {
             let to_pt = |p: Pos2| img_rect.min + p.to_vec2() / k;
 
             let painter = ui.painter();
-            painter.image(tex.id(), img_rect, Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)), Color32::WHITE);
-
-            let ink_painter = painter.with_clip_rect(img_rect.intersect(painter.clip_rect()));
-            for s in doc.strokes.iter().chain(self.drawing.as_ref()) {
-                paint_stroke(&ink_painter, s, &to_pt, 1.0 / k);
-            }
+            // Committed ink is already burned into the texture, exactly as it will be saved.
+            painter.image(canvas.tex.id(), img_rect, Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)), Color32::WHITE);
 
             let pointer = resp.interact_pointer_pos().or(resp.hover_pos());
             // Drags are noticed a few pixels after the button goes down; start where it went down.
             let origin = ctx.input(|i| i.pointer.press_origin()).or(pointer);
+            let swallowed = self.popup_guard.swallows(&ctx, resp.clicked());
             match self.tool {
+                _ if swallowed => {}
                 Tool::Pen | Tool::Highlighter => {
                     let (ink, (color, width)) = if self.tool == Tool::Pen {
                         (Ink::Pen, self.pen)
@@ -906,9 +1005,11 @@ impl App {
                     }
                     if resp.drag_stopped() || resp.clicked() {
                         if let Some(s) = self.drawing.take() {
-                            doc.checkpoint();
-                            doc.strokes.push(s);
+                            canvas.commit(doc, s);
                         }
+                    }
+                    if let Some(s) = &self.drawing {
+                        canvas.show_live(&ctx, painter, img_rect, s, doc.size());
                     }
                 }
                 Tool::Eraser => {
@@ -1159,8 +1260,10 @@ impl App {
 
     fn on_record_event(&mut self, ctx: &egui::Context, event: recorder::Event) {
         match event {
-            recorder::Event::Started { notes } => {
+            recorder::Event::Started { area, notes } => {
                 if let Stage::Recording(bar) = &mut self.stage {
+                    // The outline and bar follow what is actually recorded.
+                    bar.area = area;
                     bar.notes = notes;
                 }
             }
@@ -1403,22 +1506,75 @@ impl App {
     }
 }
 
-fn paint_stroke(painter: &egui::Painter, s: &Stroke, to_pt: &impl Fn(Pos2) -> Pos2, scale: f32) {
-    let color = s.paint_color();
-    let width = s.width * scale;
-    let pts: Vec<Pos2> = s.points.iter().map(|&p| to_pt(p)).collect();
-    match pts.as_slice() {
-        [] => {}
-        [p] => {
-            painter.circle_filled(*p, width * 0.5, color);
+/// The snip as shown: the picture with committed ink burned in by the same
+/// rasteriser that saves it, plus a layer for the stroke being drawn.
+struct CanvasTex {
+    tex: TextureHandle,
+    shown: Arc<ColorImage>,
+    /// `(image_rev, ink_rev)` of the doc that `shown` was built from.
+    rev: (u64, u64),
+    live: Option<LiveInk>,
+}
+
+/// Image-sized, see-through texture holding the stroke being drawn. Only the
+/// pixels its newest segments touch are re-rasterised and uploaded each frame.
+struct LiveInk {
+    tex: TextureHandle,
+    /// Points of the stroke already rasterised into `tex`.
+    done: usize,
+    /// Pixels written so far, cleared when the stroke ends.
+    dirty: Option<PxRect>,
+}
+
+impl LiveInk {
+    fn clear(&mut self) {
+        if let Some(r) = self.dirty.take() {
+            let (w, h) = (r.x1 - r.x0, r.y1 - r.y0);
+            self.tex.set_partial(r.pos(), ColorImage::new([w, h], vec![Color32::TRANSPARENT; w * h]), TextureOptions::LINEAR);
         }
-        _ => {
-            if s.ink == Ink::Pen {
-                painter.circle_filled(pts[0], width * 0.5, color);
-                painter.circle_filled(pts[pts.len() - 1], width * 0.5, color);
+        self.done = 0;
+    }
+}
+
+impl CanvasTex {
+    /// Adds a finished stroke, burning just that stroke into the texture
+    /// rather than re-flattening the whole snip.
+    fn commit(&mut self, doc: &mut Doc, s: Stroke) {
+        let current = self.rev == (doc.image_rev, doc.ink_rev);
+        if current {
+            if let Some(r) = s.bounds_from(0, doc.size()) {
+                let shown = Arc::make_mut(&mut self.shown);
+                markup::burn_stroke(shown, &s);
+                let patch = markup::sub_image(shown, r.x0, r.y0, r.x1 - r.x0, r.y1 - r.y0);
+                self.tex.set_partial(r.pos(), patch, TextureOptions::LINEAR);
             }
-            painter.add(Shape::line(pts, (width, color)));
         }
+        doc.add_stroke(s);
+        if current {
+            self.rev.1 = doc.ink_rev;
+        }
+        if let Some(live) = &mut self.live {
+            live.clear();
+        }
+    }
+
+    fn show_live(&mut self, ctx: &egui::Context, painter: &egui::Painter, img_rect: Rect, s: &Stroke, size: [usize; 2]) {
+        let live = self.live.get_or_insert_with(|| LiveInk {
+            tex: ctx.load_texture("live ink", ColorImage::new(size, vec![Color32::TRANSPARENT; size[0] * size[1]]), TextureOptions::LINEAR),
+            done: 0,
+            dirty: None,
+        });
+        if s.points.len() < live.done {
+            live.clear();
+        }
+        if live.done < s.points.len() {
+            if let Some(r) = s.bounds_from(live.done, size) {
+                live.tex.set_partial(r.pos(), s.ink_tile(r), TextureOptions::LINEAR);
+                live.dirty = Some(live.dirty.map_or(r, |d| d.union(r)));
+            }
+            live.done = s.points.len();
+        }
+        painter.image(live.tex.id(), img_rect, Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)), Color32::WHITE);
     }
 }
 
@@ -1463,6 +1619,8 @@ fn window_hwnd(cc: &eframe::CreationContext<'_>) -> isize {
 
 fn style(ctx: &egui::Context) {
     ctx.set_theme(egui::Theme::Dark);
+    // Ctrl+Plus/Minus/0 zoom the snip (see `read_keys`), not egui's whole UI.
+    ctx.options_mut(|o| o.zoom_with_keyboard = false);
     ctx.style_mut_of(egui::Theme::Dark, |s| {
         s.spacing.button_padding = vec2(10.0, 5.0);
         s.spacing.interact_size.y = 30.0;
@@ -1508,7 +1666,7 @@ fn main() -> eframe::Result {
         viewport: egui::ViewportBuilder::default()
             .with_title("Snipscreen")
             .with_inner_size([620.0, 330.0])
-            .with_min_inner_size([520.0, 240.0]),
+            .with_min_inner_size([MIN_WINDOW_W, MIN_WINDOW_H]),
         ..Default::default()
     };
     eframe::run_native(
@@ -1516,6 +1674,54 @@ fn main() -> eframe::Result {
         options,
         Box::new(move |cc| Ok(Box::new(App::new(cc, screenshot)))),
     )
+}
+
+/// Toast for a new snip's automatic copy and save; `None` when each job that ran succeeded and
+/// only the copy was asked for, since the clipboard needs no announcement.
+fn auto_note(copied: Option<Result<(), String>>, saved: Option<Result<(), String>>) -> Option<String> {
+    let copy_err = copied.as_ref().and_then(|r| r.as_ref().err());
+    let save_err = saved.as_ref().and_then(|r| r.as_ref().err());
+    let mut parts = Vec::new();
+    match (&copied, &saved) {
+        (Some(Ok(())), Some(Ok(()))) => parts.push("Copied, and saved to Pictures\\Screenshots".to_string()),
+        (_, Some(Ok(()))) => parts.push("Saved to Pictures\\Screenshots".to_string()),
+        (Some(Ok(())), Some(Err(_))) => parts.push("Copied to clipboard".to_string()),
+        _ => {}
+    }
+    if let Some(e) = copy_err {
+        parts.push(format!("Couldn't copy: {e}"));
+    }
+    if let Some(e) = save_err {
+        parts.push(format!("Couldn't auto-save: {e}"));
+    }
+    (!parts.is_empty()).then(|| parts.join(" · "))
+}
+
+/// A popup that closes on a click outside lets that click through to whatever lies beneath it.
+/// This notices when a canvas click only dismissed a popup, so it doesn't also draw.
+#[derive(Default)]
+struct PopupClickGuard {
+    open_at_press: bool,
+}
+
+impl PopupClickGuard {
+    /// Call once per frame before any popup is shown: the press that starts a click sees the popups as they were.
+    fn begin_frame(&mut self, ctx: &egui::Context) {
+        if ctx.input(|i| i.pointer.any_pressed()) {
+            self.open_at_press = egui::Popup::is_any_open(ctx);
+        }
+    }
+
+    /// True for a click that was open at the press and is closed now. Drags leave the popup open, so they still draw.
+    fn swallows(&self, ctx: &egui::Context, clicked: bool) -> bool {
+        clicked && self.open_at_press && !egui::Popup::is_any_open(ctx)
+    }
+}
+
+/// Left edge of the markup group: centred in the toolbar when it fits clear of the capture and
+/// output groups, otherwise pushed right up against the capture group.
+fn markup_x(center: f32, width: f32, left_end: f32, right_start: f32) -> f32 {
+    (center - width / 2.0).min(right_start - GROUP_GAP - width).max(left_end + GROUP_GAP)
 }
 
 /// Editor shortcuts pressed this frame.
@@ -1528,6 +1734,9 @@ struct Keys {
     copy: bool,
     enter: bool,
     esc: bool,
+    zoom_in: bool,
+    zoom_out: bool,
+    zoom_fit: bool,
 }
 
 fn read_keys(i: &mut egui::InputState) -> Keys {
@@ -1535,6 +1744,8 @@ fn read_keys(i: &mut egui::InputState) -> Keys {
     // egui ignores an extra Shift when matching, so Ctrl+Shift+Z must be
     // consumed before Ctrl+Z or it would undo.
     let redo_shift = i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::SHIFT, Key::Z));
+    let zoom_in_plus = i.consume_shortcut(&cmd(Key::Plus));
+    let zoom_in_equals = i.consume_shortcut(&cmd(Key::Equals));
     Keys {
         new: i.consume_shortcut(&cmd(Key::N)),
         save: i.consume_shortcut(&cmd(Key::S)),
@@ -1544,6 +1755,9 @@ fn read_keys(i: &mut egui::InputState) -> Keys {
         copy: i.events.iter().any(|e| matches!(e, Event::Copy)),
         enter: i.key_pressed(Key::Enter),
         esc: i.key_pressed(Key::Escape),
+        zoom_in: zoom_in_plus | zoom_in_equals,
+        zoom_out: i.consume_shortcut(&cmd(Key::Minus)),
+        zoom_fit: i.consume_shortcut(&cmd(Key::Num0)),
     }
 }
 
@@ -1630,6 +1844,17 @@ fn bar_position(area: [i32; 4], work: [i32; 4], bw: i32, bh: i32) -> (i32, i32) 
 mod tests {
     use super::*;
 
+    #[test]
+    fn countdown_shows_whole_seconds_rounded_up() {
+        let ms = Duration::from_millis;
+        assert_eq!(countdown_secs(ms(3000)), Some(3));
+        assert_eq!(countdown_secs(ms(2999)), Some(3));
+        assert_eq!(countdown_secs(ms(2001)), Some(3));
+        assert_eq!(countdown_secs(ms(2000)), Some(2));
+        assert_eq!(countdown_secs(ms(1)), Some(1));
+        assert_eq!(countdown_secs(Duration::ZERO), None);
+    }
+
     /// Keys seen by `read_keys` in one frame after pressing `key` with `mods`.
     fn press(key: Key, mods: Modifiers) -> Keys {
         let ctx = egui::Context::default();
@@ -1644,8 +1869,104 @@ mod tests {
     }
 
     #[test]
+    fn markup_group_never_overlaps_its_neighbours() {
+        // Group widths as laid out by `toolbar`: capture 298, output 133, markup with crop buttons 350.
+        let (left_end, out_w, width) = (12.0 + 298.0, 133.0, 350.0);
+        for window in [MIN_EDIT_W as i32, 900, 1200, 2000] {
+            let row_end = window as f32 - 12.0;
+            let right_start = row_end - out_w;
+            let x = markup_x((12.0 + row_end) / 2.0, width, left_end, right_start);
+            assert!(x >= left_end + GROUP_GAP, "overlaps capture group at {window}");
+            assert!(x + width <= right_start - GROUP_GAP, "overlaps output group at {window}");
+        }
+    }
+
+    #[test]
+    fn markup_group_centres_when_room_and_hugs_the_capture_group_otherwise() {
+        assert_eq!(markup_x(500.0, 200.0, 100.0, 900.0), 400.0);
+        assert_eq!(markup_x(500.0, 300.0, 100.0, 600.0), 284.0, "pushed left by the output group");
+        assert_eq!(markup_x(500.0, 800.0, 100.0, 1000.0), 116.0, "pulled right by the capture group");
+    }
+
+    /// One frame of a toolbar with a click-outside popup over a canvas; returns whether the canvas would draw.
+    fn popup_frame(ctx: &egui::Context, guard: &mut PopupClickGuard, events: Vec<Event>, open: bool) -> bool {
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(800.0, 600.0))),
+            events,
+            ..Default::default()
+        };
+        let mut draws = false;
+        let mut out = ctx.run_ui(input, |ui| {
+            guard.begin_frame(ui.ctx());
+            egui::Panel::top("t").show(ui, |ui| {
+                let pen = ui.button("pen");
+                egui::Popup::from_response(&pen)
+                    .open_memory(open.then_some(egui::SetOpenCommand::Bool(true)))
+                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                    .show(|ui| ui.label("options"));
+            });
+            egui::CentralPanel::default().show(ui, |ui| {
+                let resp = ui.allocate_response(ui.available_size(), Sense::click_and_drag());
+                draws = (resp.clicked() || resp.drag_started()) && !guard.swallows(ui.ctx(), resp.clicked());
+            });
+        });
+        out.textures_delta.clear();
+        draws
+    }
+
+    fn click(ctx: &egui::Context, guard: &mut PopupClickGuard, at: Pos2) -> bool {
+        let btn = |pressed| Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
+        popup_frame(ctx, guard, vec![Event::PointerMoved(at)], false);
+        popup_frame(ctx, guard, vec![btn(true)], false);
+        popup_frame(ctx, guard, vec![btn(false)], false)
+    }
+
+    #[test]
+    fn click_that_closes_a_popup_does_not_draw() {
+        let (ctx, mut guard) = (egui::Context::default(), PopupClickGuard::default());
+        for _ in 0..3 {
+            popup_frame(&ctx, &mut guard, vec![], false);
+        }
+        popup_frame(&ctx, &mut guard, vec![], true);
+        popup_frame(&ctx, &mut guard, vec![], false);
+        assert!(egui::Popup::is_any_open(&ctx), "popup should be open before the click");
+        assert!(!click(&ctx, &mut guard, pos2(400.0, 400.0)), "the dismissing click must not reach the canvas");
+        assert!(!egui::Popup::is_any_open(&ctx), "click outside should have closed the popup");
+        assert!(click(&ctx, &mut guard, pos2(400.0, 400.0)), "the next click draws as usual");
+    }
+
+    #[test]
+    fn auto_note_reports_what_each_job_did() {
+        let ok = || Some(Ok(()));
+        let err = |m: &str| Some(Err(m.to_string()));
+        assert_eq!(auto_note(ok(), ok()).as_deref(), Some("Copied, and saved to Pictures\\Screenshots"));
+        assert_eq!(auto_note(None, ok()).as_deref(), Some("Saved to Pictures\\Screenshots"));
+        assert_eq!(auto_note(ok(), None), None);
+        assert_eq!(auto_note(None, None), None);
+        assert_eq!(auto_note(err("busy"), ok()).as_deref(), Some("Saved to Pictures\\Screenshots · Couldn't copy: busy"));
+        assert_eq!(auto_note(ok(), err("disk full")).as_deref(), Some("Copied to clipboard · Couldn't auto-save: disk full"));
+        assert_eq!(auto_note(err("busy"), None).as_deref(), Some("Couldn't copy: busy"));
+        assert_eq!(auto_note(None, err("disk full")).as_deref(), Some("Couldn't auto-save: disk full"));
+        assert_eq!(auto_note(err("busy"), err("disk full")).as_deref(), Some("Couldn't copy: busy · Couldn't auto-save: disk full"));
+    }
+
+    #[test]
     fn ctrl_shift_z_redoes() {
         assert_eq!(press(Key::Z, Modifiers::COMMAND | Modifiers::SHIFT), Keys { redo: true, ..Default::default() });
+    }
+
+    #[test]
+    fn ctrl_plus_equals_minus_and_zero_zoom_the_snip() {
+        assert_eq!(press(Key::Plus, Modifiers::COMMAND), Keys { zoom_in: true, ..Default::default() });
+        assert_eq!(press(Key::Equals, Modifiers::COMMAND), Keys { zoom_in: true, ..Default::default() });
+        assert_eq!(press(Key::Minus, Modifiers::COMMAND), Keys { zoom_out: true, ..Default::default() });
+        assert_eq!(press(Key::Num0, Modifiers::COMMAND), Keys { zoom_fit: true, ..Default::default() });
+    }
+
+    #[test]
+    fn zoom_keys_need_ctrl() {
+        assert_eq!(press(Key::Minus, Modifiers::NONE), Keys::default());
+        assert_eq!(press(Key::Num0, Modifiers::NONE), Keys::default());
     }
 
     #[test]

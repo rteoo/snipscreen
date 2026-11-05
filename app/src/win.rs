@@ -13,7 +13,7 @@ use windows_sys::Win32::Graphics::Dwm::{
 use windows_sys::Win32::Graphics::Gdi::{
     BitBlt, ClientToScreen, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject,
     GetDC, GetDIBits, GetMonitorInfoW, MonitorFromPoint, MonitorFromWindow, ReleaseDC, SelectObject, BITMAPINFO,
-    BITMAPINFOHEADER, BI_RGB, CAPTUREBLT, DIB_RGB_COLORS, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    BITMAPINFOHEADER, BI_RGB, CAPTUREBLT, DIB_RGB_COLORS, MONITORINFO, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY,
     SRCCOPY,
 };
 use windows_sys::Win32::System::DataExchange::{
@@ -31,8 +31,8 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 use windows_sys::Win32::UI::Shell::{FOLDERID_Pictures, FOLDERID_Videos, SHGetKnownFolderPath};
 use windows_sys::Win32::System::Com::CoTaskMemFree;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, FindWindowW, GetClientRect, GetCursorPos, SetWindowDisplayAffinity, WDA_EXCLUDEFROMCAPTURE, WDA_NONE, GetMessageW, GetSystemMetrics, GetWindowLongW, GetWindowRect,
-    GetWindowTextLengthW, IsIconic, IsWindowVisible, SetWindowPos, GWL_EXSTYLE, MSG,
+    EnumWindows, FindWindowW, GetClientRect, GetCursorPos, GetWindowPlacement, WINDOWPLACEMENT, SetWindowDisplayAffinity, WDA_EXCLUDEFROMCAPTURE, WDA_NONE, GetMessageW, GetSystemMetrics, GetWindowLongW, GetWindowRect,
+    GetWindowTextLengthW, IsIconic, ShowWindow, SW_SHOWNOACTIVATE, IsWindowVisible, SetWindowPos, GWL_EXSTYLE, MSG,
     SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SWP_NOACTIVATE,
     SWP_NOSIZE, SWP_NOZORDER, WM_HOTKEY, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT,
 };
@@ -195,10 +195,44 @@ pub fn fit_client(hwnd: HWND, x: i32, y: i32, w: i32, h: i32) -> bool {
     }
 }
 
-/// Window's top-left corner in screen pixels.
+/// Window's top-left corner in screen pixels. A minimized window reports
+/// -32000,-32000 from `GetWindowRect`, so its restored position is used instead.
 pub fn window_corner(hwnd: HWND) -> Option<[i32; 2]> {
-    let mut r: RECT = unsafe { zeroed() };
-    (unsafe { GetWindowRect(hwnd, &mut r) } != 0).then_some([r.left, r.top])
+    unsafe {
+        if IsIconic(hwnd) == 0 {
+            let mut r: RECT = zeroed();
+            return (GetWindowRect(hwnd, &mut r) != 0).then_some([r.left, r.top]);
+        }
+        let mut wp: WINDOWPLACEMENT = zeroed();
+        wp.length = size_of::<WINDOWPLACEMENT>() as u32;
+        if GetWindowPlacement(hwnd, &mut wp) == 0 {
+            return None;
+        }
+        let mut mi: MONITORINFO = zeroed();
+        mi.cbSize = size_of::<MONITORINFO>() as u32;
+        let primary = MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY);
+        if GetMonitorInfoW(primary, &mut mi) == 0 {
+            return None;
+        }
+        let r = wp.rcNormalPosition;
+        Some(workspace_to_screen([r.left, r.top], [mi.rcWork.left - mi.rcMonitor.left, mi.rcWork.top - mi.rcMonitor.top]))
+    }
+}
+
+/// Un-minimizes the window without activating it, so a hotkey snip from another
+/// app can show its countdown without taking focus.
+pub fn restore_inactive(hwnd: HWND) {
+    unsafe {
+        if IsIconic(hwnd) != 0 {
+            ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        }
+    }
+}
+
+/// `rcNormalPosition` is in workspace coordinates: relative to the primary
+/// monitor's work area, which the taskbar can push away from the screen origin.
+fn workspace_to_screen(corner: [i32; 2], work_offset: [i32; 2]) -> [i32; 2] {
+    [corner[0] + work_offset[0], corner[1] + work_offset[1]]
 }
 
 /// Puts the window's top-left at `corner`, then pulls it fully onto the
@@ -444,4 +478,39 @@ pub fn find_window(title: &str) -> Option<HWND> {
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(Some(0)).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn workspace_corner_is_shifted_by_the_taskbar_offset() {
+        assert_eq!(workspace_to_screen([100, 50], [0, 0]), [100, 50]);
+        // Taskbar docked on the left and top of the primary monitor.
+        assert_eq!(workspace_to_screen([100, 50], [48, 40]), [148, 90]);
+        // Windows on a monitor left of the primary keep their negative coordinates.
+        assert_eq!(workspace_to_screen([-1500, 20], [0, 0]), [-1500, 20]);
+    }
+
+    /// A window minimized before the snip must report its restored corner,
+    /// not the -32000,-32000 that `GetWindowRect` gives for an icon.
+    /// Opens a real window on the desktop; run with `cargo test -- --ignored`.
+    #[test]
+    #[ignore]
+    fn minimized_window_reports_its_restored_corner() {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DestroyWindow, ShowWindow, SW_MINIMIZE, SW_SHOWNORMAL, WS_OVERLAPPEDWINDOW,
+        };
+        let class = wide("STATIC");
+        let hwnd = unsafe { CreateWindowExW(0, class.as_ptr(), wide("t").as_ptr(), WS_OVERLAPPEDWINDOW, 300, 200, 400, 300, null_mut(), null_mut(), null_mut(), null()) };
+        assert!(!hwnd.is_null());
+        unsafe { ShowWindow(hwnd, SW_SHOWNORMAL) };
+        let shown = window_corner(hwnd);
+        unsafe { ShowWindow(hwnd, SW_MINIMIZE) };
+        let minimized = window_corner(hwnd);
+        unsafe { DestroyWindow(hwnd) };
+        assert_eq!(shown, Some([300, 200]));
+        assert_eq!(minimized, shown);
+    }
 }

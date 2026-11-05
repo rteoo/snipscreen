@@ -24,11 +24,78 @@ pub struct Stroke {
 }
 
 impl Stroke {
-    pub fn paint_color(&self) -> Color32 {
+    fn alpha(&self) -> f32 {
         match self.ink {
-            Ink::Pen => self.color,
-            Ink::Highlighter => self.color.gamma_multiply(HIGHLIGHT_ALPHA),
+            Ink::Pen => 1.0,
+            Ink::Highlighter => HIGHLIGHT_ALPHA,
         }
+    }
+
+    fn radius(&self) -> f32 {
+        (self.width * 0.5).max(0.5)
+    }
+
+    /// Pixels of an image of `size` that the segments from point `from - 1`
+    /// onwards can touch; `from = 0` is the whole stroke.
+    pub fn bounds_from(&self, from: usize, size: [usize; 2]) -> Option<PxRect> {
+        let pts = self.points.get(from.saturating_sub(1)..).filter(|p| !p.is_empty())?;
+        let b = Rect::from_points(pts).expand(self.radius() + 1.0);
+        let r = PxRect {
+            x0: b.min.x.floor().max(0.0) as usize,
+            y0: b.min.y.floor().max(0.0) as usize,
+            x1: (b.max.x.ceil().max(0.0) as usize).min(size[0]),
+            y1: (b.max.y.ceil().max(0.0) as usize).min(size[1]),
+        };
+        (r.x1 > r.x0 && r.y1 > r.y0).then_some(r)
+    }
+
+    /// Coverage (0..=1) of every pixel in `r`, the max over all segments so
+    /// overlaps don't add up.
+    fn coverage(&self, r: PxRect) -> Vec<f32> {
+        let rad = self.radius();
+        let bw = r.x1 - r.x0;
+        let mut cover = vec![0f32; bw * (r.y1 - r.y0)];
+        let segments: Vec<(Pos2, Pos2)> = if self.points.len() == 1 {
+            vec![(self.points[0], self.points[0])]
+        } else {
+            self.points.windows(2).map(|p| (p[0], p[1])).collect()
+        };
+        for (a, b) in segments {
+            let sb = Rect::from_two_pos(a, b).expand(rad + 1.0);
+            let sx0 = (sb.min.x.floor().max(r.x0 as f32) as usize).max(r.x0);
+            let sy0 = (sb.min.y.floor().max(r.y0 as f32) as usize).max(r.y0);
+            let sx1 = (sb.max.x.ceil().max(0.0) as usize).min(r.x1);
+            let sy1 = (sb.max.y.ceil().max(0.0) as usize).min(r.y1);
+            for y in sy0..sy1 {
+                for x in sx0..sx1 {
+                    let d = dist_to_segment(Pos2::new(x as f32 + 0.5, y as f32 + 0.5), a, b);
+                    let c = (rad + 0.5 - d).clamp(0.0, 1.0);
+                    let slot = &mut cover[(y - r.y0) * bw + (x - r.x0)];
+                    if c > *slot {
+                        *slot = c;
+                    }
+                }
+            }
+        }
+        cover
+    }
+
+    /// The stroke's ink over `r` alone, premultiplied, with exactly the
+    /// coverage and alpha `burn_stroke` uses: drawn over the picture it
+    /// gives the same pixels as the saved snip.
+    pub fn ink_tile(&self, r: PxRect) -> ColorImage {
+        let alpha = self.alpha();
+        let [cr, cg, cb, _] = self.color.to_array();
+        let pixels = self
+            .coverage(r)
+            .into_iter()
+            .map(|c| {
+                let k = c * alpha;
+                let m = |v: u8| (v as f32 * k).round() as u8;
+                Color32::from_rgba_premultiplied(m(cr), m(cg), m(cb), m(255))
+            })
+            .collect();
+        ColorImage::new([r.x1 - r.x0, r.y1 - r.y0], pixels)
     }
 
     fn touches(&self, p: Pos2, radius: f32) -> bool {
@@ -53,6 +120,8 @@ pub struct Doc {
     redo: Vec<Snapshot>,
     /// Bumped whenever `image` changes so the texture can be refreshed.
     pub image_rev: u64,
+    /// Bumped whenever `strokes` change, for the same reason.
+    pub ink_rev: u64,
 }
 
 const HISTORY: usize = 50;
@@ -65,6 +134,7 @@ impl Doc {
             undo: Vec::new(),
             redo: Vec::new(),
             image_rev: 0,
+            ink_rev: 0,
         }
     }
 
@@ -91,6 +161,7 @@ impl Doc {
         }
         self.image = s.image;
         self.strokes = s.strokes;
+        self.ink_rev += 1;
     }
 
     pub fn can_undo(&self) -> bool {
@@ -115,6 +186,13 @@ impl Doc {
         }
     }
 
+    /// Adds a finished stroke as one undoable step.
+    pub fn add_stroke(&mut self, s: Stroke) {
+        self.checkpoint();
+        self.strokes.push(s);
+        self.ink_rev += 1;
+    }
+
     pub fn hits(&self, p: Pos2, radius: f32) -> bool {
         self.strokes.iter().any(|s| s.touches(p, radius))
     }
@@ -123,7 +201,11 @@ impl Doc {
     pub fn erase_at(&mut self, p: Pos2, radius: f32) -> bool {
         let before = self.strokes.len();
         self.strokes.retain(|s| !s.touches(p, radius));
-        self.strokes.len() != before
+        let gone = self.strokes.len() != before;
+        if gone {
+            self.ink_rev += 1;
+        }
+        gone
     }
 
     /// Crops to `r` (image pixels); strokes move with the picture.
@@ -139,6 +221,7 @@ impl Doc {
         self.checkpoint();
         self.image = Arc::new(sub_image(&self.image, x0, y0, x1 - x0, y1 - y0));
         self.image_rev += 1;
+        self.ink_rev += 1;
         let shift = eframe::egui::vec2(x0 as f32, y0 as f32);
         for s in &mut self.strokes {
             for p in &mut s.points {
@@ -154,6 +237,25 @@ impl Doc {
             burn_stroke(&mut out, s);
         }
         out
+    }
+}
+
+/// A pixel rectangle `x0..x1` × `y0..y1` inside an image.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct PxRect {
+    pub x0: usize,
+    pub y0: usize,
+    pub x1: usize,
+    pub y1: usize,
+}
+
+impl PxRect {
+    pub fn union(self, o: PxRect) -> PxRect {
+        PxRect { x0: self.x0.min(o.x0), y0: self.y0.min(o.y0), x1: self.x1.max(o.x1), y1: self.y1.max(o.y1) }
+    }
+
+    pub fn pos(self) -> [usize; 2] {
+        [self.x0, self.y0]
     }
 }
 
@@ -225,52 +327,16 @@ fn dist_to_segment(p: Pos2, a: Pos2, b: Pos2) -> f32 {
 
 /// Rasterises one stroke with soft edges. Coverage is collected first so a
 /// highlighter that crosses itself doesn't get darker where it overlaps.
-fn burn_stroke(img: &mut ColorImage, s: &Stroke) {
-    if s.points.is_empty() {
-        return;
-    }
-    let [w, h] = img.size;
-    let r = (s.width * 0.5).max(0.5);
-    let bounds = Rect::from_points(&s.points).expand(r + 1.0);
-    let x0 = bounds.min.x.floor().max(0.0) as usize;
-    let y0 = bounds.min.y.floor().max(0.0) as usize;
-    let x1 = (bounds.max.x.ceil().max(0.0) as usize).min(w);
-    let y1 = (bounds.max.y.ceil().max(0.0) as usize).min(h);
-    if x1 <= x0 || y1 <= y0 {
-        return;
-    }
-    let bw = x1 - x0;
-    let mut cover = vec![0f32; bw * (y1 - y0)];
-    let segments: Vec<(Pos2, Pos2)> = if s.points.len() == 1 {
-        vec![(s.points[0], s.points[0])]
-    } else {
-        s.points.windows(2).map(|p| (p[0], p[1])).collect()
-    };
-    for (a, b) in segments {
-        let sb = Rect::from_two_pos(a, b).expand(r + 1.0);
-        let sx0 = (sb.min.x.floor().max(x0 as f32) as usize).max(x0);
-        let sy0 = (sb.min.y.floor().max(y0 as f32) as usize).max(y0);
-        let sx1 = (sb.max.x.ceil().max(0.0) as usize).min(x1);
-        let sy1 = (sb.max.y.ceil().max(0.0) as usize).min(y1);
-        for y in sy0..sy1 {
-            for x in sx0..sx1 {
-                let d = dist_to_segment(Pos2::new(x as f32 + 0.5, y as f32 + 0.5), a, b);
-                let c = (r + 0.5 - d).clamp(0.0, 1.0);
-                let slot = &mut cover[(y - y0) * bw + (x - x0)];
-                if c > *slot {
-                    *slot = c;
-                }
-            }
-        }
-    }
-    let alpha = match s.ink {
-        Ink::Pen => 1.0,
-        Ink::Highlighter => HIGHLIGHT_ALPHA,
-    };
+pub fn burn_stroke(img: &mut ColorImage, s: &Stroke) {
+    let Some(r) = s.bounds_from(0, img.size) else { return };
+    let w = img.size[0];
+    let bw = r.x1 - r.x0;
+    let cover = s.coverage(r);
+    let alpha = s.alpha();
     let [cr, cg, cb, _] = s.color.to_array();
-    for y in y0..y1 {
-        for x in x0..x1 {
-            let k = cover[(y - y0) * bw + (x - x0)] * alpha;
+    for y in r.y0..r.y1 {
+        for x in r.x0..r.x1 {
+            let k = cover[(y - r.y0) * bw + (x - r.x0)] * alpha;
             if k <= 0.0 {
                 continue;
             }
@@ -327,6 +393,96 @@ mod tests {
         assert_eq!(out.pixels[10 * 20 + 10], Color32::BLACK);
         assert_eq!(out.pixels[0], Color32::WHITE);
         assert_eq!(d.image.pixels[10 * 20 + 10], Color32::WHITE, "original untouched");
+    }
+
+    fn zigzag() -> Stroke {
+        // Crosses itself at (20, 20) and turns sharp corners at (35, 35) and (35, 5).
+        Stroke {
+            ink: Ink::Highlighter,
+            color: Color32::from_rgb(255, 220, 0),
+            width: 8.0,
+            points: [(5.0, 5.0), (35.0, 35.0), (35.0, 5.0), (5.0, 35.0)].map(|(x, y)| Pos2::new(x, y)).to_vec(),
+        }
+    }
+
+    fn paste(dst: &mut ColorImage, tile: &ColorImage, at: [usize; 2]) {
+        for y in 0..tile.size[1] {
+            for x in 0..tile.size[0] {
+                dst.pixels[(at[1] + y) * dst.size[0] + at[0] + x] = tile.pixels[y * tile.size[0] + x];
+            }
+        }
+    }
+
+    #[test]
+    fn highlighter_tile_is_uniform_at_crossings_and_corners() {
+        let s = zigzag();
+        let r = s.bounds_from(0, [40, 40]).unwrap();
+        let tile = s.ink_tile(r);
+        let alpha_at = |x: usize, y: usize| tile.pixels[(y - r.y0) * tile.size[0] + (x - r.x0)].a();
+        let single = alpha_at(10, 10);
+        assert_eq!(single, (255.0 * HIGHLIGHT_ALPHA).round() as u8);
+        assert_eq!(alpha_at(20, 20), single, "self-crossing is no darker");
+        assert_eq!(alpha_at(34, 34), single, "joint is no darker");
+        assert_eq!(alpha_at(35, 36), single, "corner is filled round, not notched");
+    }
+
+    #[test]
+    fn ink_tile_over_picture_matches_saved_pixels() {
+        let mut d = Doc::new(white(40, 40));
+        d.add_stroke(zigzag());
+        let saved = d.flatten();
+        let s = &d.strokes[0];
+        let r = s.bounds_from(0, d.size()).unwrap();
+        let mut shown = white(40, 40);
+        let tile = s.ink_tile(r);
+        for y in r.y0..r.y1 {
+            for x in r.x0..r.x1 {
+                // Premultiplied "over", as the GPU composites the live layer.
+                let ink = tile.pixels[(y - r.y0) * tile.size[0] + (x - r.x0)].to_array();
+                let px = &mut shown.pixels[y * 40 + x];
+                let base = px.to_array();
+                let o = |i: usize| (ink[i] as f32 + base[i] as f32 * (1.0 - ink[3] as f32 / 255.0)).round() as u8;
+                *px = Color32::from_rgba_premultiplied(o(0), o(1), o(2), o(3));
+            }
+        }
+        for (a, b) in shown.pixels.iter().zip(&saved.pixels) {
+            for (ca, cb) in a.to_array().into_iter().zip(b.to_array()) {
+                assert!(ca.abs_diff(cb) <= 1, "shown {a:?} vs saved {b:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn live_tiles_built_point_by_point_match_one_pass() {
+        let full = zigzag();
+        let size = [40, 40];
+        let mut layer = ColorImage::new(size, vec![Color32::TRANSPARENT; 1600]);
+        let mut done = 0;
+        for n in 1..=full.points.len() {
+            let s = Stroke { points: full.points[..n].to_vec(), ..full.clone() };
+            let r = s.bounds_from(done, size).unwrap();
+            paste(&mut layer, &s.ink_tile(r), r.pos());
+            done = n;
+        }
+        let mut once = ColorImage::new(size, vec![Color32::TRANSPARENT; 1600]);
+        let r = full.bounds_from(0, size).unwrap();
+        paste(&mut once, &full.ink_tile(r), r.pos());
+        assert!(layer.pixels == once.pixels);
+    }
+
+    #[test]
+    fn ink_changes_bump_ink_rev() {
+        let mut d = Doc::new(white(40, 40));
+        d.add_stroke(zigzag());
+        assert_eq!(d.ink_rev, 1);
+        assert!(!d.erase_at(Pos2::new(20.0, 2.0), 0.5));
+        assert_eq!(d.ink_rev, 1);
+        d.checkpoint();
+        assert!(d.erase_at(Pos2::new(20.0, 20.0), 1.0));
+        assert_eq!(d.ink_rev, 2);
+        d.undo();
+        assert_eq!(d.ink_rev, 3);
+        assert_eq!(d.strokes.len(), 1);
     }
 
     #[test]
