@@ -32,8 +32,8 @@ use windows::Win32::Graphics::Dxgi::{
 use windows::Win32::Media::MediaFoundation::*;
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
 use windows_sys::Win32::Graphics::Gdi::{
-    CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, SelectObject, BITMAPINFO,
-    BI_RGB, DIB_RGB_COLORS, HBITMAP, HDC, HGDIOBJ,
+    BitBlt, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC, ReleaseDC, SelectObject, BITMAPINFO,
+    BI_RGB, CAPTUREBLT, DIB_RGB_COLORS, HBITMAP, HDC, HGDIOBJ, SRCCOPY,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     DrawIconEx, GetCursorInfo, GetIconInfo, CURSORINFO, CURSOR_SHOWING, DI_NORMAL, ICONINFO,
@@ -45,6 +45,8 @@ pub const FPS: u32 = 30;
 const TICKS: i64 = 10_000_000; // Media Foundation counts time in 100 ns ticks.
 /// Hardware H.264 encoders commonly stop at 4096 pixels per side.
 const MAX_SIDE: i32 = 4096;
+/// How far the sound track may trail the picture before silence fills it.
+const AUDIO_GAP: i64 = TICKS / 2;
 
 pub struct Settings {
     /// Screen pixels to record: x, y, width, height.
@@ -96,9 +98,28 @@ impl Drop for Recording {
     }
 }
 
-/// Even sizes are required by H.264; oversized areas are trimmed.
+/// H.264 level 5.1/5.2 frame size limit in 16×16 macroblocks (4096×2304).
+/// The encoders here took 4096×2880 and 4096×4096 too (level 6 territory),
+/// but level 5.2 is the largest frame players and hardware decoders broadly
+/// accept, so a recording past it may encode fine and then not play.
+const MAX_MACROBLOCKS: i32 = 36_864;
+
+/// Even sizes are required by H.264; oversized areas are trimmed: each side
+/// to `MAX_SIDE`, then the shorter side until the frame fits `MAX_MACROBLOCKS`.
+// ceiling: trimming cuts off the right or bottom of a 5K/6K area; scale the
+// frames down instead if people record whole screens that large.
 pub fn fit_area([x, y, w, h]: [i32; 4]) -> [i32; 4] {
-    [x, y, w.min(MAX_SIDE) & !1, h.min(MAX_SIDE) & !1]
+    let (mut w, mut h) = (w.min(MAX_SIDE) & !1, h.min(MAX_SIDE) & !1);
+    let mbs = |side: i32| (side + 15) / 16;
+    if w > 0 && h > 0 && mbs(w) * mbs(h) > MAX_MACROBLOCKS {
+        // The shorter side gives way: a 5K or 6K screen then keeps 16:9 at 4096×2304.
+        if w > h {
+            h = h.min(MAX_MACROBLOCKS / mbs(w) * 16) & !1;
+        } else {
+            w = w.min(MAX_MACROBLOCKS / mbs(h) * 16) & !1;
+        }
+    }
+    [x, y, w, h]
 }
 
 pub fn start(settings: Settings, on_event: impl Fn(Event) + Send + 'static) -> Recording {
@@ -107,10 +128,18 @@ pub fn start(settings: Settings, on_event: impl Fn(Event) + Send + 'static) -> R
     let thread = {
         let stop = stop.clone();
         std::thread::spawn(move || {
-            let result = record(&settings, &stop, started, &on_event);
-            if result.is_err() {
-                let _ = std::fs::remove_file(&settings.path);
-            }
+            let mut settings = settings;
+            // Claim a name nobody else has, so the clean-up below can only
+            // ever remove this recording's own file.
+            let result = crate::win::create_unique(&settings.path).and_then(|(path, file)| {
+                drop(file);
+                settings.path = path;
+                let result = record(&settings, &stop, started, &on_event);
+                if result.is_err() {
+                    let _ = std::fs::remove_file(&settings.path);
+                }
+                result
+            });
             on_event(Event::Done(result));
         })
     };
@@ -123,8 +152,7 @@ fn record(
     clock: Instant,
     on_event: &impl Fn(Event),
 ) -> Result<Finished, String> {
-    let mut grab = Grabber::new(fit_area(s.area))
-        .map_err(|e| format!("couldn't read the screen: {}", describe(&e)))?;
+    let mut grab = Grabber::new(fit_area(s.area)).map_err(|e| format!("couldn't read the screen: {e}"))?;
     let [_, _, w, h] = grab.area;
     if w < 32 || h < 32 {
         return Err("the area is too small to record".into());
@@ -147,9 +175,6 @@ fn record(
             }
             Err(e) => notes.push(format!("Recording without {name} ({e})")),
         }
-    }
-    if let Some(dir) = s.path.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     }
     let mut enc = Encoder::new(&s.path, w as u32, h as u32, !captures.is_empty())
         .map_err(|e| format!("couldn't start the video encoder: {}", describe(&e)))?;
@@ -193,7 +218,7 @@ fn record(
     })?;
     let seconds = clock.elapsed().as_secs_f64();
     drop(captures);
-    enc.finish().map_err(werr)?;
+    enc.finish().map_err(|e| finalize_failed(&e, stopped_early.as_deref()))?;
     Ok(Finished { path: s.path.clone(), seconds, size: [w as u32, h as u32], first_frame, stopped_early })
 }
 
@@ -220,9 +245,19 @@ fn pump(
     Ok(None)
 }
 
+/// Why the file couldn't be finished, with the reason the recording had
+/// already stopped early, if it had: that is usually the cause of both.
+fn finalize_failed(e: &windows::core::Error, stopped_early: Option<&str>) -> String {
+    let failed = format!("couldn't write the video: {}", describe(e));
+    match stopped_early {
+        Some(why) => format!("the recording stopped early ({why}), then {failed}"),
+        None => failed,
+    }
+}
+
 /// `Error::empty()` reads as "The operation completed successfully." and
 /// some codes carry no text; never show either to the user.
-fn describe(e: &windows::core::Error) -> String {
+pub(crate) fn describe(e: &windows::core::Error) -> String {
     let code = e.code().0;
     if code == 0 {
         return "unknown error".into();
@@ -232,10 +267,44 @@ fn describe(e: &windows::core::Error) -> String {
     if text.is_empty() { format!("error {:#010x}", code as u32) } else { text.to_string() }
 }
 
+/// Why a `Grabber` could not be set up. Failures that Windows reports with no
+/// error code (a missing monitor, a failed allocation) get their own wording
+/// here instead of `Error::empty()`'s empty text.
+#[derive(Debug)]
+enum GrabError {
+    Win(windows::core::Error),
+    /// The area's centre is not on any monitor.
+    NoMonitor,
+    /// The graphics driver gave back no device or context.
+    NoDevice,
+    /// The memory bitmap for drawing the pointer could not be allocated.
+    NoBitmap,
+}
+
+impl From<windows::core::Error> for GrabError {
+    fn from(e: windows::core::Error) -> Self {
+        Self::Win(e)
+    }
+}
+
+impl std::fmt::Display for GrabError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Win(e) => f.write_str(&describe(e)),
+            Self::NoMonitor => f.write_str("the area isn't on any screen"),
+            Self::NoDevice => f.write_str("the graphics driver didn't provide a device"),
+            Self::NoBitmap => f.write_str("not enough memory for the recording buffer"),
+        }
+    }
+}
+
 /// Wait between attempts to re-open a lost desktop duplication: short at
 /// first so a dismissed UAC prompt resumes quickly, then capped.
 const REOPEN_FIRST: Duration = Duration::from_millis(100);
 const REOPEN_MAX: Duration = Duration::from_secs(1);
+/// Longest wait for the first screen image before copying it another way:
+/// a still screen sends none, so this delays the start of such recordings.
+const FIRST_FRAME_WAIT: Duration = Duration::from_millis(250);
 
 /// Reads one monitor through DXGI Desktop Duplication (GPU copy, no stalls
 /// from other windows redrawing) and draws the mouse pointer on top.
@@ -271,7 +340,7 @@ impl Grabber {
     /// Uses the monitor holding the area's centre and trims the area to it.
     // ceiling: one monitor per recording; spanning monitors would need one
     // duplication per output stitched together.
-    fn new(area: [i32; 4]) -> windows::core::Result<Self> {
+    fn new(area: [i32; 4]) -> Result<Self, GrabError> {
         let [x, y, w, h] = area;
         let (cx, cy) = (x + w / 2, y + h / 2);
         unsafe {
@@ -290,7 +359,7 @@ impl Grabber {
                 }
                 a += 1;
             }
-            let (adapter, output, mon) = found.ok_or_else(windows::core::Error::empty)?;
+            let (adapter, output, mon) = found.ok_or(GrabError::NoMonitor)?;
             let area = on_monitor(area, [mon.left, mon.top, mon.right, mon.bottom]);
             let local = [area[0] - mon.left, area[1] - mon.top, area[2], area[3]];
 
@@ -306,8 +375,8 @@ impl Grabber {
                 None,
                 Some(&mut context),
             )?;
-            let device = device.ok_or_else(windows::core::Error::empty)?;
-            let context = context.ok_or_else(windows::core::Error::empty)?;
+            let device = device.ok_or(GrabError::NoDevice)?;
+            let context = context.ok_or(GrabError::NoDevice)?;
             let output: IDXGIOutput1 = output.cast()?;
             let dup = output.DuplicateOutput(&device)?;
             let rotation = dup.GetDesc().Rotation;
@@ -327,7 +396,7 @@ impl Grabber {
             let bitmap = CreateDIBSection(mem, &bi, DIB_RGB_COLORS, &mut pixels, null_mut(), 0);
             if bitmap.is_null() || pixels.is_null() {
                 DeleteDC(mem);
-                return Err(windows::core::Error::empty());
+                return Err(GrabError::NoBitmap);
             }
             let old = SelectObject(mem, bitmap);
             Ok(Self {
@@ -369,8 +438,9 @@ impl Grabber {
                 };
             }
             let copied = (|| {
-                // Pointer-only updates carry no new desktop image.
-                if info.LastPresentTime == 0 && self.have_frame {
+                // Pointer-only updates carry no new desktop image. The first
+                // frame after `DuplicateOutput` can be one too, with a black texture.
+                if info.LastPresentTime == 0 {
                     return Ok(());
                 }
                 let texture: ID3D11Texture2D = resource.ok_or_else(windows::core::Error::empty)?.cast()?;
@@ -388,15 +458,17 @@ impl Grabber {
                     self.staging = make_staging(&self.device, [rw, rh])?;
                     self.staging_size = [rw, rh];
                 }
-                if let Some(src) = clip_box(rect, [desktop.Width, desktop.Height]) {
-                    let (dx, dy) = ((src.left as i32 - rx) as u32, (src.top as i32 - ry) as u32);
-                    self.context.CopySubresourceRegion(&self.staging, 0, dx, dy, 0, &texture, 0, Some(&src));
-                }
+                // Only the copied part is read back: the rest of `staging` is
+                // stale or, after a turn, blank.
+                let Some(src) = clip_box(rect, [desktop.Width, desktop.Height]) else { return Ok(()) };
+                let (dx, dy) = ((src.left as i32 - rx) as u32, (src.top as i32 - ry) as u32);
+                self.context.CopySubresourceRegion(&self.staging, 0, dx, dy, 0, &texture, 0, Some(&src));
+                let copied = [dx, dy, dx + src.right - src.left, dy + src.bottom - src.top].map(|v| v as usize);
                 let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
                 self.context.Map(&self.staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))?;
                 let pitch = mapped.RowPitch as usize;
                 let src = std::slice::from_raw_parts(mapped.pData as *const u8, pitch * (rh as usize - 1) + rw as usize * 4);
-                unrotate(src, pitch, self.rotation, w as usize, h as usize, &mut self.clean);
+                unrotate(src, pitch, self.rotation, w as usize, h as usize, copied, &mut self.clean);
                 self.context.Unmap(&self.staging, 0);
                 self.have_frame = true;
                 Ok(())
@@ -441,9 +513,53 @@ impl Grabber {
         }
     }
 
+    /// Waits up to `FIRST_FRAME_WAIT` for duplication's first image. On a
+    /// still screen duplication hands over only a pointer update with a
+    /// black texture until something changes, so it then falls back to one
+    /// GDI copy rather than starting black.
+    fn first_image(&mut self) -> windows::core::Result<()> {
+        let deadline = Instant::now() + FIRST_FRAME_WAIT;
+        while !self.have_frame {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return self.copy_with_gdi();
+            }
+            if self.dup.is_none() {
+                std::thread::sleep(left.min(Duration::from_millis(10)));
+            }
+            self.refresh(left.as_millis().max(1) as u32)?;
+        }
+        Ok(())
+    }
+
+    /// Copies the area off the screen with GDI into `clean`. Upright already:
+    /// GDI works in desktop coordinates, whatever way the monitor is turned.
+    fn copy_with_gdi(&mut self) -> windows::core::Result<()> {
+        let [x, y, w, h] = self.area;
+        unsafe {
+            let screen = GetDC(null_mut());
+            if screen.is_null() {
+                return Err(windows::core::Error::from_thread());
+            }
+            let ok = BitBlt(self.mem, 0, 0, w, h, screen, x, y, SRCCOPY | CAPTUREBLT);
+            ReleaseDC(null_mut(), screen);
+            if ok == 0 {
+                return Err(windows::core::Error::from_thread());
+            }
+            let len = (w * h * 4) as usize;
+            std::ptr::copy_nonoverlapping(self.pixels, self.clean.as_mut_ptr(), len);
+        }
+        self.have_frame = true;
+        Ok(())
+    }
+
     /// The area as BGRA rows, with the mouse pointer drawn in.
     fn frame(&mut self) -> windows::core::Result<&[u8]> {
-        self.refresh(if self.have_frame { 0 } else { 500 })?;
+        if self.have_frame {
+            self.refresh(0)?;
+        } else {
+            self.first_image()?;
+        }
         let [x, y, w, h] = self.area;
         unsafe {
             let len = (w * h * 4) as usize;
@@ -549,12 +665,16 @@ fn texture_rect([x, y, w, h]: [i32; 4], rotation: DXGI_MODE_ROTATION, [tw, th]: 
 }
 
 /// Copies the area out of `src` (its `texture_rect`, rows `pitch` bytes
-/// apart, BGRA) into `dst` as upright `w`×`h` BGRA rows.
-fn unrotate(src: &[u8], pitch: usize, rotation: DXGI_MODE_ROTATION, w: usize, h: usize, dst: &mut [u8]) {
+/// apart, BGRA) into `dst` as upright `w`×`h` BGRA rows. Only the part of
+/// `src` inside `copied` (left, top, right, bottom) is taken; the rest of
+/// `dst` keeps what it had.
+fn unrotate(src: &[u8], pitch: usize, rotation: DXGI_MODE_ROTATION, w: usize, h: usize, [x0, y0, x1, y1]: [usize; 4], dst: &mut [u8]) {
     let turned = matches!(rotation, DXGI_MODE_ROTATION_ROTATE90 | DXGI_MODE_ROTATION_ROTATE180 | DXGI_MODE_ROTATION_ROTATE270);
     for (y, out) in dst.chunks_exact_mut(w * 4).take(h).enumerate() {
         if !turned {
-            out.copy_from_slice(&src[y * pitch..][..w * 4]);
+            if (y0..y1).contains(&y) && x0 < x1 {
+                out[x0 * 4..x1 * 4].copy_from_slice(&src[y * pitch + x0 * 4..][..(x1 - x0) * 4]);
+            }
             continue;
         }
         for (x, px) in out.as_chunks_mut::<4>().0.iter_mut().enumerate() {
@@ -563,7 +683,9 @@ fn unrotate(src: &[u8], pitch: usize, rotation: DXGI_MODE_ROTATION, w: usize, h:
                 DXGI_MODE_ROTATION_ROTATE180 => (w - 1 - x, h - 1 - y),
                 _ => (h - 1 - y, x),
             };
-            px.copy_from_slice(&src[sy * pitch + sx * 4..][..4]);
+            if (x0..x1).contains(&sx) && (y0..y1).contains(&sy) {
+                px.copy_from_slice(&src[sy * pitch + sx * 4..][..4]);
+            }
         }
     }
 }
@@ -598,24 +720,47 @@ fn bgra_to_nv12(bgra: &[u8], w: usize, h: usize, out: &mut [u8]) {
     }
 }
 
+/// Keeps Media Foundation started while it lives. `MFStartup` and
+/// `MFShutdown` are counted per process, so every user holds its own.
+struct MediaFoundation;
+
+impl MediaFoundation {
+    fn start() -> windows::core::Result<Self> {
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+            MFStartup(MF_VERSION, MFSTARTUP_FULL)?;
+        }
+        Ok(Self)
+    }
+}
+
+impl Drop for MediaFoundation {
+    fn drop(&mut self) {
+        let _ = unsafe { MFShutdown() };
+    }
+}
+
 struct Encoder {
     writer: IMFSinkWriter,
     video: u32,
     audio: Option<u32>,
     frame_bytes: u32,
+    /// Sound frames written, silence from `fill_audio_gap` included.
     audio_frames: i64,
+    /// Sound frames handed to `audio`; behind `audio_frames` after a fill.
+    audio_given: i64,
+    /// Last, so it drops after `writer`: fields drop in order.
+    _mf: MediaFoundation,
 }
 
 impl Encoder {
     fn new(path: &Path, w: u32, h: u32, with_audio: bool) -> windows::core::Result<Self> {
         unsafe {
-            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
-            MFStartup(MF_VERSION, MFSTARTUP_FULL)?;
+            let mf = MediaFoundation::start()?;
             let mut attrs = None;
-            MFCreateAttributes(&mut attrs, 2)?;
+            MFCreateAttributes(&mut attrs, 1)?;
             let attrs = attrs.ok_or_else(windows::core::Error::empty)?;
             attrs.SetUINT32(&MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, 1)?;
-            attrs.SetUINT32(&MF_SINK_WRITER_DISABLE_THROTTLING, 1)?;
             let writer = MFCreateSinkWriterFromURL(&HSTRING::from(path.as_os_str()), None, &attrs)?;
 
             let size = ((w as u64) << 32) | h as u64;
@@ -668,10 +813,13 @@ impl Encoder {
                 None
             };
             writer.BeginWriting()?;
-            Ok(Self { writer, video, audio, frame_bytes: w * h * 3 / 2, audio_frames: 0 })
+            Ok(Self { writer, video, audio, frame_bytes: w * h * 3 / 2, audio_frames: 0, audio_given: 0, _mf: mf })
         }
     }
 
+    /// The sink writer is left throttled: while the encoder is behind,
+    /// `WriteSample` blocks rather than queueing without bound, and the
+    /// recording loop then skips the ticks it missed (drops frames).
     fn write(&self, stream: u32, bytes: &[u8], time: i64, duration: i64) -> windows::core::Result<()> {
         unsafe {
             let buffer = MFCreateMemoryBuffer(bytes.len() as u32)?;
@@ -690,13 +838,33 @@ impl Encoder {
 
     fn video(&mut self, nv12: &[u8], time: i64) -> windows::core::Result<()> {
         debug_assert_eq!(nv12.len() as u32, self.frame_bytes);
+        self.fill_audio_gap(time)?;
         self.write(self.video, nv12, time, TICKS / FPS as i64)
     }
 
-    /// Interleaved stereo f32; time comes from the sample count so the
-    /// sound track never drifts from its own clock.
+    /// The throttled sink writer holds video back while the sound track
+    /// trails it by a few seconds, and the recorder would then hang inside
+    /// `WriteSample`. A sound source that is still warming up or stuck leaves
+    /// the mix empty, so silence fills the track up to `AUDIO_GAP` behind the
+    /// picture; `audio` then skips the sound that silence stands in for.
+    fn fill_audio_gap(&mut self, video_time: i64) -> windows::core::Result<()> {
+        let Some(stream) = self.audio else { return Ok(()) };
+        let due = (video_time - AUDIO_GAP) * audio::RATE as i64 / TICKS;
+        if due <= self.audio_frames {
+            return Ok(());
+        }
+        let frames = due - self.audio_frames;
+        self.write_pcm(stream, &vec![0u8; frames as usize * audio::CHANNELS * 2], frames)
+    }
+
+    /// Interleaved stereo f32, following on from the last call. Time comes
+    /// from the sample count so the sound track never drifts from its own clock.
     fn audio(&mut self, samples: &[f32]) -> windows::core::Result<()> {
         let Some(stream) = self.audio else { return Ok(()) };
+        let given = (samples.len() / audio::CHANNELS) as i64;
+        let skip = (self.audio_frames - self.audio_given).clamp(0, given);
+        self.audio_given += given;
+        let samples = &samples[skip as usize * audio::CHANNELS..];
         if samples.is_empty() {
             return Ok(());
         }
@@ -704,11 +872,15 @@ impl Encoder {
             .iter()
             .flat_map(|s| ((s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16).to_le_bytes())
             .collect();
-        let frames = (samples.len() / audio::CHANNELS) as i64;
+        self.write_pcm(stream, &pcm, given - skip)
+    }
+
+    /// 16-bit stereo PCM placed right after the sound written so far.
+    fn write_pcm(&mut self, stream: u32, pcm: &[u8], frames: i64) -> windows::core::Result<()> {
         let time = self.audio_frames * TICKS / audio::RATE as i64;
         let duration = frames * TICKS / audio::RATE as i64;
         self.audio_frames += frames;
-        self.write(stream, &pcm, time, duration)
+        self.write(stream, pcm, time, duration)
     }
 
     fn finish(self) -> windows::core::Result<()> {
@@ -735,6 +907,23 @@ mod tests {
     #[test]
     fn area_is_even_and_bounded() {
         assert_eq!(fit_area([5, 7, 1001, 9999]), [5, 7, 1000, 4096]);
+        // 4K fits as it is.
+        assert_eq!(fit_area([0, 0, 3840, 2160]), [0, 0, 3840, 2160]);
+        assert_eq!(fit_area([0, 0, 4096, 2304]), [0, 0, 4096, 2304]);
+    }
+
+    #[test]
+    fn area_stays_within_h264_frame_size() {
+        // 5K and 6K screens keep 16:9: landscape loses the bottom, portrait the right.
+        assert_eq!(fit_area([0, 0, 5120, 2880]), [0, 0, 4096, 2304]);
+        assert_eq!(fit_area([0, 0, 6016, 3384]), [0, 0, 4096, 2304]);
+        assert_eq!(fit_area([0, 0, 2880, 5120]), [0, 0, 2304, 4096]);
+        assert_eq!(fit_area([0, 0, 4096, 4000]), [0, 0, 4096, 2304]);
+        assert_eq!(fit_area([0, 0, 4000, 2600]), [0, 0, 4000, 2352]);
+        for [_, _, w, h] in [fit_area([0, 0, 4095, 4095]), fit_area([0, 0, 3001, 3999]), fit_area([0, 0, 4000, 2600])] {
+            assert!(w % 2 == 0 && h % 2 == 0, "{w}x{h} must be even");
+            assert!(((w + 15) / 16) * ((h + 15) / 16) <= MAX_MACROBLOCKS, "{w}x{h} is over the limit");
+        }
     }
 
     #[test]
@@ -822,10 +1011,41 @@ mod tests {
                 }
             }
             let mut clean = vec![0u8; 4 * 3 * 4];
-            unrotate(&staging, pitch, rotation, 4, 3, &mut clean);
+            unrotate(&staging, pitch, rotation, 4, 3, [0, 0, rw as usize, rh as usize], &mut clean);
             let got: Vec<u32> = clean.as_chunks::<4>().0.iter().map(|p| u32::from_le_bytes(*p)).collect();
             let want: Vec<u32> = (1..4).flat_map(|y| (2..6).map(move |x| y * 7 + x)).collect();
             assert_eq!(got, want, "{rotation:?}");
+        }
+    }
+
+    /// Turned between portrait and landscape onto a desktop that covers only
+    /// part of the area: the fresh staging texture is blank outside the
+    /// copied part, and those pixels must keep the last image, not go black.
+    #[test]
+    fn partly_covered_area_keeps_the_last_image() {
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_MODE_ROTATION_IDENTITY;
+        const LAST: u32 = 0xdead_beef;
+        let local = [2, 1, 4, 3];
+        for rotation in [DXGI_MODE_ROTATION_IDENTITY, DXGI_MODE_ROTATION_ROTATE90, DXGI_MODE_ROTATION_ROTATE180, DXGI_MODE_ROTATION_ROTATE270] {
+            let (tex, size) = unturned(rotation);
+            let [rx, ry, rw, rh] = texture_rect(local, rotation, size);
+            // Only the left part of the staging texture got this frame; the rest is blank.
+            let copied = [0, 0, rw as usize - 1, rh as usize];
+            let pitch = rw as usize * 4;
+            let mut staging = vec![0u8; pitch * rh as usize];
+            for sy in 0..copied[3] {
+                for sx in 0..copied[2] {
+                    let v = tex[(ry as usize + sy) * size[0] as usize + rx as usize + sx];
+                    staging[sy * pitch + sx * 4..][..4].copy_from_slice(&v.to_le_bytes());
+                }
+            }
+            let mut clean: Vec<u8> = std::iter::repeat_n(LAST.to_le_bytes(), 4 * 3).flatten().collect();
+            unrotate(&staging, pitch, rotation, 4, 3, copied, &mut clean);
+            let got: Vec<u32> = clean.as_chunks::<4>().0.iter().map(|p| u32::from_le_bytes(*p)).collect();
+            let want: Vec<u32> = (1..4).flat_map(|y| (2..6).map(move |x| y * 7 + x)).collect();
+            let fresh = got.iter().zip(&want).filter(|(g, w)| g == w).count();
+            assert!(got.iter().zip(&want).all(|(g, w)| g == w || *g == LAST), "{rotation:?}: {got:?}");
+            assert_eq!(fresh, copied[2] * copied[3], "{rotation:?}: {got:?}");
         }
     }
 
@@ -846,6 +1066,7 @@ mod tests {
     #[test]
     #[ignore]
     fn reopens_after_lost_duplication() {
+        let _desktop = desktop();
         let (w, h) = (640, 480);
         let mut g = Grabber::new([0, 0, w, h]).expect("grabber");
         g.frame().expect("first frame");
@@ -856,6 +1077,65 @@ mod tests {
         for _ in 0..3 {
             assert_eq!(g.frame().expect("frame after re-open").len(), (w * h * 4) as usize);
         }
+    }
+
+    /// One desktop duplication per output per process: tests that open one
+    /// take turns.
+    fn desktop() -> std::sync::MutexGuard<'static, ()> {
+        static DESKTOP: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        DESKTOP.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Needs a desktop. The first frame is a real screen image, from
+    /// duplication or else GDI, and arrives within the bounded wait.
+    #[test]
+    #[ignore]
+    fn first_frame_is_a_real_image() {
+        let _desktop = desktop();
+        let (w, h) = (640, 480);
+        let mut g = Grabber::new([0, 0, w, h]).expect("grabber");
+        g.copy_with_gdi().expect("GDI copy");
+        assert!(g.have_frame);
+        assert!(g.clean.as_chunks::<4>().0.iter().any(|p| p[..3] != [0, 0, 0]), "GDI copy of the desktop is all black");
+        drop(g);
+        let mut g = Grabber::new([0, 0, w, h]).expect("grabber");
+        let t = Instant::now();
+        assert_eq!(g.frame().expect("first frame").len(), (w * h * 4) as usize);
+        assert!(g.have_frame, "first frame must hold a screen image");
+        assert!(t.elapsed() < FIRST_FRAME_WAIT + Duration::from_millis(250), "first frame took {:?}", t.elapsed());
+        assert!(g.clean.as_chunks::<4>().0.iter().any(|p| p[..3] != [0, 0, 0]), "first frame is all black");
+    }
+
+    /// Needs a desktop and sound devices. A 3 s recording of the real screen
+    /// with system sound runs in real time and keeps close to 30 fps with
+    /// the sink writer throttled.
+    #[test]
+    #[ignore]
+    fn records_the_desktop_in_real_time() {
+        let _desktop = desktop();
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("target").join("test-realtime.mp4");
+        let _ = std::fs::remove_file(&path);
+        let settings = Settings { area: [0, 0, 1280, 720], system_sound: true, microphone: None, path: path.clone() };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut rec = start(settings, move |e| {
+            if let Event::Done(r) = e {
+                let _ = tx.send(r);
+            }
+        });
+        std::thread::sleep(Duration::from_secs(3));
+        rec.stop();
+        let done = rx.recv_timeout(Duration::from_secs(10)).expect("recording should finish").expect("recording");
+        drop(rec);
+        let (frames, span) = unsafe { count_video_frames(&done.path) }.expect("decode");
+        std::fs::remove_file(&done.path).unwrap();
+        assert!((2.9..4.0).contains(&done.seconds), "took {} s", done.seconds);
+        let thumb = done.first_frame.expect("thumbnail");
+        assert!(thumb.pixels.iter().any(|&c| c != Color32::BLACK), "thumbnail is all black");
+        // The clock starts before the grabber and encoder are set up, so
+        // measure the rate over the frames themselves.
+        assert!(span > 1.5, "video spans only {span:.2} s");
+        let fps = (frames - 1) as f64 / span;
+        assert!(fps > 27.0, "{frames} frames over {span:.2} s ({fps:.1} fps)");
     }
 
     /// Writes a 2 s clip of moving bars with a tone, without touching the
@@ -909,6 +1189,68 @@ mod tests {
         assert!(r > b + 100, "right half should be red, got {:?}", at(260, 150));
     }
 
+    /// A microphone that hasn't sent its first packet yet leaves the sound
+    /// track empty while video keeps coming. The throttled sink writer must
+    /// not wait on that track, and the file must still finalize and play.
+    #[test]
+    fn video_without_audio_samples_does_not_stall() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("target").join("test-no-audio-yet.mp4");
+        let (w, h) = (320u32, 240u32);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let written = Arc::new(std::sync::atomic::AtomicI64::new(0));
+        let worker = {
+            let (path, written) = (path.clone(), written.clone());
+            std::thread::spawn(move || {
+                let result = (|| {
+                    let mut enc = Encoder::new(&path, w, h, true).map_err(|e| describe(&e))?;
+                    let nv12 = vec![128u8; (w * h * 3 / 2) as usize];
+                    for f in 0..(5 * FPS) as i64 {
+                        enc.video(&nv12, f * TICKS / FPS as i64).map_err(|e| format!("frame {f}: {}", describe(&e)))?;
+                        enc.audio(&[]).map_err(|e| format!("audio at frame {f}: {}", describe(&e)))?;
+                        written.store(f + 1, Ordering::Relaxed);
+                    }
+                    // Silence trails the last picture by the gap...
+                    let last = (5 * FPS as i64 - 1) * TICKS / FPS as i64;
+                    if enc.audio_frames != (last - AUDIO_GAP) * audio::RATE as i64 / TICKS {
+                        return Err(format!("sound track holds {} frames of silence", enc.audio_frames));
+                    }
+                    // ...and the late sound that arrives then is skipped as far as the silence covers it.
+                    enc.audio(&vec![0.25; 5 * audio::RATE as usize * audio::CHANNELS]).map_err(|e| describe(&e))?;
+                    if enc.audio_frames != 5 * audio::RATE as i64 {
+                        return Err(format!("sound track holds {} frames after catching up", enc.audio_frames));
+                    }
+                    enc.finish().map_err(|e| format!("finalize: {}", describe(&e)))
+                })();
+                let _ = tx.send(result);
+            })
+        };
+        let Ok(result) = rx.recv_timeout(Duration::from_secs(30)) else {
+            panic!("encoder stalled with an empty sound track after {} of {} frames", written.load(Ordering::Relaxed), 5 * FPS);
+        };
+        worker.join().unwrap();
+        result.expect("encode without sound samples");
+        let (frames, span) = unsafe { count_video_frames(&path) }.expect("decode");
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(frames, 5 * FPS, "spans {span:.2} s");
+    }
+
+    /// Stopped before any sound arrived: the empty sound track must not
+    /// keep the file from finalizing.
+    #[test]
+    fn empty_sound_track_still_finalizes() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("target").join("test-empty-audio.mp4");
+        let (w, h) = (64u32, 64u32);
+        let mut enc = Encoder::new(&path, w, h, true).expect("encoder");
+        let nv12 = vec![128u8; (w * h * 3 / 2) as usize];
+        for f in 0..3 {
+            enc.video(&nv12, f * TICKS / FPS as i64).unwrap();
+        }
+        enc.finish().expect("finalize with no sound samples");
+        let (frames, _) = unsafe { count_video_frames(&path) }.expect("decode");
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(frames, 3);
+    }
+
     /// A failure partway through must still leave a playable MP4 holding the
     /// frames written before it.
     #[test]
@@ -938,6 +1280,45 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
     }
 
+    /// `start` claims the file name with an empty file before the encoder
+    /// opens it; the sink writer must take that file over.
+    #[test]
+    fn encoder_fills_the_claimed_empty_file() {
+        let want = Path::new(env!("CARGO_MANIFEST_DIR")).join("target").join("test-claimed.mp4");
+        let _ = std::fs::remove_file(&want);
+        let (path, file) = crate::win::create_unique(&want).expect("claim");
+        drop(file);
+        assert_eq!(path, want);
+        let (w, h) = (64u32, 64u32);
+        let mut enc = Encoder::new(&path, w, h, false).expect("encoder over the claimed file");
+        let nv12 = vec![128u8; (w * h * 3 / 2) as usize];
+        for f in 0..5 {
+            enc.video(&nv12, f * TICKS / FPS as i64).unwrap();
+        }
+        enc.finish().unwrap();
+        let len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        std::fs::remove_file(&path).unwrap();
+        assert!(len > 500, "mp4 is only {len} bytes");
+    }
+
+    /// The largest frame `fit_area` lets through (a 5K screen) encodes and
+    /// decodes back at full size.
+    #[test]
+    fn largest_area_encodes() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("target").join("test-largest.mp4");
+        let [_, _, w, h] = fit_area([0, 0, 5120, 2880]);
+        let (w, h) = (w as u32, h as u32);
+        let mut enc = Encoder::new(&path, w, h, false).expect("encoder at the size limit");
+        let nv12 = vec![100u8; (w * h * 3 / 2) as usize];
+        for f in 0..3 {
+            enc.video(&nv12, f * TICKS / FPS as i64).expect("frame at the size limit");
+        }
+        enc.finish().expect("finalize at the size limit");
+        let px = unsafe { first_frame_bgra(&path, h as usize) }.expect("decode");
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(px.len(), (w * h * 4) as usize);
+    }
+
     #[test]
     fn error_before_any_frame_is_a_failure() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("target").join("test-no-frames.mp4");
@@ -950,11 +1331,56 @@ mod tests {
     }
 
     #[test]
+    fn failed_finalize_keeps_the_early_stop_reason() {
+        use windows::Win32::Foundation::E_FAIL;
+        let e = windows::core::Error::from(E_FAIL);
+        let text = finalize_failed(&e, Some("couldn't read the screen: device removed"));
+        assert!(text.starts_with("the recording stopped early (couldn't read the screen: device removed), then couldn't write the video: "), "{text}");
+        assert_eq!(finalize_failed(&e, None), format!("couldn't write the video: {}", describe(&e)));
+    }
+
+    #[test]
     fn blank_windows_errors_still_say_something() {
         assert_eq!(describe(&windows::core::Error::empty()), "unknown error");
     }
 
+    #[test]
+    fn grabber_setup_failures_say_what_went_wrong() {
+        // Nowhere near any monitor: no device is needed to find that out.
+        let err = Grabber::new([-200_000, -200_000, 100, 100]).err().expect("an area off every screen must be refused");
+        assert!(matches!(err, GrabError::NoMonitor), "{err:?}");
+        assert_eq!(err.to_string(), "the area isn't on any screen");
+        for e in [GrabError::NoDevice, GrabError::NoBitmap, GrabError::Win(windows::core::Error::empty())] {
+            let text = e.to_string();
+            assert!(text.len() > 10 && !text.contains("completed successfully"), "{text}");
+        }
+    }
+
+    /// Number of video frames and the seconds they span, first to last.
+    unsafe fn count_video_frames(path: &Path) -> windows::core::Result<(u32, f64)> {
+        let _mf = MediaFoundation::start()?;
+        unsafe {
+            let reader = MFCreateSourceReaderFromURL(&HSTRING::from(path.as_os_str()), None)?;
+            let stream = MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32;
+            let (mut frames, mut first, mut last) = (0, None, 0i64);
+            loop {
+                let mut sample = None;
+                let (mut flags, mut time) = (0u32, 0i64);
+                reader.ReadSample(stream, 0, None, Some(&mut flags), Some(&mut time), Some(&mut sample))?;
+                if sample.is_some() {
+                    frames += 1;
+                    first.get_or_insert(time);
+                    last = time;
+                }
+                if flags & MF_SOURCE_READERF_ENDOFSTREAM.0 as u32 != 0 {
+                    return Ok((frames, (last - first.unwrap_or(last)) as f64 / TICKS as f64));
+                }
+            }
+        }
+    }
+
     unsafe fn first_frame_bgra(path: &Path, height: usize) -> windows::core::Result<Vec<u8>> {
+        let _mf = MediaFoundation::start()?;
         unsafe {
             let mut attrs = None;
             MFCreateAttributes(&mut attrs, 1)?;

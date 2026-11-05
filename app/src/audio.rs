@@ -107,7 +107,7 @@ impl Capture {
                     }
                 };
                 let mut produced = 0;
-                if let Err(e) = pump(&source, &client, &samples, &stop, clock, &mut produced) {
+                if let Err(e) = pump(&client, &samples, &stop, clock, &mut produced) {
                     let why = if e.code() == AUDCLNT_E_DEVICE_INVALIDATED { "it was disconnected".to_string() } else { e.to_string() };
                     *failure.lock().unwrap() = Some(why);
                     // The other source is mixed only as far as this one has
@@ -145,8 +145,12 @@ impl Drop for Capture {
 
 struct Client(IAudioClient, IAudioCaptureClient);
 
+/// What failed and why, never with Windows' text left blank.
+fn fail(what: &str, e: windows::core::Error) -> String {
+    format!("{what}: {}", crate::recorder::describe(&e))
+}
+
 fn open(source: &Source) -> Result<Client, String> {
-    let fail = |what: &str, e: windows::core::Error| format!("{what}: {}", e.message());
     unsafe {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
         let devices: IMMDeviceEnumerator =
@@ -188,7 +192,6 @@ fn open(source: &Source) -> Result<Client, String> {
 }
 
 fn pump(
-    source: &Source,
     client: &Client,
     samples: &Mutex<VecDeque<f32>>,
     stop: &AtomicBool,
@@ -235,11 +238,11 @@ fn pump(
                 }
             }
         }
-        // Loopback sends nothing while the computer is silent; fill the gap
-        // so the sound stays in step with the picture.
-        if *source == Source::System {
-            keep_time(samples, produced, clock.elapsed());
-        }
+        // Loopback sends nothing while the computer is silent, and a
+        // microphone nothing while it warms up or if it stalls. The mix only
+        // goes as far as every queue, so fill the gap with silence; a packet
+        // that then arrives late loses the overlap in `place`.
+        keep_time(samples, produced, clock.elapsed());
     }
     Ok(())
 }
@@ -350,6 +353,13 @@ mod tests {
     }
 
     #[test]
+    fn device_errors_without_text_still_say_something() {
+        assert_eq!(fail("set up device", windows::core::Error::empty()), "set up device: unknown error");
+        let text = fail("set up device", windows::core::Error::from_hresult(windows::core::HRESULT(0x8889_0000u32 as i32)));
+        assert!(text.len() > "set up device: ".len() + 3, "{text}");
+    }
+
+    #[test]
     fn packet_time_maps_onto_the_recording_clock() {
         // Captured 250 ms before a reading taken 1 s into the recording.
         let now_qpc = 123_456_789_000;
@@ -366,6 +376,22 @@ mod tests {
         // Later packets that follow on within jitter are queued as they come.
         assert_eq!(place(at as u64 + 480, at + 480 + 30, 480, false), (0, 0));
         assert_eq!(place(at as u64 + 480, at + 480 - 30, 480, false), (0, 0));
+    }
+
+    /// A microphone still warming up is kept on the clock with silence, and
+    /// its first packet then lands exactly where it was captured.
+    #[test]
+    fn warming_up_source_keeps_time_then_lines_up() {
+        let q = Mutex::new(VecDeque::new());
+        let mut produced = 0;
+        for ms in (10..=300).step_by(10) {
+            keep_time(&q, &mut produced, Duration::from_millis(ms));
+        }
+        assert!(produced >= RATE as u64 / 10, "only {produced} frames of silence after 300 ms");
+        // First packet: 10 ms captured 280 ms in.
+        let at = RATE as i64 * 28 / 100;
+        let (pad, skip) = place(produced, at, 480, true);
+        assert_eq!(produced + pad + 480 - skip, at as u64 + 480);
     }
 
     #[test]

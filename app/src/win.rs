@@ -2,7 +2,8 @@
 
 use std::ffi::c_void;
 use std::mem::{size_of, zeroed};
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
 
 use eframe::egui::{Color32, ColorImage};
@@ -26,7 +27,7 @@ use windows_sys::Win32::UI::Controls::Dialogs::{
     GetSaveFileNameW, OFN_NOCHANGEDIR, OFN_OVERWRITEPROMPT, OFN_PATHMUSTEXIST, OPENFILENAMEW,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    RegisterHotKey, MOD_ALT, MOD_NOREPEAT, MOD_SHIFT,
+    RegisterHotKey, UnregisterHotKey, MOD_ALT, MOD_NOREPEAT, MOD_SHIFT, VK_ESCAPE,
 };
 use windows_sys::Win32::UI::Shell::{FOLDERID_Pictures, FOLDERID_Videos, SHGetKnownFolderPath};
 use windows_sys::Win32::System::Com::CoTaskMemFree;
@@ -34,7 +35,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     EnumWindows, FindWindowW, GetClientRect, GetCursorPos, GetWindowPlacement, WINDOWPLACEMENT, SetWindowDisplayAffinity, WDA_EXCLUDEFROMCAPTURE, WDA_NONE, GetMessageW, GetSystemMetrics, GetWindowLongW, GetWindowRect,
     GetWindowTextLengthW, IsIconic, ShowWindow, SW_SHOWNOACTIVATE, IsWindowVisible, SetWindowPos, GWL_EXSTYLE, MSG,
     SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SWP_NOACTIVATE,
-    SWP_NOSIZE, SWP_NOZORDER, WM_HOTKEY, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT,
+    SWP_NOSIZE, SWP_NOZORDER, WM_HOTKEY, WM_APP, PeekMessageW, PostThreadMessageW, PM_NOREMOVE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT,
 };
 
 /// A frozen picture of every monitor plus the windows that were on it.
@@ -308,6 +309,10 @@ unsafe fn set_clipboard(format: u32, bytes: &[u8]) -> Result<(), String> {
         return Err("out of memory for the clipboard".into());
     }
     let dst = GlobalLock(mem) as *mut u8;
+    if dst.is_null() {
+        GlobalFree(mem);
+        return Err("couldn't lock clipboard memory".into());
+    }
     std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len());
     GlobalUnlock(mem);
     if SetClipboardData(format, mem).is_null() {
@@ -339,6 +344,52 @@ pub fn save_png(path: &std::path::Path, img: &ColorImage) -> Result<(), String> 
         std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     }
     std::fs::write(path, encode_png(img)?).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// Saves into a new file at `path`, or at the first free "name (2).png",
+/// "name (3).png"… beside it, and returns where it went. Never overwrites.
+pub fn save_png_new(path: &Path, img: &ColorImage) -> Result<PathBuf, String> {
+    let png = encode_png(img)?;
+    let (path, mut file) = create_unique(path)?;
+    if let Err(e) = file.write_all(&png) {
+        drop(file);
+        let _ = std::fs::remove_file(&path);
+        return Err(format!("{}: {e}", path.display()));
+    }
+    Ok(path)
+}
+
+/// Creates `path` (and its folder) as a new empty file, or the first free
+/// numbered name beside it the way Explorer numbers copies. Create-new
+/// semantics mean two snips or recordings made in the same second can never
+/// land on, or later delete, each other's file.
+pub fn create_unique(path: &Path) -> Result<(PathBuf, std::fs::File), String> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    }
+    for n in 1..=1000 {
+        let candidate = numbered(path, n);
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&candidate) {
+            Ok(file) => return Ok((candidate, file)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("{}: {e}", candidate.display())),
+        }
+    }
+    Err(format!("{}: too many files with this name", path.display()))
+}
+
+/// `path` itself for `n` = 1, else "stem (n).ext".
+fn numbered(path: &Path, n: u32) -> PathBuf {
+    if n <= 1 {
+        return path.to_path_buf();
+    }
+    let mut name = path.file_stem().unwrap_or_default().to_os_string();
+    name.push(format!(" ({n})"));
+    if let Some(ext) = path.extension() {
+        name.push(".");
+        name.push(ext);
+    }
+    path.with_file_name(name)
 }
 
 pub fn pictures_dir() -> Option<PathBuf> {
@@ -405,25 +456,71 @@ pub fn ask_save_path(
     Some(PathBuf::from(String::from_utf16_lossy(&buf[..len])))
 }
 
+const HOTKEY_SNIP: i32 = 1;
+const HOTKEY_ESCAPE: i32 = 2;
+const MSG_ARM_ESCAPE: u32 = WM_APP + 1;
+const MSG_DISARM_ESCAPE: u32 = WM_APP + 2;
+
+#[link(name = "kernel32")]
+extern "system" {
+    fn GetCurrentThreadId() -> u32;
+}
+
+/// Handle to the hotkey thread that turns the global Esc hotkey on and off.
+/// Dropping it releases Esc.
+pub struct EscapeHotkey {
+    thread: u32,
+}
+
+impl EscapeHotkey {
+    /// While on, Esc is taken from whatever app has focus and reported through
+    /// the `on_escape` callback instead. Hotkeys belong to the thread that
+    /// registered them, so this posts a request to that thread. If another app
+    /// already owns Esc the registration quietly fails and only in-app Esc works.
+    pub fn set(&self, on: bool) {
+        let msg = if on { MSG_ARM_ESCAPE } else { MSG_DISARM_ESCAPE };
+        unsafe { PostThreadMessageW(self.thread, msg, 0, 0) };
+    }
+}
+
+impl Drop for EscapeHotkey {
+    fn drop(&mut self) {
+        self.set(false);
+    }
+}
+
 /// Listens for Alt+Shift+S anywhere in Windows on its own thread and calls
-/// `on_press` each time. Returns an error if another app already owns it.
-pub fn listen_hotkey(on_press: impl Fn() + Send + 'static) -> Result<(), String> {
+/// `on_press` each time. The same thread owns the on-demand Esc hotkey (see
+/// [`EscapeHotkey`]) and calls `on_escape` when it fires. Returns an error if
+/// another app already owns Alt+Shift+S.
+pub fn listen_hotkey(on_press: impl Fn() + Send + 'static, on_escape: impl Fn() + Send + 'static) -> Result<EscapeHotkey, String> {
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || unsafe {
-        let ok = RegisterHotKey(null_mut(), 1, MOD_ALT | MOD_SHIFT | MOD_NOREPEAT, 'S' as u32) != 0;
-        let _ = ready_tx.send(ok);
+        let ok = RegisterHotKey(null_mut(), HOTKEY_SNIP, MOD_ALT | MOD_SHIFT | MOD_NOREPEAT, 'S' as u32) != 0;
+        let mut msg: MSG = zeroed();
+        // Creates this thread's message queue, so a request posted right after
+        // the handshake is not lost.
+        PeekMessageW(&mut msg, null_mut(), 0, 0, PM_NOREMOVE);
+        let _ = ready_tx.send(ok.then(|| GetCurrentThreadId()));
         if !ok {
             return;
         }
-        let mut msg: MSG = zeroed();
         while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
-            if msg.message == WM_HOTKEY {
-                on_press();
+            match msg.message {
+                WM_HOTKEY if msg.wParam == HOTKEY_SNIP as usize => on_press(),
+                WM_HOTKEY if msg.wParam == HOTKEY_ESCAPE as usize => on_escape(),
+                MSG_ARM_ESCAPE => {
+                    RegisterHotKey(null_mut(), HOTKEY_ESCAPE, MOD_NOREPEAT, VK_ESCAPE as u32);
+                }
+                MSG_DISARM_ESCAPE => {
+                    UnregisterHotKey(null_mut(), HOTKEY_ESCAPE);
+                }
+                _ => {}
             }
         }
     });
     match ready_rx.recv() {
-        Ok(true) => Ok(()),
+        Ok(Some(thread)) => Ok(EscapeHotkey { thread }),
         _ => Err("Alt+Shift+S is already used by another app".into()),
     }
 }
@@ -483,6 +580,40 @@ fn wide(s: &str) -> Vec<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A zero-byte moveable block is allocated "discarded" and `GlobalLock`
+    /// returns null for it: the failure must be reported, never written
+    /// through, and it stops before touching the clipboard.
+    #[test]
+    fn unlockable_clipboard_memory_is_an_error() {
+        assert_eq!(unsafe { set_clipboard(CF_DIB as u32, &[]) }, Err("couldn't lock clipboard memory".to_string()));
+    }
+
+    #[test]
+    fn numbered_names_go_before_the_extension() {
+        let p = Path::new(r"C:\Shots\Snip 2026-11-05 141530.png");
+        assert_eq!(numbered(p, 1), p);
+        assert_eq!(numbered(p, 2), Path::new(r"C:\Shots\Snip 2026-11-05 141530 (2).png"));
+        assert_eq!(numbered(Path::new("a/Recording"), 3), Path::new("a/Recording (3)"));
+    }
+
+    #[test]
+    fn same_second_files_never_overwrite_each_other() {
+        let dir = std::env::temp_dir().join(format!("snipscreen-unique-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let want = dir.join("Snip 2026-11-05 141530.png");
+        let img = ColorImage::new([2, 2], vec![Color32::RED; 4]);
+        let first = save_png_new(&want, &img);
+        let second = save_png_new(&want, &img);
+        let third = create_unique(&want).map(|(p, _)| p);
+        let sizes: Vec<_> = [&first, &second].iter().map(|r| r.as_ref().ok().and_then(|p| std::fs::metadata(p).ok()).map(|m| m.len())).collect();
+        let _ = std::fs::remove_dir_all(&dir);
+        let name = |r: Result<PathBuf, String>| r.map(|p| p.file_name().unwrap().to_string_lossy().into_owned());
+        assert_eq!(name(first), Ok("Snip 2026-11-05 141530.png".into()));
+        assert_eq!(name(second), Ok("Snip 2026-11-05 141530 (2).png".into()));
+        assert_eq!(name(third), Ok("Snip 2026-11-05 141530 (3).png".into()));
+        assert!(sizes.iter().all(|s| s.is_some_and(|s| s > 0)), "both PNGs keep their bytes: {sizes:?}");
+    }
 
     #[test]
     fn workspace_corner_is_shifted_by_the_taskbar_offset() {
