@@ -1208,8 +1208,7 @@ impl App {
         let (bw, bh) = ((BAR.x * ppp).round() as i32, (BAR.y * ppp).round() as i32);
         let [x, y, w, h] = bar.area;
         let work = win::work_area_at(x + w / 2, y + h / 2);
-        let bx = (x + w / 2 - bw / 2).clamp(work[0], work[0] + work[2] - bw);
-        let by = if y - bh - 12 >= work[1] { y - bh - 12 } else { y + 12 };
+        let (bx, by) = bar_position(bar.area, work, bw, bh);
         win::fit_client(hwnd, bx, by, bw, bh);
         area_outline(&ctx, bar.area);
 
@@ -1608,6 +1607,17 @@ fn area_outline(ctx: &egui::Context, [x, y, w, h]: [i32; 4]) {
     });
 }
 
+/// Top-left of the recording bar (`bw`x`bh` px) for a capture `area` on a monitor `work` area, both `[x, y, w, h]`.
+/// Centred over the area, just above it or inside its top edge, and kept on the work area; never panics.
+fn bar_position(area: [i32; 4], work: [i32; 4], bw: i32, bh: i32) -> (i32, i32) {
+    let [x, y, w, _] = area;
+    // `i32::clamp` panics when min > max, so a work area narrower than the bar aligns to its left edge instead.
+    let bx = (x + w / 2 - bw / 2).clamp(work[0], (work[0] + work[2] - bw).max(work[0]));
+    let by = if y - bh - 12 >= work[1] { y - bh - 12 } else { y + 12 };
+    let by = by.clamp(work[1], (work[1] + work[3] - bh).max(work[1]));
+    (bx, by)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1634,5 +1644,36 @@ mod tests {
     fn ctrl_z_undoes_and_ctrl_y_redoes() {
         assert_eq!(press(Key::Z, Modifiers::COMMAND), Keys { undo: true, ..Default::default() });
         assert_eq!(press(Key::Y, Modifiers::COMMAND), Keys { redo: true, ..Default::default() });
+    }
+
+    const WORK: [i32; 4] = [0, 0, 1920, 1080];
+
+    #[test]
+    fn bar_centres_above_the_area() {
+        assert_eq!(bar_position([500, 400, 400, 300], WORK, 300, 60), (550, 328));
+    }
+
+    #[test]
+    fn bar_clamps_to_left_and_right_edges() {
+        assert_eq!(bar_position([0, 400, 100, 300], WORK, 300, 60).0, 0);
+        assert_eq!(bar_position([1800, 400, 120, 300], WORK, 300, 60).0, 1620);
+    }
+
+    #[test]
+    fn bar_wider_than_work_area_aligns_left_without_panicking() {
+        assert_eq!(bar_position([100, 400, 500, 300], [50, 0, 200, 1080], 300, 60).0, 50);
+    }
+
+    #[test]
+    fn bar_drops_inside_the_top_edge_when_there_is_no_room_above() {
+        assert_eq!(bar_position([500, 20, 400, 300], WORK, 300, 60), (550, 32));
+    }
+
+    #[test]
+    fn bar_stays_on_a_work_area_too_short_for_it() {
+        // no room above, and y + 12 would put the bar's bottom below the work area
+        assert_eq!(bar_position([0, 50, 400, 30], [0, 0, 1920, 100], 300, 60), (50, 40));
+        // area at the top of a work area shorter than the bar: pinned to its top
+        assert_eq!(bar_position([0, 0, 400, 30], [0, 0, 1920, 40], 300, 60), (50, 0));
     }
 }
