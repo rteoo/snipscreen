@@ -2,7 +2,8 @@
 
 use std::ffi::c_void;
 use std::mem::{size_of, zeroed};
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
 
 use eframe::egui::{Color32, ColorImage};
@@ -341,6 +342,52 @@ pub fn save_png(path: &std::path::Path, img: &ColorImage) -> Result<(), String> 
     std::fs::write(path, encode_png(img)?).map_err(|e| format!("{}: {e}", path.display()))
 }
 
+/// Saves into a new file at `path`, or at the first free "name (2).png",
+/// "name (3).png"… beside it, and returns where it went. Never overwrites.
+pub fn save_png_new(path: &Path, img: &ColorImage) -> Result<PathBuf, String> {
+    let png = encode_png(img)?;
+    let (path, mut file) = create_unique(path)?;
+    if let Err(e) = file.write_all(&png) {
+        drop(file);
+        let _ = std::fs::remove_file(&path);
+        return Err(format!("{}: {e}", path.display()));
+    }
+    Ok(path)
+}
+
+/// Creates `path` (and its folder) as a new empty file, or the first free
+/// numbered name beside it the way Explorer numbers copies. Create-new
+/// semantics mean two snips or recordings made in the same second can never
+/// land on, or later delete, each other's file.
+pub fn create_unique(path: &Path) -> Result<(PathBuf, std::fs::File), String> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    }
+    for n in 1..=1000 {
+        let candidate = numbered(path, n);
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&candidate) {
+            Ok(file) => return Ok((candidate, file)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("{}: {e}", candidate.display())),
+        }
+    }
+    Err(format!("{}: too many files with this name", path.display()))
+}
+
+/// `path` itself for `n` = 1, else "stem (n).ext".
+fn numbered(path: &Path, n: u32) -> PathBuf {
+    if n <= 1 {
+        return path.to_path_buf();
+    }
+    let mut name = path.file_stem().unwrap_or_default().to_os_string();
+    name.push(format!(" ({n})"));
+    if let Some(ext) = path.extension() {
+        name.push(".");
+        name.push(ext);
+    }
+    path.with_file_name(name)
+}
+
 pub fn pictures_dir() -> Option<PathBuf> {
     known_folder(&FOLDERID_Pictures)
 }
@@ -483,6 +530,32 @@ fn wide(s: &str) -> Vec<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn numbered_names_go_before_the_extension() {
+        let p = Path::new(r"C:\Shots\Snip 2026-11-05 141530.png");
+        assert_eq!(numbered(p, 1), p);
+        assert_eq!(numbered(p, 2), Path::new(r"C:\Shots\Snip 2026-11-05 141530 (2).png"));
+        assert_eq!(numbered(Path::new("a/Recording"), 3), Path::new("a/Recording (3)"));
+    }
+
+    #[test]
+    fn same_second_files_never_overwrite_each_other() {
+        let dir = std::env::temp_dir().join(format!("snipscreen-unique-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let want = dir.join("Snip 2026-11-05 141530.png");
+        let img = ColorImage::new([2, 2], vec![Color32::RED; 4]);
+        let first = save_png_new(&want, &img);
+        let second = save_png_new(&want, &img);
+        let third = create_unique(&want).map(|(p, _)| p);
+        let sizes: Vec<_> = [&first, &second].iter().map(|r| r.as_ref().ok().and_then(|p| std::fs::metadata(p).ok()).map(|m| m.len())).collect();
+        let _ = std::fs::remove_dir_all(&dir);
+        let name = |r: Result<PathBuf, String>| r.map(|p| p.file_name().unwrap().to_string_lossy().into_owned());
+        assert_eq!(name(first), Ok("Snip 2026-11-05 141530.png".into()));
+        assert_eq!(name(second), Ok("Snip 2026-11-05 141530 (2).png".into()));
+        assert_eq!(name(third), Ok("Snip 2026-11-05 141530 (3).png".into()));
+        assert!(sizes.iter().all(|s| s.is_some_and(|s| s > 0)), "both PNGs keep their bytes: {sizes:?}");
+    }
 
     #[test]
     fn workspace_corner_is_shifted_by_the_taskbar_offset() {

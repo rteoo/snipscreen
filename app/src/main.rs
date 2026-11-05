@@ -525,7 +525,7 @@ impl App {
         let (copy, tx, ctx, hwnd) = (self.auto_copy, self.note_tx.clone(), ctx.clone(), self.hwnd);
         std::thread::spawn(move || {
             let copied = copy.then(|| win::copy_image(hwnd as HWND, &image));
-            let saved = save_path.map(|path| path.and_then(|p| win::save_png(&p, &image)));
+            let saved = save_path.map(|path| path.and_then(|p| win::save_png_new(&p, &image).map(|_| ())));
             if let Some(msg) = auto_note(copied, saved) {
                 let _ = tx.send(msg);
                 ctx.request_repaint();

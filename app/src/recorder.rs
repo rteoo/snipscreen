@@ -107,10 +107,18 @@ pub fn start(settings: Settings, on_event: impl Fn(Event) + Send + 'static) -> R
     let thread = {
         let stop = stop.clone();
         std::thread::spawn(move || {
-            let result = record(&settings, &stop, started, &on_event);
-            if result.is_err() {
-                let _ = std::fs::remove_file(&settings.path);
-            }
+            let mut settings = settings;
+            // Claim a name nobody else has, so the clean-up below can only
+            // ever remove this recording's own file.
+            let result = crate::win::create_unique(&settings.path).and_then(|(path, file)| {
+                drop(file);
+                settings.path = path;
+                let result = record(&settings, &stop, started, &on_event);
+                if result.is_err() {
+                    let _ = std::fs::remove_file(&settings.path);
+                }
+                result
+            });
             on_event(Event::Done(result));
         })
     };
@@ -146,9 +154,6 @@ fn record(
             }
             Err(e) => notes.push(format!("Recording without {name} ({e})")),
         }
-    }
-    if let Some(dir) = s.path.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     }
     let mut enc = Encoder::new(&s.path, w as u32, h as u32, !captures.is_empty())
         .map_err(|e| format!("couldn't start the video encoder: {}", describe(&e)))?;
@@ -966,6 +971,27 @@ mod tests {
         let (r, b) = (px[i + 2] as i32, px[i] as i32);
         assert!(b > r + 100, "frame should be blue, got r={r} b={b}");
         std::fs::remove_file(&path).unwrap();
+    }
+
+    /// `start` claims the file name with an empty file before the encoder
+    /// opens it; the sink writer must take that file over.
+    #[test]
+    fn encoder_fills_the_claimed_empty_file() {
+        let want = Path::new(env!("CARGO_MANIFEST_DIR")).join("target").join("test-claimed.mp4");
+        let _ = std::fs::remove_file(&want);
+        let (path, file) = crate::win::create_unique(&want).expect("claim");
+        drop(file);
+        assert_eq!(path, want);
+        let (w, h) = (64u32, 64u32);
+        let mut enc = Encoder::new(&path, w, h, false).expect("encoder over the claimed file");
+        let nv12 = vec![128u8; (w * h * 3 / 2) as usize];
+        for f in 0..5 {
+            enc.video(&nv12, f * TICKS / FPS as i64).unwrap();
+        }
+        enc.finish().unwrap();
+        let len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        std::fs::remove_file(&path).unwrap();
+        assert!(len > 500, "mp4 is only {len} bytes");
     }
 
     #[test]
