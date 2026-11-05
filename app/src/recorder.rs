@@ -652,19 +652,40 @@ fn bgra_to_nv12(bgra: &[u8], w: usize, h: usize, out: &mut [u8]) {
     }
 }
 
+/// Keeps Media Foundation started while it lives. `MFStartup` and
+/// `MFShutdown` are counted per process, so every user holds its own.
+struct MediaFoundation;
+
+impl MediaFoundation {
+    fn start() -> windows::core::Result<Self> {
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+            MFStartup(MF_VERSION, MFSTARTUP_FULL)?;
+        }
+        Ok(Self)
+    }
+}
+
+impl Drop for MediaFoundation {
+    fn drop(&mut self) {
+        let _ = unsafe { MFShutdown() };
+    }
+}
+
 struct Encoder {
     writer: IMFSinkWriter,
     video: u32,
     audio: Option<u32>,
     frame_bytes: u32,
     audio_frames: i64,
+    /// Last, so it drops after `writer`: fields drop in order.
+    _mf: MediaFoundation,
 }
 
 impl Encoder {
     fn new(path: &Path, w: u32, h: u32, with_audio: bool) -> windows::core::Result<Self> {
         unsafe {
-            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
-            MFStartup(MF_VERSION, MFSTARTUP_FULL)?;
+            let mf = MediaFoundation::start()?;
             let mut attrs = None;
             MFCreateAttributes(&mut attrs, 2)?;
             let attrs = attrs.ok_or_else(windows::core::Error::empty)?;
@@ -722,7 +743,7 @@ impl Encoder {
                 None
             };
             writer.BeginWriting()?;
-            Ok(Self { writer, video, audio, frame_bytes: w * h * 3 / 2, audio_frames: 0 })
+            Ok(Self { writer, video, audio, frame_bytes: w * h * 3 / 2, audio_frames: 0, _mf: mf })
         }
     }
 
@@ -1077,6 +1098,7 @@ mod tests {
     }
 
     unsafe fn first_frame_bgra(path: &Path, height: usize) -> windows::core::Result<Vec<u8>> {
+        let _mf = MediaFoundation::start()?;
         unsafe {
             let mut attrs = None;
             MFCreateAttributes(&mut attrs, 1)?;
