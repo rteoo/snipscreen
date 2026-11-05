@@ -55,6 +55,9 @@ pub struct Finished {
     pub seconds: f64,
     pub size: [u32; 2],
     pub first_frame: Option<ColorImage>,
+    /// Why the recording ended before the user stopped it; the video up to
+    /// that point was still saved.
+    pub stopped_early: Option<String>,
 }
 
 pub enum Event {
@@ -114,7 +117,7 @@ fn record(
     on_event: &impl Fn(Event),
 ) -> Result<Finished, String> {
     let mut grab = Grabber::new(fit_area(s.area))
-        .map_err(|e| format!("couldn't read the screen: {}", e.message()))?;
+        .map_err(|e| format!("couldn't read the screen: {}", describe(&e)))?;
     let [_, _, w, h] = grab.area;
     if w < 32 || h < 32 {
         return Err("the area is too small to record".into());
@@ -139,7 +142,7 @@ fn record(
         std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     }
     let mut enc = Encoder::new(&s.path, w as u32, h as u32, !captures.is_empty())
-        .map_err(|e| format!("couldn't start the video encoder: {}", e.message()))?;
+        .map_err(|e| format!("couldn't start the video encoder: {}", describe(&e)))?;
     on_event(Event::Started { notes });
 
     let frame_time = Duration::from_secs(1) / FPS;
@@ -148,8 +151,8 @@ fn record(
     let mut first_frame = None;
     let mut next = clock;
     let mut last_video = -1i64;
-    let werr = |e: windows::core::Error| format!("couldn't write the video: {}", e.message());
-    while !stop.load(Ordering::Relaxed) {
+    let werr = |e: windows::core::Error| format!("couldn't write the video: {}", describe(&e));
+    let stopped_early = pump(&mut enc, stop, |enc| {
         let now = Instant::now();
         if now < next {
             std::thread::sleep(next - now);
@@ -158,13 +161,14 @@ fn record(
         while next <= Instant::now() {
             next += frame_time;
         }
-        let bgra = grab.frame().map_err(|e| format!("couldn't read the screen: {}", e.message()))?;
+        let bgra = grab.frame().map_err(|e| format!("couldn't read the screen: {}", describe(&e)))?;
         if first_frame.is_none() {
             first_frame = Some(to_color_image(bgra, w as usize, h as usize));
         }
         bgra_to_nv12(bgra, w as usize, h as usize, &mut nv12);
         let t = (clock.elapsed().as_secs_f64() * TICKS as f64) as i64;
-        if t > last_video {
+        let wrote = t > last_video;
+        if wrote {
             enc.video(&nv12, t).map_err(werr)?;
             last_video = t;
         }
@@ -175,11 +179,47 @@ fn record(
                 on_event(Event::Note(format!("Lost {name} ({e}); recording continues without it")));
             }
         }
-    }
+        Ok(wrote)
+    })?;
     let seconds = clock.elapsed().as_secs_f64();
     drop(captures);
     enc.finish().map_err(werr)?;
-    Ok(Finished { path: s.path.clone(), seconds, size: [w as u32, h as u32], first_frame })
+    Ok(Finished { path: s.path.clone(), seconds, size: [w as u32, h as u32], first_frame, stopped_early })
+}
+
+/// Runs `step` (which reports whether it wrote a video frame) until `stop` is
+/// set or it fails. A failure after the first video frame ends the recording
+/// early rather than losing it: the reason comes back and the caller still
+/// finalizes the file. With no frame written there is nothing worth keeping.
+fn pump(
+    enc: &mut Encoder,
+    stop: &AtomicBool,
+    mut step: impl FnMut(&mut Encoder) -> Result<bool, String>,
+) -> Result<Option<String>, String> {
+    let mut frames = 0u64;
+    while !stop.load(Ordering::Relaxed) {
+        match step(enc) {
+            Ok(wrote) => frames += wrote as u64,
+            Err(e) if frames == 0 => return Err(e),
+            Err(e) => return Ok(Some(e)),
+        }
+    }
+    if frames == 0 {
+        return Err("nothing was recorded".into());
+    }
+    Ok(None)
+}
+
+/// `Error::empty()` reads as "The operation completed successfully." and
+/// some codes carry no text; never show either to the user.
+fn describe(e: &windows::core::Error) -> String {
+    let code = e.code().0;
+    if code == 0 {
+        return "unknown error".into();
+    }
+    let text = e.message();
+    let text = text.trim();
+    if text.is_empty() { format!("error {:#010x}", code as u32) } else { text.to_string() }
 }
 
 /// Reads one monitor through DXGI Desktop Duplication (GPU copy, no stalls
@@ -602,6 +642,51 @@ mod tests {
         assert!(b > r + 100, "left half should be blue, got {:?}", at(60, 150));
         let (r, _, b) = at(260, 150);
         assert!(r > b + 100, "right half should be red, got {:?}", at(260, 150));
+    }
+
+    /// A failure partway through must still leave a playable MP4 holding the
+    /// frames written before it.
+    #[test]
+    fn error_midway_keeps_the_video() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("target").join("test-stopped-early.mp4");
+        let (w, h) = (320u32, 240u32);
+        let mut enc = Encoder::new(&path, w, h, false).expect("encoder");
+        let bgra: Vec<u8> = (0..w * h).flat_map(|_| [230, 80, 25, 255]).collect();
+        let mut nv12 = vec![0u8; (w * h * 3 / 2) as usize];
+        bgra_to_nv12(&bgra, w as usize, h as usize, &mut nv12);
+        let mut f = 0i64;
+        let stop = AtomicBool::new(false);
+        let reason = pump(&mut enc, &stop, |enc| {
+            if f == 10 {
+                return Err("couldn't read the screen: device removed".into());
+            }
+            enc.video(&nv12, f * TICKS / FPS as i64).map_err(|e| describe(&e))?;
+            f += 1;
+            Ok(true)
+        });
+        assert_eq!(reason, Ok(Some("couldn't read the screen: device removed".to_string())));
+        enc.finish().expect("finalize after the error");
+        let px = unsafe { first_frame_bgra(&path, h as usize) }.expect("decode");
+        let i = ((120 * w + 160) * 4) as usize;
+        let (r, b) = (px[i + 2] as i32, px[i] as i32);
+        assert!(b > r + 100, "frame should be blue, got r={r} b={b}");
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn error_before_any_frame_is_a_failure() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("target").join("test-no-frames.mp4");
+        let mut enc = Encoder::new(&path, 64, 64, false).expect("encoder");
+        let stop = AtomicBool::new(false);
+        assert_eq!(pump(&mut enc, &stop, |_| Err("boom".into())), Err("boom".to_string()));
+        assert_eq!(pump(&mut enc, &AtomicBool::new(true), |_| Ok(true)), Err("nothing was recorded".to_string()));
+        drop(enc);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn blank_windows_errors_still_say_something() {
+        assert_eq!(describe(&windows::core::Error::empty()), "unknown error");
     }
 
     unsafe fn first_frame_bgra(path: &Path, height: usize) -> windows::core::Result<Vec<u8>> {

@@ -1182,7 +1182,10 @@ impl App {
                         self.doc = None;
                         self.texture = None;
                         self.place_window(ctx, self.window_size_for(ctx));
-                        let mut msg = "Saved to Videos\\Screen Recordings".to_string();
+                        let mut msg = match f.stopped_early {
+                            Some(why) => format!("Recording stopped early ({why}) · Saved to Videos\\Screen Recordings"),
+                            None => "Saved to Videos\\Screen Recordings".to_string(),
+                        };
                         for n in notes {
                             msg.push_str(" · ");
                             msg.push_str(&n);
