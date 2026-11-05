@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024" role="img" aria-labelledby="title desc">
+  <title id="title">SnipScreen</title>
+  <desc id="desc">Small-size SnipScreen mark: bold snip corners and a copper recording dot on a matte navy tile.</desc>
+
+  <!-- Drawn for 16-24 px slots: the hills would fall below one pixel, so the
+       glyph keeps only the corners and the dot, with heavier strokes.
+       Same canvas and tile placement as snipscreen-icon.svg. -->
+  <rect x="64" y="64" width="896" height="896" rx="200" fill="#263C56"/>
+  <rect x="80" y="80" width="864" height="864" rx="184" fill="none" stroke="#8CA8CF" stroke-opacity="0.55" stroke-width="32"/>
+  <path d="M208 400 V300 Q208 252 256 252 H356 M668 252 H768 Q816 252 816 300 V400 M816 624 V724 Q816 772 768 772 H668 M356 772 H256 Q208 772 208 724 V624" fill="none" stroke="#F2EFE9" stroke-width="88" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="512" cy="512" r="132" fill="#E6A05A" stroke="#263C56" stroke-width="36"/>
+</svg>
