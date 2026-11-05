@@ -424,28 +424,24 @@ impl App {
         self.place_window(ctx, self.window_size_for(ctx));
         let Some(doc) = &self.doc else { return };
         let image = doc.image.clone();
-        if self.auto_copy {
-            self.copy_in_background(ctx, image.clone(), false);
+        if !self.auto_copy && !self.auto_save {
+            return;
         }
-        if self.auto_save {
-            match win::pictures_dir() {
-                Some(dir) => {
-                    let path = dir.join("Screenshots").join(format!("Snip {}.png", win::timestamp()));
-                    let (tx, ctx) = (self.note_tx.clone(), ctx.clone());
-                    let copied = self.auto_copy;
-                    std::thread::spawn(move || {
-                        let msg = match win::save_png(&path, &image) {
-                            Ok(()) if copied => "Copied, and saved to Pictures\\Screenshots".to_string(),
-                            Ok(()) => "Saved to Pictures\\Screenshots".to_string(),
-                            Err(e) => format!("Couldn't auto-save: {e}"),
-                        };
-                        let _ = tx.send(msg);
-                        ctx.request_repaint();
-                    });
-                }
-                None => self.say(ctx, "Couldn't find your Pictures folder to auto-save".into()),
+        // One worker does both jobs so the toast can report what each really did.
+        let save_path = self.auto_save.then(|| {
+            win::pictures_dir()
+                .map(|dir| dir.join("Screenshots").join(format!("Snip {}.png", win::timestamp())))
+                .ok_or_else(|| "couldn't find your Pictures folder".to_string())
+        });
+        let (copy, tx, ctx, hwnd) = (self.auto_copy, self.note_tx.clone(), ctx.clone(), self.hwnd);
+        std::thread::spawn(move || {
+            let copied = copy.then(|| win::copy_image(hwnd as HWND, &image));
+            let saved = save_path.map(|path| path.and_then(|p| win::save_png(&p, &image)));
+            if let Some(msg) = auto_note(copied, saved) {
+                let _ = tx.send(msg);
+                ctx.request_repaint();
             }
-        }
+        });
     }
 
     fn copy_in_background(&self, ctx: &egui::Context, image: Arc<ColorImage>, announce: bool) {
@@ -1556,6 +1552,27 @@ fn main() -> eframe::Result {
     )
 }
 
+/// Toast for a new snip's automatic copy and save; `None` when each job that ran succeeded and
+/// only the copy was asked for, since the clipboard needs no announcement.
+fn auto_note(copied: Option<Result<(), String>>, saved: Option<Result<(), String>>) -> Option<String> {
+    let copy_err = copied.as_ref().and_then(|r| r.as_ref().err());
+    let save_err = saved.as_ref().and_then(|r| r.as_ref().err());
+    let mut parts = Vec::new();
+    match (&copied, &saved) {
+        (Some(Ok(())), Some(Ok(()))) => parts.push("Copied, and saved to Pictures\\Screenshots".to_string()),
+        (_, Some(Ok(()))) => parts.push("Saved to Pictures\\Screenshots".to_string()),
+        (Some(Ok(())), Some(Err(_))) => parts.push("Copied to clipboard".to_string()),
+        _ => {}
+    }
+    if let Some(e) = copy_err {
+        parts.push(format!("Couldn't copy: {e}"));
+    }
+    if let Some(e) = save_err {
+        parts.push(format!("Couldn't auto-save: {e}"));
+    }
+    (!parts.is_empty()).then(|| parts.join(" · "))
+}
+
 /// A popup that closes on a click outside lets that click through to whatever lies beneath it.
 /// This notices when a canvas click only dismissed a popup, so it doesn't also draw.
 #[derive(Default)]
@@ -1781,6 +1798,21 @@ mod tests {
         assert!(!click(&ctx, &mut guard, pos2(400.0, 400.0)), "the dismissing click must not reach the canvas");
         assert!(!egui::Popup::is_any_open(&ctx), "click outside should have closed the popup");
         assert!(click(&ctx, &mut guard, pos2(400.0, 400.0)), "the next click draws as usual");
+    }
+
+    #[test]
+    fn auto_note_reports_what_each_job_did() {
+        let ok = || Some(Ok(()));
+        let err = |m: &str| Some(Err(m.to_string()));
+        assert_eq!(auto_note(ok(), ok()).as_deref(), Some("Copied, and saved to Pictures\\Screenshots"));
+        assert_eq!(auto_note(None, ok()).as_deref(), Some("Saved to Pictures\\Screenshots"));
+        assert_eq!(auto_note(ok(), None), None);
+        assert_eq!(auto_note(None, None), None);
+        assert_eq!(auto_note(err("busy"), ok()).as_deref(), Some("Saved to Pictures\\Screenshots · Couldn't copy: busy"));
+        assert_eq!(auto_note(ok(), err("disk full")).as_deref(), Some("Copied to clipboard · Couldn't auto-save: disk full"));
+        assert_eq!(auto_note(err("busy"), None).as_deref(), Some("Couldn't copy: busy"));
+        assert_eq!(auto_note(None, err("disk full")).as_deref(), Some("Couldn't auto-save: disk full"));
+        assert_eq!(auto_note(err("busy"), err("disk full")).as_deref(), Some("Couldn't copy: busy · Couldn't auto-save: disk full"));
     }
 
     #[test]
