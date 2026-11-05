@@ -356,6 +356,8 @@ impl App {
         if !matches!(self.stage, Stage::Idle | Stage::Counting { .. }) {
             return;
         }
+        // A half-drawn stroke belongs to the snip being replaced.
+        self.drawing = None;
         let delay = if self.mode == Mode::Photo { self.delay } else { 0 };
         if delay == 0 {
             self.hide_and_grab(ctx);
@@ -713,10 +715,10 @@ impl App {
         }
         if let Some(doc) = &mut self.doc {
             if undo {
-                step_history(doc, &mut self.crop, false);
+                step_history(doc, &mut self.crop, &mut self.drawing, false);
             }
             if redo {
-                step_history(doc, &mut self.crop, true);
+                step_history(doc, &mut self.crop, &mut self.drawing, true);
             }
         }
         if enter {
@@ -944,10 +946,10 @@ impl App {
         divider(ui);
         if let Some(doc) = &mut self.doc {
             if icon_button(ui, Icon::Undo, None, false, doc.can_undo(), "Undo (Ctrl+Z)").clicked() {
-                step_history(doc, &mut self.crop, false);
+                step_history(doc, &mut self.crop, &mut self.drawing, false);
             }
             if icon_button(ui, Icon::Redo, None, false, doc.can_redo(), "Redo (Ctrl+Y)").clicked() {
-                step_history(doc, &mut self.crop, true);
+                step_history(doc, &mut self.crop, &mut self.drawing, true);
             }
         }
     }
@@ -1893,13 +1895,15 @@ fn zoom_badge(painter: &egui::Painter, view: Rect, zoom: f32) {
 
 /// Undoes or redoes one step. The pending crop box is in pixels of the image it was drawn on,
 /// and the restored image can be a different size, so the box is dropped rather than applied to it.
-fn step_history(doc: &mut Doc, crop: &mut Option<(Pos2, Pos2)>, redo: bool) {
+/// A stroke still being drawn is in the old image's coordinates, so it is dropped as well.
+fn step_history(doc: &mut Doc, crop: &mut Option<(Pos2, Pos2)>, drawing: &mut Option<Stroke>, redo: bool) {
     if redo {
         doc.redo();
     } else {
         doc.undo();
     }
     *crop = None;
+    *drawing = None;
 }
 
 /// True on the frame the primary button comes up over `resp`. egui reports a press held longer than
@@ -2145,12 +2149,12 @@ mod tests {
         let box_on_cropped = Some((pos2(5.0, 5.0), pos2(45.0, 35.0)));
 
         let mut crop = box_on_cropped;
-        step_history(&mut doc, &mut crop, false);
+        step_history(&mut doc, &mut crop, &mut None, false);
         assert_eq!(doc.size(), [100, 80], "undo restores the larger image");
         assert_eq!(crop, None, "the 50x40 box must not carry over to the 100x80 image");
 
         let mut crop = Some((pos2(80.0, 60.0), pos2(99.0, 79.0)));
-        step_history(&mut doc, &mut crop, true);
+        step_history(&mut doc, &mut crop, &mut None, true);
         assert_eq!(doc.size(), [50, 40], "redo re-crops");
         assert_eq!(crop, None, "a box drawn on the large image would fall outside the small one");
     }
@@ -2478,6 +2482,15 @@ mod tests {
         // Normal fit: the floor and ceiling hold.
         assert_eq!(clamp_zoom(0.01, 0.5), MIN_ZOOM);
         assert_eq!(clamp_zoom(100.0, 0.5), MAX_ZOOM);
+    }
+
+    #[test]
+    fn undo_drops_a_stroke_in_progress() {
+        let mut doc = Doc::new(ColorImage::new([100, 80], vec![Color32::WHITE; 8000]));
+        doc.crop(Rect::from_min_max(pos2(10.0, 10.0), pos2(60.0, 50.0)));
+        let mut drawing = Some(Stroke { ink: Ink::Pen, color: Color32::RED, width: 4.0, points: vec![pos2(1.0, 1.0)] });
+        step_history(&mut doc, &mut None, &mut drawing, false);
+        assert!(drawing.is_none(), "a stroke in the old image's coordinates must not land on the restored one");
     }
 
     /// One frame in the picker's order: the full-screen response is read first, the shape menu shown after it.
