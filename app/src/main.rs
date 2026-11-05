@@ -670,10 +670,10 @@ impl App {
         }
         if let Some(doc) = &mut self.doc {
             if undo {
-                doc.undo();
+                step_history(doc, &mut self.crop, false);
             }
             if redo {
-                doc.redo();
+                step_history(doc, &mut self.crop, true);
             }
         }
         if enter {
@@ -901,10 +901,10 @@ impl App {
         divider(ui);
         if let Some(doc) = &mut self.doc {
             if icon_button(ui, Icon::Undo, None, false, doc.can_undo(), "Undo (Ctrl+Z)").clicked() {
-                doc.undo();
+                step_history(doc, &mut self.crop, false);
             }
             if icon_button(ui, Icon::Redo, None, false, doc.can_redo(), "Redo (Ctrl+Y)").clicked() {
-                doc.redo();
+                step_history(doc, &mut self.crop, true);
             }
         }
     }
@@ -1793,6 +1793,17 @@ impl PopupClickGuard {
     }
 }
 
+/// Undoes or redoes one step. The pending crop box is in pixels of the image it was drawn on,
+/// and the restored image can be a different size, so the box is dropped rather than applied to it.
+fn step_history(doc: &mut Doc, crop: &mut Option<(Pos2, Pos2)>, redo: bool) {
+    if redo {
+        doc.redo();
+    } else {
+        doc.undo();
+    }
+    *crop = None;
+}
+
 /// True on the frame the primary button comes up over `resp`. egui reports a press held longer than
 /// ~0.8 s or moved more than ~6 pt as a drag, not a click, and a still, slow press produces no frame
 /// that marks it a drag, so `clicked` and `drag_stopped` alone miss some releases.
@@ -1995,6 +2006,24 @@ mod tests {
         assert_eq!(countdown_secs(ms(2000)), Some(2));
         assert_eq!(countdown_secs(ms(1)), Some(1));
         assert_eq!(countdown_secs(Duration::ZERO), None);
+    }
+
+    #[test]
+    fn undo_and_redo_drop_the_pending_crop_box() {
+        let mut doc = Doc::new(ColorImage::new([100, 80], vec![Color32::WHITE; 8000]));
+        doc.crop(Rect::from_min_max(pos2(10.0, 10.0), pos2(60.0, 50.0)));
+        assert_eq!(doc.size(), [50, 40]);
+        let box_on_cropped = Some((pos2(5.0, 5.0), pos2(45.0, 35.0)));
+
+        let mut crop = box_on_cropped;
+        step_history(&mut doc, &mut crop, false);
+        assert_eq!(doc.size(), [100, 80], "undo restores the larger image");
+        assert_eq!(crop, None, "the 50x40 box must not carry over to the 100x80 image");
+
+        let mut crop = Some((pos2(80.0, 60.0), pos2(99.0, 79.0)));
+        step_history(&mut doc, &mut crop, true);
+        assert_eq!(doc.size(), [50, 40], "redo re-crops");
+        assert_eq!(crop, None, "a box drawn on the large image would fall outside the small one");
     }
 
     /// Frames of a press-move-release on a fresh widget; returns whether `released_on` fired on any of them.
