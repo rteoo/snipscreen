@@ -17,7 +17,7 @@ use eframe::egui::{
     TextureHandle, TextureOptions, Vec2, ViewportCommand, WindowLevel,
 };
 use icons::Icon;
-use markup::{Doc, Ink, Stroke};
+use markup::{Doc, Ink, PxRect, Stroke};
 use windows_sys::Win32::Foundation::HWND;
 
 const ACCENT: Color32 = Color32::from_rgb(0xff, 0xb6, 0x34);
@@ -186,7 +186,7 @@ struct App {
     settle: u8,
 
     doc: Option<Doc>,
-    texture: Option<(TextureHandle, u64)>,
+    texture: Option<CanvasTex>,
     tool: Tool,
     pen: (Color32, f32),
     highlighter: (Color32, f32),
@@ -873,11 +873,26 @@ impl App {
     fn canvas(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         let Some(doc) = &mut self.doc else { return };
-        if self.texture.as_ref().is_none_or(|(_, rev)| *rev != doc.image_rev) {
-            let tex = ctx.load_texture("snip", doc.image.clone(), TextureOptions::LINEAR);
-            self.texture = Some((tex, doc.image_rev));
+        let rev = (doc.image_rev, doc.ink_rev);
+        if self.texture.as_ref().is_none_or(|c| c.rev != rev) {
+            // ceiling: erase/undo re-flatten the whole snip (~150 ms for 20 long strokes on 4K); burn per-stroke tiles if erasing feels sticky.
+            let shown = if doc.strokes.is_empty() { doc.image.clone() } else { Arc::new(doc.flatten()) };
+            match &mut self.texture {
+                Some(c) => {
+                    c.tex.set(shown.clone(), TextureOptions::LINEAR);
+                    if c.rev.0 != rev.0 {
+                        c.live = None;
+                    }
+                    c.shown = shown;
+                    c.rev = rev;
+                }
+                None => {
+                    let tex = ctx.load_texture("snip", shown.clone(), TextureOptions::LINEAR);
+                    self.texture = Some(CanvasTex { tex, shown, rev, live: None });
+                }
+            }
         }
-        let Some((tex, _)) = &self.texture else { return };
+        let Some(canvas) = &mut self.texture else { return };
 
         let ppp = ctx.pixels_per_point();
         let px_size = vec2(doc.size()[0] as f32, doc.size()[1] as f32);
@@ -901,12 +916,8 @@ impl App {
             let to_pt = |p: Pos2| img_rect.min + p.to_vec2() / k;
 
             let painter = ui.painter();
-            painter.image(tex.id(), img_rect, Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)), Color32::WHITE);
-
-            let ink_painter = painter.with_clip_rect(img_rect.intersect(painter.clip_rect()));
-            for s in doc.strokes.iter().chain(self.drawing.as_ref()) {
-                paint_stroke(&ink_painter, s, &to_pt, 1.0 / k);
-            }
+            // Committed ink is already burned into the texture, exactly as it will be saved.
+            painter.image(canvas.tex.id(), img_rect, Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)), Color32::WHITE);
 
             let pointer = resp.interact_pointer_pos().or(resp.hover_pos());
             // Drags are noticed a few pixels after the button goes down; start where it went down.
@@ -938,9 +949,11 @@ impl App {
                     }
                     if resp.drag_stopped() || resp.clicked() {
                         if let Some(s) = self.drawing.take() {
-                            doc.checkpoint();
-                            doc.strokes.push(s);
+                            canvas.commit(doc, s);
                         }
+                    }
+                    if let Some(s) = &self.drawing {
+                        canvas.show_live(&ctx, painter, img_rect, s, doc.size());
                     }
                 }
                 Tool::Eraser => {
@@ -1435,22 +1448,75 @@ impl App {
     }
 }
 
-fn paint_stroke(painter: &egui::Painter, s: &Stroke, to_pt: &impl Fn(Pos2) -> Pos2, scale: f32) {
-    let color = s.paint_color();
-    let width = s.width * scale;
-    let pts: Vec<Pos2> = s.points.iter().map(|&p| to_pt(p)).collect();
-    match pts.as_slice() {
-        [] => {}
-        [p] => {
-            painter.circle_filled(*p, width * 0.5, color);
+/// The snip as shown: the picture with committed ink burned in by the same
+/// rasteriser that saves it, plus a layer for the stroke being drawn.
+struct CanvasTex {
+    tex: TextureHandle,
+    shown: Arc<ColorImage>,
+    /// `(image_rev, ink_rev)` of the doc that `shown` was built from.
+    rev: (u64, u64),
+    live: Option<LiveInk>,
+}
+
+/// Image-sized, see-through texture holding the stroke being drawn. Only the
+/// pixels its newest segments touch are re-rasterised and uploaded each frame.
+struct LiveInk {
+    tex: TextureHandle,
+    /// Points of the stroke already rasterised into `tex`.
+    done: usize,
+    /// Pixels written so far, cleared when the stroke ends.
+    dirty: Option<PxRect>,
+}
+
+impl LiveInk {
+    fn clear(&mut self) {
+        if let Some(r) = self.dirty.take() {
+            let (w, h) = (r.x1 - r.x0, r.y1 - r.y0);
+            self.tex.set_partial(r.pos(), ColorImage::new([w, h], vec![Color32::TRANSPARENT; w * h]), TextureOptions::LINEAR);
         }
-        _ => {
-            if s.ink == Ink::Pen {
-                painter.circle_filled(pts[0], width * 0.5, color);
-                painter.circle_filled(pts[pts.len() - 1], width * 0.5, color);
+        self.done = 0;
+    }
+}
+
+impl CanvasTex {
+    /// Adds a finished stroke, burning just that stroke into the texture
+    /// rather than re-flattening the whole snip.
+    fn commit(&mut self, doc: &mut Doc, s: Stroke) {
+        let current = self.rev == (doc.image_rev, doc.ink_rev);
+        if current {
+            if let Some(r) = s.bounds_from(0, doc.size()) {
+                let shown = Arc::make_mut(&mut self.shown);
+                markup::burn_stroke(shown, &s);
+                let patch = markup::sub_image(shown, r.x0, r.y0, r.x1 - r.x0, r.y1 - r.y0);
+                self.tex.set_partial(r.pos(), patch, TextureOptions::LINEAR);
             }
-            painter.add(Shape::line(pts, (width, color)));
         }
+        doc.add_stroke(s);
+        if current {
+            self.rev.1 = doc.ink_rev;
+        }
+        if let Some(live) = &mut self.live {
+            live.clear();
+        }
+    }
+
+    fn show_live(&mut self, ctx: &egui::Context, painter: &egui::Painter, img_rect: Rect, s: &Stroke, size: [usize; 2]) {
+        let live = self.live.get_or_insert_with(|| LiveInk {
+            tex: ctx.load_texture("live ink", ColorImage::new(size, vec![Color32::TRANSPARENT; size[0] * size[1]]), TextureOptions::LINEAR),
+            done: 0,
+            dirty: None,
+        });
+        if s.points.len() < live.done {
+            live.clear();
+        }
+        if live.done < s.points.len() {
+            if let Some(r) = s.bounds_from(live.done, size) {
+                live.tex.set_partial(r.pos(), s.ink_tile(r), TextureOptions::LINEAR);
+                live.dirty = Some(live.dirty.map_or(r, |d| d.union(r)));
+            }
+            live.done = s.points.len();
+        }
+        painter.image(live.tex.id(), img_rect, Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)), Color32::WHITE);
     }
 }
 
