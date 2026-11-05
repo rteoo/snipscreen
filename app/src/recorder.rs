@@ -45,6 +45,8 @@ pub const FPS: u32 = 30;
 const TICKS: i64 = 10_000_000; // Media Foundation counts time in 100 ns ticks.
 /// Hardware H.264 encoders commonly stop at 4096 pixels per side.
 const MAX_SIDE: i32 = 4096;
+/// How far the sound track may trail the picture before silence fills it.
+const AUDIO_GAP: i64 = TICKS / 2;
 
 pub struct Settings {
     /// Screen pixels to record: x, y, width, height.
@@ -725,7 +727,10 @@ struct Encoder {
     video: u32,
     audio: Option<u32>,
     frame_bytes: u32,
+    /// Sound frames written, silence from `fill_audio_gap` included.
     audio_frames: i64,
+    /// Sound frames handed to `audio`; behind `audio_frames` after a fill.
+    audio_given: i64,
     /// Last, so it drops after `writer`: fields drop in order.
     _mf: MediaFoundation,
 }
@@ -790,7 +795,7 @@ impl Encoder {
                 None
             };
             writer.BeginWriting()?;
-            Ok(Self { writer, video, audio, frame_bytes: w * h * 3 / 2, audio_frames: 0, _mf: mf })
+            Ok(Self { writer, video, audio, frame_bytes: w * h * 3 / 2, audio_frames: 0, audio_given: 0, _mf: mf })
         }
     }
 
@@ -815,13 +820,33 @@ impl Encoder {
 
     fn video(&mut self, nv12: &[u8], time: i64) -> windows::core::Result<()> {
         debug_assert_eq!(nv12.len() as u32, self.frame_bytes);
+        self.fill_audio_gap(time)?;
         self.write(self.video, nv12, time, TICKS / FPS as i64)
     }
 
-    /// Interleaved stereo f32; time comes from the sample count so the
-    /// sound track never drifts from its own clock.
+    /// The throttled sink writer holds video back while the sound track
+    /// trails it by a few seconds, and the recorder would then hang inside
+    /// `WriteSample`. A sound source that is still warming up or stuck leaves
+    /// the mix empty, so silence fills the track up to `AUDIO_GAP` behind the
+    /// picture; `audio` then skips the sound that silence stands in for.
+    fn fill_audio_gap(&mut self, video_time: i64) -> windows::core::Result<()> {
+        let Some(stream) = self.audio else { return Ok(()) };
+        let due = (video_time - AUDIO_GAP) * audio::RATE as i64 / TICKS;
+        if due <= self.audio_frames {
+            return Ok(());
+        }
+        let frames = due - self.audio_frames;
+        self.write_pcm(stream, &vec![0u8; frames as usize * audio::CHANNELS * 2], frames)
+    }
+
+    /// Interleaved stereo f32, following on from the last call. Time comes
+    /// from the sample count so the sound track never drifts from its own clock.
     fn audio(&mut self, samples: &[f32]) -> windows::core::Result<()> {
         let Some(stream) = self.audio else { return Ok(()) };
+        let given = (samples.len() / audio::CHANNELS) as i64;
+        let skip = (self.audio_frames - self.audio_given).clamp(0, given);
+        self.audio_given += given;
+        let samples = &samples[skip as usize * audio::CHANNELS..];
         if samples.is_empty() {
             return Ok(());
         }
@@ -829,11 +854,15 @@ impl Encoder {
             .iter()
             .flat_map(|s| ((s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16).to_le_bytes())
             .collect();
-        let frames = (samples.len() / audio::CHANNELS) as i64;
+        self.write_pcm(stream, &pcm, given - skip)
+    }
+
+    /// 16-bit stereo PCM placed right after the sound written so far.
+    fn write_pcm(&mut self, stream: u32, pcm: &[u8], frames: i64) -> windows::core::Result<()> {
         let time = self.audio_frames * TICKS / audio::RATE as i64;
         let duration = frames * TICKS / audio::RATE as i64;
         self.audio_frames += frames;
-        self.write(stream, &pcm, time, duration)
+        self.write(stream, pcm, time, duration)
     }
 
     fn finish(self) -> windows::core::Result<()> {
@@ -1109,6 +1138,68 @@ mod tests {
         assert!(b > r + 100, "left half should be blue, got {:?}", at(60, 150));
         let (r, _, b) = at(260, 150);
         assert!(r > b + 100, "right half should be red, got {:?}", at(260, 150));
+    }
+
+    /// A microphone that hasn't sent its first packet yet leaves the sound
+    /// track empty while video keeps coming. The throttled sink writer must
+    /// not wait on that track, and the file must still finalize and play.
+    #[test]
+    fn video_without_audio_samples_does_not_stall() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("target").join("test-no-audio-yet.mp4");
+        let (w, h) = (320u32, 240u32);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let written = Arc::new(std::sync::atomic::AtomicI64::new(0));
+        let worker = {
+            let (path, written) = (path.clone(), written.clone());
+            std::thread::spawn(move || {
+                let result = (|| {
+                    let mut enc = Encoder::new(&path, w, h, true).map_err(|e| describe(&e))?;
+                    let nv12 = vec![128u8; (w * h * 3 / 2) as usize];
+                    for f in 0..(5 * FPS) as i64 {
+                        enc.video(&nv12, f * TICKS / FPS as i64).map_err(|e| format!("frame {f}: {}", describe(&e)))?;
+                        enc.audio(&[]).map_err(|e| format!("audio at frame {f}: {}", describe(&e)))?;
+                        written.store(f + 1, Ordering::Relaxed);
+                    }
+                    // Silence trails the last picture by the gap...
+                    let last = (5 * FPS as i64 - 1) * TICKS / FPS as i64;
+                    if enc.audio_frames != (last - AUDIO_GAP) * audio::RATE as i64 / TICKS {
+                        return Err(format!("sound track holds {} frames of silence", enc.audio_frames));
+                    }
+                    // ...and the late sound that arrives then is skipped as far as the silence covers it.
+                    enc.audio(&vec![0.25; 5 * audio::RATE as usize * audio::CHANNELS]).map_err(|e| describe(&e))?;
+                    if enc.audio_frames != 5 * audio::RATE as i64 {
+                        return Err(format!("sound track holds {} frames after catching up", enc.audio_frames));
+                    }
+                    enc.finish().map_err(|e| format!("finalize: {}", describe(&e)))
+                })();
+                let _ = tx.send(result);
+            })
+        };
+        let Ok(result) = rx.recv_timeout(Duration::from_secs(30)) else {
+            panic!("encoder stalled with an empty sound track after {} of {} frames", written.load(Ordering::Relaxed), 5 * FPS);
+        };
+        worker.join().unwrap();
+        result.expect("encode without sound samples");
+        let (frames, span) = unsafe { count_video_frames(&path) }.expect("decode");
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(frames, 5 * FPS, "spans {span:.2} s");
+    }
+
+    /// Stopped before any sound arrived: the empty sound track must not
+    /// keep the file from finalizing.
+    #[test]
+    fn empty_sound_track_still_finalizes() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("target").join("test-empty-audio.mp4");
+        let (w, h) = (64u32, 64u32);
+        let mut enc = Encoder::new(&path, w, h, true).expect("encoder");
+        let nv12 = vec![128u8; (w * h * 3 / 2) as usize];
+        for f in 0..3 {
+            enc.video(&nv12, f * TICKS / FPS as i64).unwrap();
+        }
+        enc.finish().expect("finalize with no sound samples");
+        let (frames, _) = unsafe { count_video_frames(&path) }.expect("decode");
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(frames, 3);
     }
 
     /// A failure partway through must still leave a playable MP4 holding the

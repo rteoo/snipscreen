@@ -107,7 +107,7 @@ impl Capture {
                     }
                 };
                 let mut produced = 0;
-                if let Err(e) = pump(&source, &client, &samples, &stop, clock, &mut produced) {
+                if let Err(e) = pump(&client, &samples, &stop, clock, &mut produced) {
                     let why = if e.code() == AUDCLNT_E_DEVICE_INVALIDATED { "it was disconnected".to_string() } else { e.to_string() };
                     *failure.lock().unwrap() = Some(why);
                     // The other source is mixed only as far as this one has
@@ -188,7 +188,6 @@ fn open(source: &Source) -> Result<Client, String> {
 }
 
 fn pump(
-    source: &Source,
     client: &Client,
     samples: &Mutex<VecDeque<f32>>,
     stop: &AtomicBool,
@@ -235,11 +234,11 @@ fn pump(
                 }
             }
         }
-        // Loopback sends nothing while the computer is silent; fill the gap
-        // so the sound stays in step with the picture.
-        if *source == Source::System {
-            keep_time(samples, produced, clock.elapsed());
-        }
+        // Loopback sends nothing while the computer is silent, and a
+        // microphone nothing while it warms up or if it stalls. The mix only
+        // goes as far as every queue, so fill the gap with silence; a packet
+        // that then arrives late loses the overlap in `place`.
+        keep_time(samples, produced, clock.elapsed());
     }
     Ok(())
 }
@@ -366,6 +365,22 @@ mod tests {
         // Later packets that follow on within jitter are queued as they come.
         assert_eq!(place(at as u64 + 480, at + 480 + 30, 480, false), (0, 0));
         assert_eq!(place(at as u64 + 480, at + 480 - 30, 480, false), (0, 0));
+    }
+
+    /// A microphone still warming up is kept on the clock with silence, and
+    /// its first packet then lands exactly where it was captured.
+    #[test]
+    fn warming_up_source_keeps_time_then_lines_up() {
+        let q = Mutex::new(VecDeque::new());
+        let mut produced = 0;
+        for ms in (10..=300).step_by(10) {
+            keep_time(&q, &mut produced, Duration::from_millis(ms));
+        }
+        assert!(produced >= RATE as u64 / 10, "only {produced} frames of silence after 300 ms");
+        // First packet: 10 ms captured 280 ms in.
+        let at = RATE as i64 * 28 / 100;
+        let (pad, skip) = place(produced, at, 480, true);
+        assert_eq!(produced + pad + 480 - skip, at as u64 + 480);
     }
 
     #[test]
