@@ -235,6 +235,10 @@ struct App {
     grab_rx: Receiver<Result<win::Grab, String>>,
     hotkey_rx: Option<Receiver<()>>,
     hotkey_note: Option<String>,
+    /// Presses of the global Esc hotkey, which is registered only during a countdown.
+    esc_rx: Option<Receiver<()>>,
+    esc_hotkey: Option<win::EscapeHotkey>,
+    esc_armed: bool,
     note_tx: Sender<String>,
     note_rx: Receiver<String>,
     note: Option<Note>,
@@ -282,16 +286,23 @@ impl App {
         let (grab_tx, grab_rx) = channel();
         let (note_tx, note_rx) = channel();
         let (rec_tx, rec_rx) = channel();
-        let (mut hotkey_rx, mut hotkey_note) = (None, None);
+        let (mut hotkey_rx, mut hotkey_note, mut esc_rx, mut esc_hotkey) = (None, None, None, None);
         // A screenshot run must not steal the shortcut from a running copy.
         if screenshot.is_none() {
             let (tx, rx) = channel();
-            let ctx = cc.egui_ctx.clone();
-            match win::listen_hotkey(move || {
-                let _ = tx.send(());
-                ctx.request_repaint();
-            }) {
-                Ok(()) => hotkey_rx = Some(rx),
+            let (esc_tx, erx) = channel();
+            let (ctx, esc_ctx) = (cc.egui_ctx.clone(), cc.egui_ctx.clone());
+            match win::listen_hotkey(
+                move || {
+                    let _ = tx.send(());
+                    ctx.request_repaint();
+                },
+                move || {
+                    let _ = esc_tx.send(());
+                    esc_ctx.request_repaint();
+                },
+            ) {
+                Ok(esc) => (hotkey_rx, esc_rx, esc_hotkey) = (Some(rx), Some(erx), Some(esc)),
                 Err(e) => hotkey_note = Some(e),
             }
         }
@@ -305,6 +316,9 @@ impl App {
             grab_rx,
             hotkey_rx,
             hotkey_note,
+            esc_rx,
+            esc_hotkey,
+            esc_armed: false,
             note_tx,
             note_rx,
             note: None,
@@ -354,11 +368,25 @@ impl App {
         ctx.request_repaint();
     }
 
+    /// Esc is a global hotkey only while a countdown runs: a hotkey-started
+    /// countdown never takes focus, so the window cannot see Esc itself. Called
+    /// on every stage exit and once per frame, so it cannot stay registered.
+    fn sync_escape_hotkey(&mut self) {
+        let want = wants_escape_hotkey(&self.stage);
+        if want != self.esc_armed {
+            self.esc_armed = want;
+            if let Some(esc) = &self.esc_hotkey {
+                esc.set(want);
+            }
+        }
+    }
+
     /// Hides the window, waits for its hide animation, then copies the screen.
     fn hide_and_grab(&mut self, ctx: &egui::Context) {
         self.restore_corner = win::window_corner(self.hwnd as HWND);
         ctx.send_viewport_cmd(ViewportCommand::Visible(false));
         self.stage = Stage::Waiting;
+        self.sync_escape_hotkey();
         let (tx, ctx) = (self.grab_tx.clone(), ctx.clone());
         std::thread::spawn(move || {
             std::thread::sleep(HIDE_SETTLE);
@@ -369,8 +397,10 @@ impl App {
 
     /// Advances the delay countdown: Esc cancels, the last second hides the window.
     fn tick_countdown(&mut self, ctx: &egui::Context) {
+        // Always drained, so a press that arrives just as the countdown ends is not kept for the next one.
+        let global_esc = self.esc_rx.as_ref().is_some_and(drain);
         let Stage::Counting { end } = self.stage else { return };
-        if take_escape(ctx) {
+        if take_escape(ctx) || global_esc {
             self.cancel_countdown(ctx);
             return;
         }
@@ -384,6 +414,7 @@ impl App {
 
     fn cancel_countdown(&mut self, ctx: &egui::Context) {
         self.stage = Stage::Idle;
+        self.sync_escape_hotkey();
         self.show_window(ctx);
     }
 
@@ -616,6 +647,7 @@ impl eframe::App for App {
         self.tick_countdown(ctx);
         self.reveal_picker(ctx);
         self.settle_window(ctx);
+        self.sync_escape_hotkey();
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -1877,6 +1909,16 @@ struct Keys {
     zoom_fit: bool,
 }
 
+/// Esc is grabbed system-wide only while a countdown is running.
+fn wants_escape_hotkey(stage: &Stage) -> bool {
+    matches!(stage, Stage::Counting { .. })
+}
+
+/// True if anything arrived on the channel; empties it.
+fn drain(rx: &Receiver<()>) -> bool {
+    rx.try_iter().count() > 0
+}
+
 /// Esc cancels the innermost thing: an open popup or menu closes itself on Esc, so while one is open
 /// the key is left alone, and otherwise it is consumed so only one action reacts to it.
 fn take_escape(ctx: &egui::Context) -> bool {
@@ -2367,6 +2409,25 @@ mod tests {
         assert_eq!(auto_note(err("busy"), None).as_deref(), Some("Couldn't copy: busy"));
         assert_eq!(auto_note(None, err("disk full")).as_deref(), Some("Couldn't auto-save: disk full"));
         assert_eq!(auto_note(err("busy"), err("disk full")).as_deref(), Some("Couldn't copy: busy · Couldn't auto-save: disk full"));
+    }
+
+    #[test]
+    fn global_esc_is_registered_only_while_counting() {
+        let end = Instant::now();
+        assert!(wants_escape_hotkey(&Stage::Counting { end }));
+        for stage in [Stage::Idle, Stage::Waiting] {
+            assert!(!wants_escape_hotkey(&stage), "Esc must stay with the focused app outside a countdown");
+        }
+    }
+
+    #[test]
+    fn drain_reports_and_empties_pending_global_esc_presses() {
+        let (tx, rx) = channel();
+        assert!(!drain(&rx));
+        tx.send(()).unwrap();
+        tx.send(()).unwrap();
+        assert!(drain(&rx));
+        assert!(!drain(&rx), "a press must be reported once");
     }
 
     #[test]
