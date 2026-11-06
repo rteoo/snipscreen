@@ -586,6 +586,9 @@ impl App {
             Stage::Idle => {
                 self.home_visible = false;
                 self.conceal();
+                // The foreground is handed on in `keep_concealed`, at the start of a pass; without
+                // this one it would wait for the next event.
+                ctx.request_repaint();
             }
             Stage::Counting { .. } => {
                 self.home_visible = false;
