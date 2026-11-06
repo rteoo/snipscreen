@@ -900,6 +900,45 @@ fn bar_hit(s: &BarState, x: i32, y: i32, width: i32, zoomed: bool, resizable: bo
     HTCLIENT
 }
 
+/// A maximised window with no caption covers its whole monitor, which Windows takes for full
+/// screen: an auto-hide taskbar on that monitor then never slides out. Leaving it a sliver on that
+/// edge keeps it working, as Windows Terminal does.
+fn leave_room_for_autohide_taskbars(hwnd: HWND, client: &mut RECT) {
+    use windows_sys::Win32::UI::Shell::{SHAppBarMessage, ABM_GETAUTOHIDEBAREX, ABM_GETSTATE, ABS_AUTOHIDE, APPBARDATA};
+    let mut data = APPBARDATA { cbSize: size_of::<APPBARDATA>() as u32, ..unsafe { zeroed() } };
+    // The setting is shared by every taskbar; off (the usual case), nothing more to ask.
+    if unsafe { SHAppBarMessage(ABM_GETSTATE, &mut data) } as u32 & ABS_AUTOHIDE == 0 {
+        return;
+    }
+    let mut mi: MONITORINFO = unsafe { zeroed() };
+    mi.cbSize = size_of::<MONITORINFO>() as u32;
+    if unsafe { GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mut mi) } == 0 {
+        return;
+    }
+    autohide_inset(client, |edge| {
+        let mut data = APPBARDATA { cbSize: size_of::<APPBARDATA>() as u32, uEdge: edge, rc: mi.rcMonitor, ..unsafe { zeroed() } };
+        unsafe { SHAppBarMessage(ABM_GETAUTOHIDEBAREX, &mut data) != 0 }
+    });
+}
+
+/// Pulls `client` in by `AUTOHIDE_SLIVER` on each edge (`ABE_*`) where `has_bar` finds an auto-hide taskbar.
+fn autohide_inset(client: &mut RECT, has_bar: impl Fn(u32) -> bool) {
+    use windows_sys::Win32::UI::Shell::{ABE_BOTTOM, ABE_LEFT, ABE_RIGHT, ABE_TOP};
+    const AUTOHIDE_SLIVER: i32 = 2;
+    if has_bar(ABE_TOP) {
+        client.top += AUTOHIDE_SLIVER;
+    }
+    if has_bar(ABE_BOTTOM) {
+        client.bottom -= AUTOHIDE_SLIVER;
+    }
+    if has_bar(ABE_LEFT) {
+        client.left += AUTOHIDE_SLIVER;
+    }
+    if has_bar(ABE_RIGHT) {
+        client.right -= AUTOHIDE_SLIVER;
+    }
+}
+
 /// Makes Windows ask for the frame again (`WM_NCCALCSIZE`) without moving, sizing or activating the window.
 fn reframe(hwnd: HWND) {
     unsafe { SetWindowPos(hwnd, null_mut(), 0, 0, 0, 0, SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOACTIVATE) };
@@ -945,8 +984,12 @@ unsafe extern "system" fn bar_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             let native_top = rect.top - top;
             let frame = bottom - rect.bottom;
             // Maximised, the window hangs over the monitor edges by its frame; keep the bar on screen.
-            let inset = if IsZoomed(hwnd) != 0 { frame } else { 0 };
+            let zoomed = IsZoomed(hwnd) != 0;
+            let inset = if zoomed { frame } else { 0 };
             rect.top = top + inset;
+            if zoomed {
+                leave_room_for_autohide_taskbars(hwnd, rect);
+            }
             if native_top > frame {
                 if let Ok(mut s) = state.try_lock() {
                     s.frame = frame;
@@ -1105,6 +1148,18 @@ mod tests {
         })
         .join()
         .unwrap();
+    }
+
+    #[test]
+    fn a_maximised_window_leaves_a_sliver_for_an_autohide_taskbar() {
+        use windows_sys::Win32::UI::Shell::{ABE_BOTTOM, ABE_LEFT};
+        let mut r = RECT { left: 0, top: 0, right: 1920, bottom: 1080 };
+        autohide_inset(&mut r, |_| false);
+        assert_eq!((r.left, r.top, r.right, r.bottom), (0, 0, 1920, 1080), "no auto-hide taskbar: the whole monitor");
+        autohide_inset(&mut r, |e| e == ABE_BOTTOM);
+        assert_eq!((r.left, r.top, r.right, r.bottom), (0, 0, 1920, 1078));
+        autohide_inset(&mut r, |e| e == ABE_LEFT);
+        assert_eq!(r.left, 2);
     }
 
     #[test]
