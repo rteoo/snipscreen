@@ -1179,7 +1179,8 @@ pub struct Doc {
     pub image_rev: u64,
     /// Bumped whenever `marks` change, for the same reason.
     pub ink_rev: u64,
-    /// Rendered text marks by identity, for the picture size `texts_size`. Each entry keeps its mark's
+    /// Rendered text marks by identity, for the picture size `texts_size`: only marks in `marks`, as
+    /// a text's tiles take megabytes and undo history can hold many. Each entry keeps its mark's
     /// allocation alive (`Weak`), so no other mark can take its address while the entry exists.
     texts: std::collections::HashMap<usize, (Weak<Mark>, TextRaster)>,
     texts_size: [usize; 2],
@@ -1266,14 +1267,19 @@ impl Doc {
         }
     }
 
-    /// Drops cached text rasters of marks no version of the list holds any more, and all of them when
-    /// the picture changed size (a raster's tiles are cut to the picture).
+    /// Drops cached text rasters of marks the list doesn't hold now (an undo that brings one back
+    /// renders it again), and all of them when the picture changed size (a raster's tiles are cut
+    /// to the picture).
     fn sync_text_cache(&mut self) {
         if self.texts_size != self.size() {
             self.texts.clear();
             self.texts_size = self.size();
         }
-        self.texts.retain(|_, (m, _)| m.strong_count() > 0);
+        if self.texts.is_empty() {
+            return;
+        }
+        let shown: std::collections::HashSet<usize> = self.marks.iter().filter(|m| matches!(***m, Mark::Text(_))).map(|m| Arc::as_ptr(m) as usize).collect();
+        self.texts.retain(|key, _| shown.contains(key));
     }
 
     fn cached_text(&self, m: &Arc<Mark>) -> Option<&TextRaster> {
@@ -2098,5 +2104,26 @@ mod tests {
         let tiles = d.changed_tiles(&d.marks[..1]);
         d.render_runs(&tiles);
         assert_eq!(d.texts.values().map(|(_, r)| r.tiles.len()).sum::<usize>(), 0, "nor on undo");
+    }
+
+    #[test]
+    fn rendered_text_is_kept_only_while_it_is_on_the_snip() {
+        let mut d = Doc::new(white(600, 300));
+        d.add_mark(text("Kept", Color32::RED, true));
+        let all = |d: &Doc| {
+            let mut t = Tiles::new(d.size());
+            t.add(Rect::from_min_size(Pos2::ZERO, eframe::egui::vec2(600.0, 300.0)));
+            t
+        };
+        let shown = d.render_runs(&all(&d));
+        assert_eq!(d.texts.len(), 1);
+        let before = d.marks.clone();
+        d.checkpoint();
+        assert!(d.erase_at(Pos2::new(60.0, 40.0), 30.0), "rubs the text out");
+        d.render_runs(&d.changed_tiles(&before));
+        assert!(d.texts.is_empty(), "undo history still holds it, the cache doesn't");
+        d.undo();
+        assert!(d.render_runs(&all(&d)) == shown, "undo renders it again, the same");
+        assert_eq!(d.texts.len(), 1);
     }
 }
