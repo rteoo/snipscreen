@@ -278,7 +278,7 @@ impl App {
             rec_tx,
             rec_rx,
             recent: notify::Recent::new(RECENT_SNIPS, RECENT_BYTES),
-            last_snip_id: 0,
+            last_snip_id: if shot_run { 0 } else { notify::recent_dir().map_or(0, |d| notify::newest_id(&d)) },
             snip_tx,
             snip_rx,
             workers: Vec::new(),

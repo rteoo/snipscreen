@@ -301,14 +301,25 @@ pub fn load_png(path: &Path) -> Result<ColorImage, String> {
     Ok(ColorImage::from_rgba_unmultiplied([w, h], &rgba))
 }
 
+/// The snip id in a `recent` file name (`<kind>-<id>.png`).
+fn file_id(name: &str) -> Option<u64> {
+    name.strip_suffix(".png").and_then(|s| s.rsplit_once('-')).and_then(|(_, id)| id.parse::<u64>().ok())
+}
+
+/// The highest snip id with a file in `recent`, 0 when there is none. New ids start above it, so the
+/// newest snip always has the highest id (pruning relies on that) even if the clock went back.
+pub fn newest_id(dir: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else { return 0 };
+    entries.filter_map(|e| file_id(e.ok()?.file_name().to_str()?)).max().unwrap_or(0)
+}
+
 /// File names in `recent` that belong to snips older than the newest `keep` (named `<kind>-<id>.png`).
 fn stale(names: &[String], keep: usize) -> Vec<String> {
-    let id = |n: &str| n.strip_suffix(".png").and_then(|s| s.rsplit_once('-')).and_then(|(_, id)| id.parse::<u64>().ok());
-    let mut ids: Vec<u64> = names.iter().filter_map(|n| id(n)).collect();
+    let mut ids: Vec<u64> = names.iter().filter_map(|n| file_id(n)).collect();
     ids.sort_unstable_by(|a, b| b.cmp(a));
     ids.dedup();
     let Some(&cutoff) = ids.get(keep) else { return Vec::new() };
-    names.iter().filter(|n| id(n).is_some_and(|i| i <= cutoff)).cloned().collect()
+    names.iter().filter(|n| file_id(n).is_some_and(|i| i <= cutoff)).cloned().collect()
 }
 
 /// Deletes previews and unsaved snips beyond the newest `RECENT_FILES`. Only names SnipScreen gives
@@ -444,5 +455,18 @@ mod tests {
         want.sort();
         assert_eq!(gone, want);
         assert!(stale(&names[..10], 20).is_empty());
+    }
+
+    #[test]
+    fn new_ids_start_above_the_newest_file() {
+        let dir = std::env::temp_dir().join(format!("snipscreen-ids-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in ["preview-1762400000000.png", "snip-1762400000123.png", "preview-1762400000123.png", "notes-x.png", "snip-9.txt"] {
+            std::fs::write(dir.join(name), b"").unwrap();
+        }
+        let newest = newest_id(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(newest, 1762400000123);
+        assert_eq!(newest_id(Path::new("Z:\\no\\such\\dir")), 0);
     }
 }
