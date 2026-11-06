@@ -626,23 +626,6 @@ impl Snip {
                             }
                         }
                     }
-                    if let Some(Mark::Text(t)) = drawing.as_ref() {
-                        let line = t.line_height() / k;
-                        let typed = to_pt(t.caret());
-                        // An input method's composition shows after the text, underlined, until it is committed.
-                        let end = if draft.preedit.is_empty() { typed } else { to_pt(with_preedit(t, &draft.preedit).caret()) };
-                        if end != typed {
-                            let under = vec2(0.0, line * 0.92);
-                            painter.line_segment([typed + under, end + under], (1.5, t.color));
-                        }
-                        let caret = [end, end + vec2(0.0, line)];
-                        painter.line_segment(caret, (3.0, t.halo_color()));
-                        painter.line_segment(caret, (1.5, t.color));
-                        // Turns the window's input method on and tells it where the text is.
-                        let rect = Rect::from_min_max(to_pt(t.pos), end + vec2(1.0, line));
-                        let cursor_rect = Rect::from_min_size(end, vec2(1.0, line));
-                        ctx.output_mut(|o| o.ime = Some(egui::output::IMEOutput { purpose: egui::IMEPurpose::Normal, rect, cursor_rect, should_interrupt_composition: false }));
-                    }
                 }
                 Tool::Eraser => {
                     let radius_pt = 10.0;
@@ -684,6 +667,25 @@ impl Snip {
                 Some(Mark::Text(t)) if !draft.preedit.is_empty() => canvas.show_live(&Mark::Text(with_preedit(t, &draft.preedit)), &visible),
                 Some(m) => canvas.show_live(m, &visible),
                 None => canvas.clear_live(),
+            }
+            if let Some(Mark::Text(t)) = drawing.as_ref() {
+                let line = t.line_height() / k;
+                // From the text's raster, laid out already, rather than laying out a long paste again.
+                let live = canvas.live.text.as_ref();
+                let typed = to_pt(live.map_or_else(|| t.caret(), |r| r.caret_at(t.text.len())));
+                // An input method's composition shows after the text, underlined, until it is committed.
+                let end = if draft.preedit.is_empty() { typed } else { to_pt(live.map_or_else(|| with_preedit(t, &draft.preedit).caret(), |r| r.caret())) };
+                if end != typed {
+                    let under = vec2(0.0, line * 0.92);
+                    painter.line_segment([typed + under, end + under], (1.5, t.color));
+                }
+                let caret = [end, end + vec2(0.0, line)];
+                painter.line_segment(caret, (3.0, t.halo_color()));
+                painter.line_segment(caret, (1.5, t.color));
+                // Turns the window's input method on and tells it where the text is.
+                let rect = Rect::from_min_max(to_pt(t.pos), end + vec2(1.0, line));
+                let cursor_rect = Rect::from_min_size(end, vec2(1.0, line));
+                ctx.output_mut(|o| o.ime = Some(egui::output::IMEOutput { purpose: egui::IMEPurpose::Normal, rect, cursor_rect, should_interrupt_composition: false }));
             }
         });
         zoom_badge(ui.painter(), view_rect, zoom);
@@ -3046,6 +3048,22 @@ Arc::ptr_eq(&snip.flattened(), &shown), "a current canvas is reused, not re-burn
         stats("type: catch-up frame after the slider", &catch_up);
         let commit = bench_frame(&ctx, &mut snip, vec![key(Key::Enter, Modifiers::NONE)]);
         stats("type: Enter places the 12-line block", &[commit]);
+
+        // A 100k-character paste (lines of 80), then typing after it.
+        let ctx = egui::Context::default();
+        let mut snip = Snip::new(gradient(3840, 2160), Tools { tool: Tool::Text, ..Tools::default() });
+        snip.zoom = Some(1.0);
+        bench_frame(&ctx, &mut snip, vec![]);
+        bench_frame(&ctx, &mut snip, vec![Event::PointerMoved(at), pointer(at, true)]);
+        bench_frame(&ctx, &mut snip, vec![pointer(at, false)]);
+        let line = format!("{}
+", "pasted log line 0123456789 ".repeat(3).chars().take(79).collect::<String>());
+        let paste = bench_frame(&ctx, &mut snip, vec![Event::Paste(line.repeat(100_000 / line.len()))]);
+        stats("paste: 100k characters", &[paste]);
+        let typed: Vec<f64> = "typing after it".chars().map(|ch| bench_frame(&ctx, &mut snip, vec![Event::Text(ch.to_string())])).collect();
+        stats("paste: keystroke after 100k characters", &typed);
+        let back: Vec<f64> = (0..5).map(|_| bench_frame(&ctx, &mut snip, vec![key(Key::Backspace, Modifiers::NONE)])).collect();
+        stats("paste: backspace after 100k characters", &back);
 
         // Highlighter drag across the whole snip at fit zoom.
         let ctx = egui::Context::default();
