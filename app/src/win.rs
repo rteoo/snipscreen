@@ -20,7 +20,7 @@ use windows_sys::Win32::Graphics::Gdi::{
     SRCCOPY,
 };
 use windows_sys::Win32::System::DataExchange::{
-    CloseClipboard, EmptyClipboard, OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
+    CloseClipboard, EmptyClipboard, GetClipboardSequenceNumber, OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
 };
 use windows_sys::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
 use windows_sys::Win32::System::Ole::CF_DIB;
@@ -274,45 +274,102 @@ pub fn copy_image(owner: HWND, img: &ColorImage) -> Result<(), String> {
 
 /// `copy_image` with the PNG already encoded, for a caller that also saves it.
 pub fn copy_image_with_png(owner: HWND, img: &ColorImage, png: &[u8]) -> Result<(), String> {
-    let [w, h] = img.size;
-    let mut dib = Vec::with_capacity(size_of::<BITMAPINFOHEADER>() + w * h * 4);
-    let header = bitmap_header(w as i32, h as i32);
-    dib.extend_from_slice(unsafe {
-        std::slice::from_raw_parts(
-            &header as *const _ as *const u8,
-            size_of::<BITMAPINFOHEADER>(),
-        )
-    });
-    // Bottom-up rows; transparent areas become white so they don't paste as black.
-    for row in img.pixels.chunks_exact(w).rev() {
-        for c in row {
-            let [r, g, b, a] = c.to_srgba_unmultiplied();
-            let mix = |v: u8| ((v as u32 * a as u32 + 255 * (255 - a as u32)) / 255) as u8;
-            dib.extend_from_slice(&[mix(b), mix(g), mix(r), 255]);
-        }
-    }
     unsafe {
-        let mut opened = false;
-        for _ in 0..10 {
-            if OpenClipboard(owner) != 0 {
-                opened = true;
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(15));
-        }
-        if !opened {
-            return Err("the clipboard is busy".into());
-        }
+        open_clipboard(owner)?;
         EmptyClipboard();
-        let png_format = RegisterClipboardFormatW(wide("PNG").as_ptr());
-        let result = set_clipboard(CF_DIB as u32, &dib).and_then(|_| set_clipboard(png_format, png));
+        let result = set_dib(img).and_then(|_| set_clipboard(png_format(), png));
         CloseClipboard();
         result
     }
 }
 
+/// The first half of a copy that can't wait for the PNG: the picture goes on the clipboard as a
+/// bitmap only, which every app pastes. Returns the clipboard's sequence number for `add_png`.
+pub fn copy_bitmap(owner: HWND, img: &ColorImage) -> Result<u32, String> {
+    unsafe {
+        open_clipboard(owner)?;
+        EmptyClipboard();
+        let result = set_dib(img);
+        CloseClipboard();
+        // Windows counts the change when the clipboard is closed.
+        result.map(|_| GetClipboardSequenceNumber())
+    }
+}
+
+/// The second half: adds the PNG (which keeps transparency) to the bitmap `copy_bitmap` put on the
+/// clipboard. Leaves the clipboard alone, and is done, when something else was copied since: the
+/// sequence number moved on, or (should another copy have slipped in just before `copy_bitmap` read
+/// it) the clipboard has another owner.
+pub fn add_png(owner: HWND, seq: u32, png: &[u8]) -> Result<(), String> {
+    use windows_sys::Win32::System::DataExchange::GetClipboardOwner;
+    let ours = || unsafe { GetClipboardSequenceNumber() == seq && GetClipboardOwner() == owner };
+    unsafe {
+        if !ours() {
+            return Ok(());
+        }
+        open_clipboard(owner)?;
+        // Checked again with the clipboard held, so nothing can be copied in between.
+        let result = if ours() { set_clipboard(png_format(), png) } else { Ok(()) };
+        CloseClipboard();
+        result
+    }
+}
+
+/// Puts the picture on the open clipboard as a bottom-up 32-bit DIB, converted straight into the
+/// clipboard's memory (no second 33 MB copy for a 4K snip).
+unsafe fn set_dib(img: &ColorImage) -> Result<(), String> {
+    let [w, h] = img.size;
+    set_clipboard_with(CF_DIB as u32, size_of::<BITMAPINFOHEADER>() + w * h * 4, |out| write_dib(img, out))
+}
+
+/// `img` as a DIB into `out` (header, then bottom-up rows); transparent areas become white so they
+/// don't paste as black.
+fn write_dib(img: &ColorImage, out: &mut [u8]) {
+    let [w, h] = img.size;
+    let header = bitmap_header(w as i32, h as i32);
+    let (head, rows) = out.split_at_mut(size_of::<BITMAPINFOHEADER>());
+    head.copy_from_slice(unsafe { std::slice::from_raw_parts(&header as *const _ as *const u8, size_of::<BITMAPINFOHEADER>()) });
+    if w == 0 {
+        return;
+    }
+    for (src, dst) in img.pixels.chunks_exact(w).rev().zip(rows.chunks_exact_mut(w * 4)) {
+        for (c, d) in src.iter().zip(dst.chunks_exact_mut(4)) {
+            let [r, g, b, a] = c.to_array();
+            // Opaque (nearly every pixel of a snip): premultiplied is the colour itself.
+            let px = if a == 255 {
+                [b, g, r, 255]
+            } else {
+                let [r, g, b, a] = c.to_srgba_unmultiplied();
+                let mix = |v: u8| ((v as u32 * a as u32 + 255 * (255 - a as u32)) / 255) as u8;
+                [mix(b), mix(g), mix(r), 255]
+            };
+            d.copy_from_slice(&px);
+        }
+    }
+}
+
+fn png_format() -> u32 {
+    unsafe { RegisterClipboardFormatW(wide("PNG").as_ptr()) }
+}
+
+/// Opens the clipboard for `owner`, retrying for a moment while another program has it open.
+unsafe fn open_clipboard(owner: HWND) -> Result<(), String> {
+    for _ in 0..10 {
+        if OpenClipboard(owner) != 0 {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(15));
+    }
+    Err("the clipboard is busy".into())
+}
+
 unsafe fn set_clipboard(format: u32, bytes: &[u8]) -> Result<(), String> {
-    let mem = GlobalAlloc(GMEM_MOVEABLE, bytes.len());
+    set_clipboard_with(format, bytes.len(), |dst| dst.copy_from_slice(bytes))
+}
+
+/// Puts `len` bytes, written by `fill`, on the open clipboard as `format`.
+unsafe fn set_clipboard_with(format: u32, len: usize, fill: impl FnOnce(&mut [u8])) -> Result<(), String> {
+    let mem = GlobalAlloc(GMEM_MOVEABLE, len);
     if mem.is_null() {
         return Err("out of memory for the clipboard".into());
     }
@@ -321,7 +378,7 @@ unsafe fn set_clipboard(format: u32, bytes: &[u8]) -> Result<(), String> {
         GlobalFree(mem);
         return Err("couldn't lock clipboard memory".into());
     }
-    std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len());
+    fill(std::slice::from_raw_parts_mut(dst, len));
     GlobalUnlock(mem);
     if SetClipboardData(format, mem).is_null() {
         GlobalFree(mem);
@@ -980,6 +1037,18 @@ mod tests {
     #[test]
     fn unlockable_clipboard_memory_is_an_error() {
         assert_eq!(unsafe { set_clipboard(CF_DIB as u32, &[]) }, Err("couldn't lock clipboard memory".to_string()));
+    }
+
+    #[test]
+    fn clipboard_bitmap_is_bottom_up_bgr_with_transparency_on_white() {
+        let img = ColorImage::new([2, 2], vec![Color32::from_rgb(1, 2, 3), Color32::TRANSPARENT, Color32::from_rgba_unmultiplied(200, 100, 0, 128), Color32::from_rgb(9, 8, 7)]);
+        let head = size_of::<BITMAPINFOHEADER>();
+        let mut out = vec![0; head + 16];
+        write_dib(&img, &mut out);
+        let [r, g, b, a] = img.pixels[2].to_srgba_unmultiplied();
+        let mix = |v: u8| ((v as u32 * a as u32 + 255 * (255 - a as u32)) / 255) as u8;
+        assert_eq!(&out[head..], &[mix(b), mix(g), mix(r), 255, 7, 8, 9, 255, 3, 2, 1, 255, 255, 255, 255, 255], "bottom row first");
+        assert_eq!(&out[..4], &(head as u32).to_le_bytes());
     }
 
     #[test]

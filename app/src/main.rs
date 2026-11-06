@@ -1866,9 +1866,10 @@ fn next_snip_id(last: u64, now: std::time::SystemTime) -> u64 {
     ms.max(last + 1)
 }
 
-/// The worker behind `App::notify_snip`. The notification goes up as soon as the preview is made,
-/// worded for copy and save going as asked; the PNG is encoded, copied and written alongside, and
-/// a notification that turns out wrong is replaced with one that says what failed. A click before
+/// The worker behind `App::notify_snip`. The notification goes up as soon as the preview is made
+/// and the picture is on the clipboard (as a bitmap, which needs no PNG), worded for save going as
+/// asked; the PNG is encoded, added to the clipboard and written alongside, and a notification that
+/// turns out wrong is replaced with one that says what failed. A click before
 /// the file is written opens the snip from memory. A snip that isn't auto-saved is kept in
 /// `recent`, so a click from the notification centre can still open it after a restart.
 fn deliver_by_notification(id: u64, image: &ColorImage, hwnd: isize, copy: bool, save_to: Option<Result<PathBuf, String>>, report: impl Fn(SnipEvent) + Clone + Send + 'static) {
@@ -1898,24 +1899,27 @@ fn deliver_by_notification(id: u64, image: &ColorImage, hwnd: isize, copy: bool,
         }
     };
     let preview_path = recent.as_ref().map(|d| d.join(format!("preview-{id}.png")));
+    let (copied_tx, copied_rx) = channel();
     let (shown, files) = std::thread::scope(|s| {
-        let files = s.spawn(|| write_snip(image, hwnd, copy, reserved, kept.as_deref()));
+        let files = s.spawn(|| write_snip(image, hwnd, copy, reserved, kept.as_deref(), move |c| drop(copied_tx.send(c))));
         let shown = match &file {
             None => Err("couldn't find your local AppData folder".to_string()),
             Some(file) => {
                 let preview = preview_path.and_then(|p| win::save_png(&p, &notify::preview_of(image)).ok().map(|_| p));
-                let (title, lines) = toast_text(&copy.then_some(Ok(())), &planned, None);
+                // The title says "copied" only once it is so. A worker that died first counts as the copy failing.
+                let copied = if copy { copied_rx.recv().unwrap_or_else(|_| Some(Err("something went wrong".into()))) } else { None };
+                let (title, lines) = toast_text(&copied, &planned, None, None);
                 notify::Toast { title, lines, image: preview, launch: notify::open_link(id, file), tag: id.to_string() }.show(gone.clone()).map(|t| (t, file.clone()))
             }
         };
         // A panic while encoding or writing counts as each job failing.
         let files = files.join().unwrap_or_else(|_| {
             let failed = "something went wrong".to_string();
-            Written { copied: copy.then(|| Err(failed.clone())), saved: planned.as_ref().map(|_| Err(failed.clone())), kept: kept.as_ref().map(|_| Err(failed.clone())) }
+            Written { copied: copy.then(|| Err(failed.clone())), png: None, saved: planned.as_ref().map(|_| Err(failed.clone())), kept: kept.as_ref().map(|_| Err(failed.clone())) }
         });
         (shown, files)
     });
-    let Written { copied, saved, kept } = files;
+    let Written { copied, png, saved, kept } = files;
     written.store(true, std::sync::atomic::Ordering::SeqCst);
     if dismissed.load(std::sync::atomic::Ordering::SeqCst) {
         report(SnipEvent::Gone(id));
@@ -1924,10 +1928,12 @@ fn deliver_by_notification(id: u64, image: &ColorImage, hwnd: isize, copy: bool,
         Err(e) => report(SnipEvent::NotShown { id, msg: not_shown(&e, copied, saved) }),
         Ok((toast, file)) => {
             report(SnipEvent::Shown { id, toast });
-            let went_wrong = matches!(copied, Some(Err(_))) || matches!((&planned, &saved), (Some(Ok(_)), Some(Err(_)))) || matches!(kept, Some(Err(_)));
+            // A failed copy was already told: the first notification waited for it.
+            let went_wrong = matches!(png, Some(Err(_))) || matches!((&planned, &saved), (Some(Ok(_)), Some(Err(_)))) || matches!(kept, Some(Err(_)));
             if went_wrong {
                 let kept_err = kept.as_ref().and_then(|r| r.as_ref().err()).map(String::as_str);
-                let (title, lines) = toast_text(&copied, &saved, kept_err);
+                let png_err = png.as_ref().and_then(|r| r.as_ref().err()).map(String::as_str);
+                let (title, lines) = toast_text(&copied, &saved, kept_err, png_err);
                 // The preview file is there by now; its picture stays.
                 let image = recent.as_ref().map(|d| d.join(format!("preview-{id}.png"))).filter(|p| p.exists());
                 match (notify::Toast { title, lines, image, launch: notify::open_link(id, &file), tag: id.to_string() }).show(gone) {
@@ -1960,21 +1966,31 @@ fn copy_and_save(hwnd: isize, image: &ColorImage, copy: bool, save_to: Option<Re
 
 /// What `write_snip` did; `None` for a job that wasn't asked for.
 struct Written {
+    /// The bitmap on the clipboard.
     copied: Option<Result<(), String>>,
+    /// The PNG added to it; `None` when there was no bitmap to add it to.
+    png: Option<Result<(), String>>,
     /// Into the reserved file in Pictures\Screenshots.
     saved: Option<Result<PathBuf, String>>,
     /// Into `recent`, for a snip that wasn't auto-saved.
     kept: Option<Result<(), String>>,
 }
 
-/// The snip as PNG, encoded once, then copied and written into the files given.
-fn write_snip(image: &ColorImage, hwnd: isize, copy: bool, reserved: Option<Result<(PathBuf, std::fs::File), String>>, kept: Option<&std::path::Path>) -> Written {
+/// Copies the snip as a bitmap first and tells `on_copied` how that went (`None`: no copy asked
+/// for), then encodes the PNG once, adds it to the clipboard and writes it into the files given.
+fn write_snip(image: &ColorImage, hwnd: isize, copy: bool, reserved: Option<Result<(PathBuf, std::fs::File), String>>, kept: Option<&std::path::Path>, on_copied: impl FnOnce(Option<Result<(), String>>)) -> Written {
+    let bitmap = copy.then(|| win::copy_bitmap(hwnd as HWND, image));
+    let copied = bitmap.as_ref().map(|r| r.as_ref().map(|_| ()).map_err(Clone::clone));
+    on_copied(copied.clone());
     let png = win::encode_png(image);
     let bytes = || png.as_ref().map_err(|e| format!("couldn't encode the snip: {e}"));
-    let copied = copy.then(|| bytes().and_then(|p| win::copy_image_with_png(hwnd as HWND, image, p)));
+    let png_added = match bitmap {
+        Some(Ok(seq)) => Some(bytes().and_then(|p| win::add_png(hwnd as HWND, seq, p))),
+        _ => None,
+    };
     let saved = reserved.map(|r| r.and_then(|(path, file)| fill(path, file, bytes())));
     let kept = kept.map(|path| bytes().and_then(|p| std::fs::write(path, p).map_err(|e| format!("{}: {e}", path.display()))));
-    Written { copied, saved, kept }
+    Written { copied, png: png_added, saved, kept }
 }
 
 /// Writes `bytes` into the new, empty `file` at `path`; on failure the empty file goes again.
@@ -2003,7 +2019,7 @@ fn not_shown(why: &str, copied: Option<Result<(), String>>, saved: Option<Result
 
 /// A new snip's notification text: the title says what happened to it (copied, saved, or neither),
 /// the first line where it was saved and what failed, the last what a click does.
-fn toast_text(copied: &Option<Result<(), String>>, saved: &Option<Result<PathBuf, String>>, kept: Option<&str>) -> (String, Vec<String>) {
+fn toast_text(copied: &Option<Result<(), String>>, saved: &Option<Result<PathBuf, String>>, kept: Option<&str>, png: Option<&str>) -> (String, Vec<String>) {
     let title = match (copied, saved) {
         (Some(Ok(())), _) => "Snip copied to clipboard",
         (_, Some(Ok(_))) => "Snip saved",
@@ -2015,6 +2031,9 @@ fn toast_text(copied: &Option<Result<(), String>>, saved: &Option<Result<PathBuf
     }
     if let Some(Err(e)) = copied {
         status.push(format!("Couldn't copy: {e}"));
+    }
+    if let Some(e) = png {
+        status.push(format!("Copied as a bitmap only: {e}"));
     }
     if let Some(Err(e)) = saved {
         status.push(format!("Couldn't auto-save: {e}"));
@@ -2259,20 +2278,25 @@ mod tests {
         let saved = || Some(Ok(PathBuf::from(r"C:\Users\a\Pictures\Screenshots\Snip 2026-11-05 141530.png")));
         let hint = "Select to mark it up".to_string();
         let as_saved = "Saved to Pictures\\Screenshots as Snip 2026-11-05 141530.png".to_string();
-        assert_eq!(toast_text(&ok(), &saved(), None), ("Snip copied to clipboard".into(), vec![as_saved.clone(), hint.clone()]));
-        assert_eq!(toast_text(&ok(), &None, None), ("Snip copied to clipboard".into(), vec![hint.clone()]));
-        assert_eq!(toast_text(&None, &saved(), None), ("Snip saved".into(), vec![as_saved.clone(), hint.clone()]));
-        assert_eq!(toast_text(&None, &None, None), ("Snip taken".into(), vec![hint.clone()]));
-        assert_eq!(toast_text(&Some(Err("busy".into())), &saved(), None), ("Snip saved".into(), vec![format!("{as_saved} · Couldn't copy: busy"), hint.clone()]));
+        assert_eq!(toast_text(&ok(), &saved(), None, None), ("Snip copied to clipboard".into(), vec![as_saved.clone(), hint.clone()]));
+        assert_eq!(toast_text(&ok(), &None, None, None), ("Snip copied to clipboard".into(), vec![hint.clone()]));
+        assert_eq!(toast_text(&None, &saved(), None, None), ("Snip saved".into(), vec![as_saved.clone(), hint.clone()]));
+        assert_eq!(toast_text(&None, &None, None, None), ("Snip taken".into(), vec![hint.clone()]));
+        assert_eq!(toast_text(&Some(Err("busy".into())), &saved(), None, None), ("Snip saved".into(), vec![format!("{as_saved} · Couldn't copy: busy"), hint.clone()]));
         assert_eq!(
-            toast_text(&ok(), &Some(Err("disk full".into())), None),
+            toast_text(&ok(), &Some(Err("disk full".into())), None, None),
             ("Snip copied to clipboard".into(), vec!["Couldn't auto-save: disk full".into(), hint.clone()])
         );
-        assert_eq!(toast_text(&Some(Err("busy".into())), &Some(Err("disk full".into())), None).0, "Snip taken");
+        assert_eq!(toast_text(&Some(Err("busy".into())), &Some(Err("disk full".into())), None, None).0, "Snip taken");
         assert_eq!(
-            toast_text(&ok(), &None, Some("access denied")),
+            toast_text(&ok(), &None, Some("access denied"), None),
             ("Snip copied to clipboard".into(), vec!["Couldn't keep it for later: access denied".into(), hint.clone()]),
             "an unsaved snip that couldn't be kept is reported"
+        );
+        assert_eq!(
+            toast_text(&ok(), &None, None, Some("the clipboard is busy")),
+            ("Snip copied to clipboard".into(), vec!["Copied as a bitmap only: the clipboard is busy".into(), hint.clone()]),
+            "a copy that lost its PNG says so"
         );
     }
 
@@ -2306,12 +2330,14 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("snipscreen-deliver-{}", std::process::id()));
         let img = ColorImage::new([4, 3], vec![Color32::from_rgb(1, 2, 3); 12]);
         let reserved = win::create_unique(&dir.join("Snip.png"));
-        let Written { copied, saved, kept } = write_snip(&img, 0, false, Some(reserved), Some(&dir.join("snip-1.png")));
+        let mut told = None;
+        let Written { copied, png, saved, kept } = write_snip(&img, 0, false, Some(reserved), Some(&dir.join("snip-1.png")), |c| told = Some(c));
         let on_disk = saved.as_ref().and_then(|r| r.as_ref().ok()).and_then(|p| std::fs::read(p).ok());
         let also = std::fs::read(dir.join("snip-1.png")).ok();
-        let failed = write_snip(&img, 0, false, Some(Err("couldn't find your Pictures folder".into())), Some(&dir.join("no-such-dir").join("x.png")));
+        let failed = write_snip(&img, 0, false, Some(Err("couldn't find your Pictures folder".into())), Some(&dir.join("no-such-dir").join("x.png")), |_| {});
         let _ = std::fs::remove_dir_all(&dir);
-        assert!(copied.is_none(), "copy wasn't asked for");
+        assert!(copied.is_none() && png.is_none(), "copy wasn't asked for");
+        assert_eq!(told, Some(None), "the copy's outcome is told before the PNG is encoded");
         assert_eq!(on_disk, win::encode_png(&img).ok(), "the saved file is the encoded PNG");
         assert_eq!((kept, also), (Some(Ok(())), on_disk));
         assert_eq!(failed.saved, Some(Err("couldn't find your Pictures folder".into())));
@@ -2455,6 +2481,61 @@ mod tests {
     #[test]
     fn bar_drops_inside_the_top_edge_when_there_is_no_room_above() {
         assert_eq!(bar_position([500, 20, 400, 300], WORK, 300, 60), (550, 32));
+    }
+
+    /// Grab to clipboard-ready on a 4K snip, the old way (PNG encoded first, then one clipboard
+    /// write) and the new (bitmap first, PNG added after), and how long the toast's preview takes,
+    /// which runs alongside. Overwrites the clipboard. Run in release:
+    /// `cargo test --release perf_snip_clipboard -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "timing report that writes the clipboard"]
+    fn perf_snip_clipboard() {
+        let ms = |t: Instant| t.elapsed().as_secs_f64() * 1000.0;
+        let (w, h) = (3840, 2160);
+        let img = ColorImage::new([w, h], (0..w * h).map(|i| Color32::from_rgb((i % w * 255 / w) as u8, (i / w * 255 / h) as u8, (i % 97) as u8)).collect());
+        let (mut old, mut new_copy, mut new_png, mut preview) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for _ in 0..5 {
+            let t = Instant::now();
+            let png = win::encode_png(&img).unwrap();
+            win::copy_image_with_png(std::ptr::null_mut(), &img, &png).unwrap();
+            old.push(ms(t));
+            let t = Instant::now();
+            let seq = win::copy_bitmap(std::ptr::null_mut(), &img).unwrap();
+            new_copy.push(ms(t));
+            let png = win::encode_png(&img).unwrap();
+            win::add_png(std::ptr::null_mut(), seq, &png).unwrap();
+            new_png.push(ms(t));
+            let t = Instant::now();
+            std::hint::black_box(win::encode_png(&notify::preview_of(&img)).unwrap());
+            preview.push(ms(t));
+        }
+        let median = |v: &mut Vec<f64>| {
+            v.sort_by(f64::total_cmp);
+            v[v.len() / 2]
+        };
+        println!("old: clipboard ready (PNG encoded first)  median {:>7.2} ms", median(&mut old));
+        println!("new: clipboard ready (bitmap)             median {:>7.2} ms", median(&mut new_copy));
+        println!("new: PNG added too                        median {:>7.2} ms", median(&mut new_png));
+        println!("toast preview made (runs alongside)       median {:>7.2} ms", median(&mut preview));
+    }
+
+    #[test]
+    #[ignore = "writes the clipboard"]
+    fn a_bitmap_copy_gets_its_png_unless_something_else_was_copied() {
+        use windows_sys::Win32::System::DataExchange::{IsClipboardFormatAvailable, RegisterClipboardFormatW};
+        let png_format = unsafe { RegisterClipboardFormatW("PNG\0".encode_utf16().collect::<Vec<u16>>().as_ptr()) };
+        let has = |f: u32| unsafe { IsClipboardFormatAvailable(f) } != 0;
+        let img = ColorImage::new([2, 2], vec![Color32::from_rgb(9, 8, 7); 4]);
+        let png = win::encode_png(&img).unwrap();
+        let seq = win::copy_bitmap(std::ptr::null_mut(), &img).unwrap();
+        assert!(has(windows_sys::Win32::System::Ole::CF_DIB as u32) && !has(png_format), "the bitmap goes first, alone");
+        win::add_png(std::ptr::null_mut(), seq, &png).unwrap();
+        assert!(has(png_format), "then the PNG joins it");
+        // Something else copied in between: its clipboard is left as it is.
+        let seq = win::copy_bitmap(std::ptr::null_mut(), &img).unwrap();
+        win::copy_bitmap(std::ptr::null_mut(), &img).unwrap();
+        win::add_png(std::ptr::null_mut(), seq, &png).unwrap();
+        assert!(!has(png_format));
     }
 
     #[test]
