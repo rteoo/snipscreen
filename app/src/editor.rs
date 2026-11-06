@@ -362,6 +362,21 @@ impl Snip {
         self.crop_drag = None;
     }
 
+    /// Whether Undo has something to take back: the text being typed (undoing past its start drops
+    /// it), or the snip's own history.
+    fn can_undo(&self) -> bool {
+        self.typing() || self.doc.can_undo()
+    }
+
+    /// Whether Redo has something to bring back, from the same history `step` would use.
+    fn can_redo(&self) -> bool {
+        if self.typing() {
+            !self.draft.redo.is_empty()
+        } else {
+            self.doc.can_redo()
+        }
+    }
+
     fn markup_width(&self) -> f32 {
         let buttons = if self.crop.is_some() { 10.0 } else { 8.0 };
         let dividers = 2.0;
@@ -411,10 +426,10 @@ impl Snip {
             }
         }
         divider(ui);
-        if icon_button(ui, Icon::Undo, None, false, self.doc.can_undo(), "Undo (Ctrl+Z)").clicked() {
+        if icon_button(ui, Icon::Undo, None, false, self.can_undo(), "Undo (Ctrl+Z)").clicked() {
             self.step(false);
         }
-        if icon_button(ui, Icon::Redo, None, false, self.doc.can_redo(), "Redo (Ctrl+Y)").clicked() {
+        if icon_button(ui, Icon::Redo, None, false, self.can_redo(), "Redo (Ctrl+Y)").clicked() {
             self.step(true);
         }
     }
@@ -2609,6 +2624,25 @@ Arc::ptr_eq(&snip.flattened(), &shown), "a current canvas is reused, not re-burn
         shortcut(&ctx, &mut ed, Key::Z, Modifiers::COMMAND);
         assert_eq!(draft_text(&mut ed), None, "Ctrl+Z on the empty draft cancels it");
         assert!(snip_of(&mut ed).doc.marks.is_empty(), "and never touched the snip's own history");
+    }
+
+    #[test]
+    fn undo_and_redo_buttons_follow_the_text_being_typed() {
+        let (ctx, mut ed, _) = typing("one two");
+        let buttons = |ed: &mut Editor| {
+            let s = snip_of(ed);
+            (s.can_undo(), s.can_redo())
+        };
+        assert!(!snip_of(&mut ed).doc.can_undo(), "the snip itself has nothing to undo yet");
+        assert_eq!(buttons(&mut ed), (true, false), "undo takes back typing; nothing to redo");
+        shortcut(&ctx, &mut ed, Key::Z, Modifiers::COMMAND);
+        assert_eq!(buttons(&mut ed), (true, true));
+        shortcut(&ctx, &mut ed, Key::Y, Modifiers::COMMAND);
+        assert_eq!(buttons(&mut ed), (true, false));
+        // A placed mark redone by the snip's history doesn't light Redo while new text is typed.
+        snip_of(&mut ed).finish_text();
+        snip_of(&mut ed).step(false);
+        assert_eq!(buttons(&mut ed), (false, true), "back on the snip's own history");
     }
 
     #[test]
