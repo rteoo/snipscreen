@@ -5,6 +5,7 @@
 //! editors, and idle editors cost nothing. The shell owns the `Editors` list; an editor reports
 //! back through two flags (`new_requested`, `closed`) that the shell collects in `Editors::poll`.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -16,7 +17,7 @@ use eframe::egui::{
 use windows_sys::Win32::Foundation::HWND;
 
 use crate::icons::{self, Icon};
-use crate::markup::{self, Doc, Ink, Mark, Shape, ShapeKind, Stroke, Text, Tiles};
+use crate::markup::{self, Doc, Ink, Mark, Shape, ShapeKind, Stroke, Text, TextRaster, Tiles};
 use crate::widgets::{
     self, dim_outside, divider, escape_for_app, icon_button, Note, Notifier, PopupClickGuard, ACCENT, BTN, BUTTON_HOVER, DIVIDER_W, GAP, GROUP_GAP, ICON,
     ICON_OFF, MIN_WINDOW_H, MIN_WINDOW_W, TOOLBAR_BG,
@@ -1102,13 +1103,18 @@ struct Live {
     tiles: Tiles,
     /// Points of the stroke already painted into `tiles`.
     done: usize,
-    /// Any other mark, as last painted.
+    /// A shape, as last painted.
     last: Option<Mark>,
+    /// Text being typed, as last painted, with the tiles of it rendered so far.
+    text: Option<TextRaster>,
+    /// The pixels the texture shows in each live tile (by tile index), so a commit burns them into
+    /// `shown` as they are instead of painting the mark again.
+    patches: HashMap<usize, Vec<Color32>>,
 }
 
 impl Live {
     fn new(size: [usize; 2]) -> Self {
-        Self { tiles: Tiles::new(size), done: 0, last: None }
+        Self { tiles: Tiles::new(size), done: 0, last: None, text: None, patches: HashMap::new() }
     }
 }
 
@@ -1124,7 +1130,7 @@ impl CanvasTex {
     /// Brings the picture and texture up to date with `doc`. When only marks changed (an erase, an
     /// undo of a mark) just the tiles those marks cover are redrawn and uploaded; a new picture
     /// (crop, or undoing one) is flattened and uploaded whole.
-    fn sync(&mut self, doc: &Doc) {
+    fn sync(&mut self, doc: &mut Doc) {
         let rev = (doc.image_rev, doc.ink_rev);
         if self.rev == rev {
             return;
@@ -1146,29 +1152,71 @@ impl CanvasTex {
         self.live = Live::new(self.shown.size);
     }
 
-    /// Uploads the runs of `tiles` with `m` painted over the committed picture, or plain when `m` is `None`.
-    fn upload(&mut self, tiles: &Tiles, m: Option<&Mark>) {
-        let raster = m.map(|m| m.raster(self.shown.size));
+    /// Uploads the runs of `tiles` with `raster` painted over the committed picture, or plain when
+    /// it is `None`, and remembers what each live tile now shows.
+    fn upload(&mut self, tiles: &Tiles, mut raster: Option<&mut markup::Raster>) {
+        let cols = self.shown.size[0].div_ceil(markup::TILE);
         for r in tiles.runs() {
             let mut patch = markup::sub_image(&self.shown, r.x0, r.y0, r.x1 - r.x0, r.y1 - r.y0);
-            if let Some(raster) = &raster {
+            let first = (r.y0 / markup::TILE) * cols + r.x0 / markup::TILE;
+            if let Some(raster) = raster.as_deref_mut() {
                 raster.paint(&mut patch, r.pos());
+                for (i, x) in (r.x0..r.x1).step_by(markup::TILE).enumerate() {
+                    let w = markup::TILE.min(r.x1 - x);
+                    let mut pixels = Vec::with_capacity(w * patch.size[1]);
+                    for row in patch.pixels.chunks(patch.size[0]) {
+                        pixels.extend_from_slice(&row[x - r.x0..x - r.x0 + w]);
+                    }
+                    self.live.patches.insert(first + i, pixels);
+                }
+            } else {
+                for i in 0..(r.x1 - r.x0).div_ceil(markup::TILE) {
+                    self.live.patches.remove(&(first + i));
+                }
             }
             self.tex.set_partial(r.pos(), patch, TextureOptions::LINEAR);
         }
     }
 
     /// Adds a finished mark, burning just that mark into the picture and texture rather than
-    /// re-flattening the whole snip.
+    /// re-flattening the whole snip. Tiles the texture already shows with the mark (it was drawn
+    /// live) are copied into the picture as shown, neither painted again nor uploaded.
     fn commit(&mut self, doc: &mut Doc, m: Mark) {
         let current = self.rev == (doc.image_rev, doc.ink_rev);
+        let size = doc.size();
+        let live_text = self.live.text.take().filter(|r| matches!(&m, Mark::Text(t) if r.text() == t));
+        // The live tiles that show `m` exactly as it will be burned.
+        let as_shown = match &m {
+            _ if !current => Tiles::new(size),
+            Mark::Text(_) if live_text.is_some() => self.live.tiles.clone(),
+            Mark::Stroke(s) if self.live.last.is_none() && self.live.done > 0 && self.live.done <= s.points.len() => {
+                // Points added since the last frame still have to be painted.
+                let mut newer = Tiles::new(size);
+                s.footprint_from(self.live.done, &mut newer);
+                self.live.tiles.minus(&newer)
+            }
+            Mark::Shape(_) if self.live.last.as_ref() == Some(&m) => self.live.tiles.clone(),
+            _ => Tiles::new(size),
+        };
+        let mut raster = match live_text {
+            Some(text) => markup::Raster::of_text(&m, text),
+            None => m.raster(size),
+        };
         if current {
-            let mut tiles = Tiles::new(doc.size());
+            let mut tiles = Tiles::new(size);
             m.footprint(&mut tiles);
             let shown = Arc::make_mut(&mut self.shown);
-            let raster = m.raster(doc.size());
-
-            for r in tiles.runs() {
+            let cols = size[0].div_ceil(markup::TILE);
+            let mut reused = tiles.intersect(&as_shown);
+            reused.retain(|idx| self.live.patches.contains_key(&idx));
+            for idx in reused.indices() {
+                if let Some(pixels) = self.live.patches.get(&idx) {
+                    let at = [(idx % cols) * markup::TILE, (idx / cols) * markup::TILE];
+                    let w = markup::TILE.min(size[0] - at[0]);
+                    markup::paste(shown, &ColorImage::new([w, pixels.len() / w], pixels.clone()), at);
+                }
+            }
+            for r in tiles.minus(&reused).runs() {
                 let mut patch = markup::sub_image(shown, r.x0, r.y0, r.x1 - r.x0, r.y1 - r.y0);
                 raster.paint(&mut patch, r.pos());
                 markup::paste(shown, &patch, r.pos());
@@ -1178,7 +1226,10 @@ impl CanvasTex {
             let stale = self.live.tiles.minus(&tiles);
             self.upload(&stale, None);
         }
-        doc.add_mark(m);
+        match raster.into_text() {
+            Some(text) => doc.add_text(text),
+            None => doc.add_mark(m),
+        }
         if current {
             self.rev.1 = doc.ink_rev;
             self.burned = doc.marks.clone();
@@ -1187,11 +1238,14 @@ impl CanvasTex {
     }
 
     /// Shows `m`, the mark being drawn. A stroke only grows, so only the tiles its newest segments
-    /// reach are repainted; any other mark is repainted where it is now, and the tiles it has left
-    /// go back to the picture. Nothing is redone while the mark stays the same.
+    /// reach are repainted; text is repainted where its changed letters are; a shape is repainted
+    /// where it is now; and the tiles a mark has left go back to the picture. Nothing is redone while
+    /// the mark stays the same.
     fn show_live(&mut self, m: &Mark) {
-        let mut fresh = Tiles::new(self.shown.size);
-        match m {
+        let size = self.shown.size;
+        let mut fresh = Tiles::new(size);
+        let mut covered = Tiles::new(size);
+        let mut raster = match m {
             Mark::Stroke(s) => {
                 if s.points.len() < self.live.done {
                     self.clear_live();
@@ -1202,28 +1256,45 @@ impl CanvasTex {
                 s.footprint_from(self.live.done, &mut fresh);
                 self.live.done = s.points.len();
                 self.live.tiles.union(&fresh);
+                let mut raster = m.raster(size);
+                self.upload(&fresh, Some(&mut raster));
+                return;
             }
-            _ => {
+            Mark::Text(t) => {
+                let text = match self.live.text.take() {
+                    Some(text) if text.text() == t => {
+                        self.live.text = Some(text);
+                        return;
+                    }
+                    // Typing changes a letter at a time: only the changed letters' tiles are repainted.
+                    Some(mut text) => {
+                        text.retext(t, &mut fresh);
+                        text
+                    }
+                    None => {
+                        let text = TextRaster::new(t, size);
+                        fresh.add(text.bounds());
+                        text
+                    }
+                };
+                covered.add(text.bounds());
+                markup::Raster::of_text(m, text)
+            }
+            Mark::Shape(_) => {
                 if self.live.last.as_ref() == Some(m) {
                     return;
                 }
-                let mut covered = Tiles::new(self.shown.size);
                 m.footprint(&mut covered);
-                let left = self.live.tiles.minus(&covered);
-                self.upload(&left, None);
-                match (&self.live.last, m) {
-                    // Typing changes a letter at a time: only the changed letters' tiles are repainted.
-                    (Some(Mark::Text(old)), Mark::Text(new)) => {
-                        markup::text_changes(old, new, &mut fresh);
-                        fresh = fresh.intersect(&covered);
-                    }
-                    _ => fresh = covered.clone(),
-                }
-                self.live.tiles = covered;
+                fresh = covered.clone();
                 self.live.last = Some(m.clone());
+                m.raster(size)
             }
-        }
-        self.upload(&fresh, Some(m));
+        };
+        let left = self.live.tiles.minus(&covered);
+        self.upload(&left, None);
+        self.live.tiles = covered.clone();
+        self.upload(&fresh.intersect(&covered), Some(&mut raster));
+        self.live.text = raster.into_text();
     }
 
     /// Puts back the committed picture wherever a cancelled mark was showing.
@@ -2036,5 +2107,130 @@ Arc::ptr_eq(&snip.flattened(), &shown), "a current canvas is reused, not re-burn
         for id in [a, b] {
             assert_eq!(editors.with(id, |e| e.new_tip.clone()).unwrap(), "New recording (Ctrl+N)");
         }
+    }
+
+    /// One headless frame of the snip's canvas without mirroring its uploads, for timing.
+    fn bench_frame(ctx: &egui::Context, snip: &mut Snip, events: Vec<Event>) -> f64 {
+        let input = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1280.0, 800.0))), max_texture_side: Some(16384), events, ..Default::default() };
+        let guard = PopupClickGuard::default();
+        let t = std::time::Instant::now();
+        let mut out = ctx.run_ui(input, |ui| {
+            egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| snip.canvas(ui, &guard));
+        });
+        let ms = t.elapsed().as_secs_f64() * 1000.0;
+        out.textures_delta.clear();
+        ms
+    }
+
+    fn stats(name: &str, v: &[f64]) {
+        let mut s = v.to_vec();
+        s.sort_by(f64::total_cmp);
+        println!("{name:<46} n={:<4} median {:>7.2} ms   max {:>7.2} ms", s.len(), s[s.len() / 2], s[s.len() - 1]);
+    }
+
+    /// Timings on a 4K snip. Run in release: `cargo test --release perf_ -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "timing report, not a check"]
+    fn perf_editor_on_4k() {
+        let ms = |t: std::time::Instant| t.elapsed().as_secs_f64() * 1000.0;
+        // Typing a 12-line block at 160 px, shown at 100%.
+        let ctx = egui::Context::default();
+        let mut snip = Snip::new(gradient(3840, 2160), Tools { tool: Tool::Text, text: (PEN_COLORS[2], 160.0), ..Tools::default() });
+        snip.zoom = Some(1.0);
+        bench_frame(&ctx, &mut snip, vec![]);
+        let at = pos2(40.0, 110.0);
+        bench_frame(&ctx, &mut snip, vec![Event::PointerMoved(at), pointer(at, true)]);
+        bench_frame(&ctx, &mut snip, vec![pointer(at, false)]);
+        let mut lines = Vec::new();
+        for l in 0..12 {
+            if l > 0 {
+                bench_frame(&ctx, &mut snip, vec![key(Key::Enter, Modifiers::SHIFT)]);
+            }
+            let mut line = Vec::new();
+            for ch in "The quick brown fox jumps".chars() {
+                line.push(bench_frame(&ctx, &mut snip, vec![Event::Text(ch.to_string())]));
+            }
+            lines.push(line);
+        }
+        let Some(Mark::Text(t)) = snip.drawing.as_ref() else { panic!("typing") };
+        // The last line wholly on the snip: lower ones are cut off by its bottom edge.
+        let on = ((2160.0 - t.pos.y) / t.line_height()).floor() as usize;
+        stats("type: keystroke, line 1", &lines[0]);
+        stats(&format!("type: keystroke, line {on} (last whole line on 4K)"), &lines[on - 1]);
+        stats("type: keystroke, any of the 12 lines", &lines.concat());
+        let mut back = Vec::new();
+        for _ in 0..5 {
+            back.push(bench_frame(&ctx, &mut snip, vec![key(Key::Backspace, Modifiers::NONE)]));
+        }
+        stats("type: backspace at the end of the block", &back);
+        let mut slider = Vec::new();
+        for i in 0..10 {
+            snip.tools.text.1 = 159.0 - i as f32;
+            slider.push(bench_frame(&ctx, &mut snip, vec![]));
+        }
+        stats("type: size slider frame (12 lines)", &slider);
+        let commit = bench_frame(&ctx, &mut snip, vec![key(Key::Enter, Modifiers::NONE)]);
+        stats("type: Enter places the 12-line block", &[commit]);
+
+        // Highlighter drag across the whole snip at fit zoom.
+        let ctx = egui::Context::default();
+        let mut snip = Snip::new(gradient(3840, 2160), Tools { tool: Tool::Highlighter, ..Tools::default() });
+        bench_frame(&ctx, &mut snip, vec![]);
+        let path: Vec<Pos2> = (0..120).map(|i| pos2(40.0 + i as f32 * 10.0, 300.0 + (i as f32 * 0.3).sin() * 120.0)).collect();
+        bench_frame(&ctx, &mut snip, vec![Event::PointerMoved(path[0]), pointer(path[0], true)]);
+        let mut drag = Vec::new();
+        for &p in &path[1..] {
+            drag.push(bench_frame(&ctx, &mut snip, vec![Event::PointerMoved(p)]));
+        }
+        stats("highlighter: drag frame (120 points)", &drag);
+        let up = bench_frame(&ctx, &mut snip, vec![pointer(*path.last().unwrap(), false)]);
+        stats("highlighter: first stroke's mouse-up", &[up]);
+        let path2: Vec<Pos2> = path.iter().map(|p| *p + vec2(0.0, 60.0)).collect();
+        bench_frame(&ctx, &mut snip, vec![Event::PointerMoved(path2[0]), pointer(path2[0], true)]);
+        for &p in &path2[1..] {
+            bench_frame(&ctx, &mut snip, vec![Event::PointerMoved(p)]);
+        }
+        let up = bench_frame(&ctx, &mut snip, vec![pointer(*path2.last().unwrap(), false)]);
+        stats("highlighter: second stroke's mouse-up", &[up]);
+
+        // Erase, undo and redo beside 20 text marks.
+        let mut d = Doc::new(gradient(3840, 2160));
+        for i in 0..20 {
+            let pos = pos2(100.0 + (i % 4) as f32 * 900.0, 100.0 + (i / 4) as f32 * 400.0);
+            d.add_mark(Text { text: "Label 12345\nsecond line".into(), color: PEN_COLORS[2], size: 96.0, outline: true, pos });
+        }
+        d.add_mark(Shape { kind: ShapeKind::Line, color: Color32::RED, width: 4.0, from: pos2(3700.0, 2100.0), to: pos2(3710.0, 2100.0) });
+        let (mut erase, mut undo, mut redo, mut hits) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for _ in 0..5 {
+            let before = d.marks.clone();
+            let t = std::time::Instant::now();
+            d.checkpoint();
+            assert!(d.erase_at(pos2(3705.0, 2100.0), 3.0));
+            let tiles = d.changed_tiles(&before);
+            std::hint::black_box(d.render_runs(&tiles));
+            erase.push(ms(t));
+            let before = d.marks.clone();
+            let t = std::time::Instant::now();
+            d.undo();
+            let tiles = d.changed_tiles(&before);
+            std::hint::black_box(d.render_runs(&tiles));
+            undo.push(ms(t));
+            let before = d.marks.clone();
+            let t = std::time::Instant::now();
+            d.redo();
+            let tiles = d.changed_tiles(&before);
+            std::hint::black_box(d.render_runs(&tiles));
+            redo.push(ms(t));
+            d.undo();
+            let t = std::time::Instant::now();
+            for i in 0..20 {
+                std::hint::black_box(d.hits(pos2(150.0 + i as f32 * 10.0, 150.0), 10.0));
+            }
+            hits.push(ms(t) / 20.0);
+        }
+        stats("erase a dot beside 20 text marks", &erase);
+        stats("undo that erase", &undo);
+        stats("redo that erase", &redo);
+        stats("eraser hit test over 20 text marks", &hits);
     }
 }
