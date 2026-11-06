@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/rteoo/snipscreen/releases/tag/v0.2.0"><img src="https://img.shields.io/badge/stable-v0.2.0-blue.svg" alt="Stable v0.2.0"></a>
+  <a href="https://github.com/rteoo/snipscreen/releases/tag/v0.2.1"><img src="https://img.shields.io/badge/stable-v0.2.1-blue.svg" alt="Stable v0.2.1"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT license"></a>
 </p>
 
@@ -45,9 +45,9 @@ installed per user or run portable. It is a sibling of [SnipType](https://github
 
 ## Quick start
 
-Download `SnipscreenSetup-0.2.0.exe` from the
-[stable v0.2.0 release](https://github.com/rteoo/snipscreen/releases/tag/v0.2.0)
-and run it, or extract the portable `Snipscreen-0.2.0-windows-x64.zip` and run
+Download `SnipscreenSetup-0.2.1.exe` from the
+[stable v0.2.1 release](https://github.com/rteoo/snipscreen/releases/tag/v0.2.1)
+and run it, or extract the portable `Snipscreen-0.2.1-windows-x64.zip` and run
 `snipscreen.exe`. To build from source with Rust and the MSVC build tools (which
 include the Windows SDK) installed:
 
@@ -63,7 +63,7 @@ Use `cargo run` for a development build.
 ### Releases and installer
 
 The current stable release is
-[`v0.2.0`](https://github.com/rteoo/snipscreen/releases/tag/v0.2.0):
+[`v0.2.1`](https://github.com/rteoo/snipscreen/releases/tag/v0.2.1):
 
 | Platform | Package |
 | --- | --- |
