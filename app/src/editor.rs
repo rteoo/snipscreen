@@ -187,7 +187,7 @@ const PEN_COLORS: [Color32; 6] = [
     Color32::from_rgb(0xff, 0x8c, 0x00),
 ];
 const HIGHLIGHT_COLORS: [Color32; 4] = [
-    Color32::from_rgb(0xff, 0xe6, 0x00),
+    Color32::from_rgb(0xff, 0xff, 0x00),
     Color32::from_rgb(0x5c, 0xf0, 0x5c),
     Color32::from_rgb(0xff, 0x6e, 0xc7),
     Color32::from_rgb(0x5c, 0xd6, 0xff),
@@ -559,9 +559,7 @@ impl Snip {
                     let width_px = width * k;
                     if resp.drag_started() || resp.clicked() {
                         if let Some(p) = origin {
-                            // The highlighter picks how it blends from what it starts on, as shown, and keeps it for the stroke.
-                            let on_dark = ink == Ink::Highlighter && markup::is_dark_under(&canvas.shown, to_px(p), width_px / 2.0);
-                            *drawing = Some(Mark::Stroke(Stroke { ink, color, width: width_px, points: vec![to_px(p)], on_dark }));
+                            *drawing = Some(Mark::Stroke(Stroke { ink, color, width: width_px, points: vec![to_px(p)] }));
                         }
                     }
                     if let (Some(Mark::Stroke(s)), Some(p)) = (drawing.as_mut(), pointer) {
@@ -1942,7 +1940,7 @@ mod tests {
     fn undo_drops_a_stroke_in_progress() {
         let mut doc = Doc::new(white(100, 80));
         doc.crop(Rect::from_min_max(pos2(10.0, 10.0), pos2(60.0, 50.0)));
-        let mut drawing = Some(Mark::Stroke(Stroke { on_dark: false, ink: Ink::Pen, color: Color32::RED, width: 4.0, points: vec![pos2(1.0, 1.0)] }));
+        let mut drawing = Some(Mark::Stroke(Stroke { ink: Ink::Pen, color: Color32::RED, width: 4.0, points: vec![pos2(1.0, 1.0)] }));
         step_history(&mut doc, &mut None, &mut drawing, false);
         assert!(drawing.is_none(), "a stroke in the old image's coordinates must not land on the restored one");
     }
@@ -2173,7 +2171,7 @@ mod tests {
     #[test]
     fn copy_and_save_use_the_canvas_picture_only_while_it_is_current() {
         let mut snip = Snip::new(white(8, 8), Tools::default());
-        let stroke = || Stroke { on_dark: false, ink: Ink::Pen, color: Color32::RED, width: 2.0, points: vec![pos2(1.0, 1.0), pos2(6.0, 6.0)] };
+        let stroke = || Stroke { ink: Ink::Pen, color: Color32::RED, width: 2.0, points: vec![pos2(1.0, 1.0), pos2(6.0, 6.0)] };
         snip.doc.add_mark(stroke());
         assert_eq!(*snip.flattened(), snip.doc.flatten(), "no canvas yet: flattened from the doc");
         let ctx = egui::Context::default();
@@ -2275,12 +2273,10 @@ Arc::ptr_eq(&snip.flattened(), &shown), "a current canvas is reused, not re-burn
         }
     }
     #[test]
-    fn the_highlighter_screens_on_a_dark_snip_and_multiplies_on_a_light_one_exactly_as_saved() {
-        for (base, dark) in [(Color32::from_rgb(28, 30, 34), true), (Color32::from_rgb(250, 250, 248), false)] {
+    fn the_highlighter_on_a_dark_or_light_snip_shows_exactly_what_is_saved() {
+        for base in [Color32::from_rgb(28, 30, 34), Color32::from_rgb(250, 250, 248)] {
             let mut snip = Snip::new(ColorImage::new([300, 200], vec![base; 60000]), Tools { tool: Tool::Highlighter, ..Tools::default() });
             drag_and_compare(&mut snip, &PATH);
-            assert!(matches!(&*snip.doc.marks[0], Mark::Stroke(s) if s.on_dark == dark), "on a {base:?} snip");
-            // A second stroke starting on the first keeps reading the picture as shown.
             drag_and_compare(&mut snip, &PATH[1..]);
         }
     }
@@ -2533,7 +2529,7 @@ Arc::ptr_eq(&snip.flattened(), &shown), "a current canvas is reused, not re-burn
 
         editors.with(a, |e| {
             let Content::Snip(s) = &mut e.content else { panic!("a snip") };
-            s.doc.add_mark(Stroke { on_dark: false, ink: Ink::Pen, color: Color32::RED, width: 2.0, points: vec![pos2(1.0, 1.0)] });
+            s.doc.add_mark(Stroke { ink: Ink::Pen, color: Color32::RED, width: 2.0, points: vec![pos2(1.0, 1.0)] });
         });
         let undo = |id| editors.with(id, |e| e.snip().is_some_and(|s| s.doc.can_undo())).unwrap();
         assert!(undo(a) && !undo(b), "undo stacks are separate");
@@ -2985,7 +2981,7 @@ Arc::ptr_eq(&snip.flattened(), &shown), "a current canvas is reused, not re-burn
     fn render_samples_for_review() {
         let Ok(dir) = std::env::var("SNIPSCREEN_RENDER_DIR") else { return };
         let dir = PathBuf::from(dir);
-        let lines = ["The quick brown fox jumps over", "the lazy dog, then naps again.", "(this line multiplied, as before)"];
+        let lines = ["The quick brown fox jumps over", "the lazy dog, then naps again.", "A third line, crossed twice."];
         for (name, bg, fg) in [("highlighter-on-light", Color32::from_rgb(250, 250, 248), PEN_COLORS[0]), ("highlighter-on-dark", Color32::from_rgb(30, 31, 34), Color32::from_gray(225))] {
             let mut d = Doc::new(ColorImage::new([560, 190], vec![bg; 560 * 190]));
             for (i, line) in lines.iter().enumerate() {
@@ -2994,8 +2990,7 @@ Arc::ptr_eq(&snip.flattened(), &shown), "a current canvas is reused, not re-burn
             for (i, color) in [HIGHLIGHT_COLORS[0], HIGHLIGHT_COLORS[3], HIGHLIGHT_COLORS[0]].into_iter().enumerate() {
                 let y = 16.0 + i as f32 * 56.0 + 20.0;
                 let points = vec![pos2(16.0, y), pos2(500.0, y)];
-                let on_dark = i < 2 && markup::is_dark_under(&d.flatten(), points[0], 15.0);
-                d.add_mark(Stroke { ink: Ink::Highlighter, color, width: 30.0, points, on_dark });
+                d.add_mark(Stroke { ink: Ink::Highlighter, color, width: 30.0, points });
             }
             win::save_png(&dir.join(format!("{name}.png")), &d.flatten()).expect("render saved");
         }
