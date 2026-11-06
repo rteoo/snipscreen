@@ -14,7 +14,7 @@
 ; (its notification settings and the Startup apps switch).
 
 #define MyAppName "SnipScreen"
-#define MyAppVersion "0.1.1"
+#define MyAppVersion "0.2.0"
 #define MyAppPublisher "Project Contributors"
 #define MyAppExeName "snipscreen.exe"
 #define MyAppIcon "..\app\assets\snipscreen.ico"
