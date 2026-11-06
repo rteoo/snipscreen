@@ -1,19 +1,22 @@
 //! Snip document: picture, marks (ink strokes), crop and undo history.
+//!
+//! Every mark is rasterised on the CPU by `Mark::paint`, tile run by tile run. The editor shows a
+//! mark being drawn by painting the same runs over the picture it will be burned into, so what is
+//! on screen is exactly what gets copied or saved, blend modes included.
 
 use std::sync::Arc;
 
 use eframe::egui::{Color32, ColorImage, Pos2, Rect};
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Ink {
     Pen,
+    /// Multiplies with the picture like a real highlighter: white turns the ink's colour and dark
+    /// text stays dark, instead of a see-through coat laid on top.
     Highlighter,
 }
 
-/// Highlighter ink is see-through; it is stored opaque and faded when drawn.
-pub const HIGHLIGHT_ALPHA: f32 = 0.42;
-
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Debug)]
 pub struct Stroke {
     pub ink: Ink,
     pub color: Color32,
@@ -24,91 +27,47 @@ pub struct Stroke {
 }
 
 impl Stroke {
-    fn alpha(&self) -> f32 {
-        match self.ink {
-            Ink::Pen => 1.0,
-            Ink::Highlighter => HIGHLIGHT_ALPHA,
-        }
-    }
-
     fn radius(&self) -> f32 {
         (self.width * 0.5).max(0.5)
     }
 
-    /// Pixels of an image of `size` that the segments from point `from - 1`
-    /// onwards can touch; `from = 0` is the whole stroke.
-    pub fn bounds_from(&self, from: usize, size: [usize; 2]) -> Option<PxRect> {
-        let pts = self.points.get(from.saturating_sub(1)..).filter(|p| !p.is_empty())?;
-        let b = Rect::from_points(pts).expand(self.radius() + 1.0);
-        let r = PxRect {
-            x0: b.min.x.floor().max(0.0) as usize,
-            y0: b.min.y.floor().max(0.0) as usize,
-            x1: (b.max.x.ceil().max(0.0) as usize).min(size[0]),
-            y1: (b.max.y.ceil().max(0.0) as usize).min(size[1]),
-        };
-        (r.x1 > r.x0 && r.y1 > r.y0).then_some(r)
+    /// Segments from point `from - 1` onwards; a lone point is a segment of length zero.
+    fn segments_from(&self, from: usize) -> impl Iterator<Item = (Pos2, Pos2)> + '_ {
+        let pts = self.points.get(from.saturating_sub(1)..).unwrap_or(&[]);
+        let single = (pts.len() == 1).then(|| (pts[0], pts[0]));
+        single.into_iter().chain(pts.windows(2).map(|p| (p[0], p[1])))
     }
 
-    /// Coverage (0..=1) of every pixel in `r`, the max over all segments so
-    /// overlaps don't add up.
-    fn coverage(&self, r: PxRect) -> Vec<f32> {
-        let rad = self.radius();
-        let bw = r.x1 - r.x0;
-        let mut cover = vec![0f32; bw * (r.y1 - r.y0)];
-        let segments: Vec<(Pos2, Pos2)> = if self.points.len() == 1 {
-            vec![(self.points[0], self.points[0])]
-        } else {
-            self.points.windows(2).map(|p| (p[0], p[1])).collect()
+    /// Tiles the segments from point `from - 1` onwards can touch; `from = 0` is the whole stroke.
+    pub fn footprint_from(&self, from: usize, tiles: &mut Tiles) {
+        let reach = self.radius() + 1.0;
+        for (a, b) in self.segments_from(from) {
+            tiles.add_segment(a, b, reach);
+        }
+    }
+
+    fn paint(&self, patch: &mut ColorImage, at: [usize; 2]) {
+        let mut cover = vec![0f32; patch.pixels.len()];
+        cover_segments(&mut cover, patch_rect(patch, at), self.segments_from(0), self.radius());
+        let blend = match self.ink {
+            Ink::Pen => over,
+            Ink::Highlighter => multiply,
         };
-        for (a, b) in segments {
-            let sb = Rect::from_two_pos(a, b).expand(rad + 1.0);
-            let sx0 = (sb.min.x.floor().max(r.x0 as f32) as usize).max(r.x0);
-            let sy0 = (sb.min.y.floor().max(r.y0 as f32) as usize).max(r.y0);
-            let sx1 = (sb.max.x.ceil().max(0.0) as usize).min(r.x1);
-            let sy1 = (sb.max.y.ceil().max(0.0) as usize).min(r.y1);
-            for y in sy0..sy1 {
-                for x in sx0..sx1 {
-                    let d = dist_to_segment(Pos2::new(x as f32 + 0.5, y as f32 + 0.5), a, b);
-                    let c = (rad + 0.5 - d).clamp(0.0, 1.0);
-                    let slot = &mut cover[(y - r.y0) * bw + (x - r.x0)];
-                    if c > *slot {
-                        *slot = c;
-                    }
-                }
+        for (px, &k) in patch.pixels.iter_mut().zip(&cover) {
+            if k > 0.0 {
+                *px = blend(*px, self.color, k);
             }
         }
-        cover
-    }
-
-    /// The stroke's ink over `r` alone, premultiplied, with exactly the
-    /// coverage and alpha `burn_stroke` uses: drawn over the picture it
-    /// gives the same pixels as the saved snip.
-    pub fn ink_tile(&self, r: PxRect) -> ColorImage {
-        let alpha = self.alpha();
-        let [cr, cg, cb, _] = self.color.to_array();
-        let pixels = self
-            .coverage(r)
-            .into_iter()
-            .map(|c| {
-                let k = c * alpha;
-                let m = |v: u8| (v as f32 * k).round() as u8;
-                Color32::from_rgba_premultiplied(m(cr), m(cg), m(cb), m(255))
-            })
-            .collect();
-        ColorImage::new([r.x1 - r.x0, r.y1 - r.y0], pixels)
     }
 
     fn touches(&self, p: Pos2, radius: f32) -> bool {
         let reach = self.width * 0.5 + radius;
-        match self.points.as_slice() {
-            [only] => only.distance(p) <= reach,
-            pts => pts.windows(2).any(|s| dist_to_segment(p, s[0], s[1]) <= reach),
-        }
+        self.segments_from(0).any(|(a, b)| dist_to_segment(p, a, b) <= reach)
     }
 }
 
 /// Anything drawn on the snip. Each mark is burned into the picture on its own, in order.
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Debug)]
 pub enum Mark {
     Stroke(Stroke),
 }
@@ -120,10 +79,19 @@ impl From<Stroke> for Mark {
 }
 
 impl Mark {
-    /// Pixels of an image of `size` that the mark can touch.
-    pub fn bounds(&self, size: [usize; 2]) -> Option<PxRect> {
+    /// Every tile the mark can change. Never misses a pixel, so the mark can be burned run by run.
+    pub fn footprint(&self, tiles: &mut Tiles) {
         match self {
-            Mark::Stroke(s) => s.bounds_from(0, size),
+            Mark::Stroke(s) => s.footprint_from(0, tiles),
+        }
+    }
+
+    /// Composites the mark onto `patch`, a piece of the picture whose top-left pixel is `at`. The
+    /// result for a pixel depends only on that pixel and the mark, never on where the patch ends,
+    /// so painting tile runs one at a time gives the same pixels as painting the whole picture.
+    pub fn paint(&self, patch: &mut ColorImage, at: [usize; 2]) {
+        match self {
+            Mark::Stroke(s) => s.paint(patch, at),
         }
     }
 
@@ -138,6 +106,143 @@ impl Mark {
             Mark::Stroke(s) => s.points.iter_mut().for_each(|p| *p += d),
         }
     }
+}
+
+/// Side of the square tiles marks are rasterised and uploaded in, in image pixels.
+pub const TILE: usize = 32;
+
+/// A set of `TILE`-sized tiles of an image: where a mark can paint, or what needs redrawing.
+#[derive(Clone, PartialEq, Debug)]
+pub struct Tiles {
+    size: [usize; 2],
+    cols: usize,
+    on: Vec<bool>,
+}
+
+impl Tiles {
+    pub fn new(size: [usize; 2]) -> Self {
+        let cols = size[0].div_ceil(TILE);
+        Self { size, cols, on: vec![false; cols * size[1].div_ceil(TILE)] }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        !self.on.contains(&true)
+    }
+
+    /// Adds every tile that `r` (image pixels) overlaps.
+    pub fn add(&mut self, r: Rect) {
+        let [w, h] = self.size.map(|v| v as f32);
+        // Written so a NaN rectangle adds nothing.
+        if !(r.max.x > 0.0 && r.max.y > 0.0 && r.min.x < w && r.min.y < h) {
+            return;
+        }
+        let first = |v: f32| v.max(0.0) as usize / TILE;
+        let end = |v: f32, lim: f32| (v.ceil().min(lim) as usize).div_ceil(TILE);
+        let (tx0, ty0, tx1, ty1) = (first(r.min.x), first(r.min.y), end(r.max.x, w), end(r.max.y, h));
+        for ty in ty0..ty1 {
+            self.on[ty * self.cols + tx0..ty * self.cols + tx1].fill(true);
+        }
+    }
+
+    /// Tiles within `reach` of the segment `a`–`b`, taken in short pieces so a long diagonal doesn't
+    /// claim its whole bounding box.
+    pub fn add_segment(&mut self, a: Pos2, b: Pos2, reach: f32) {
+        let n = ((b - a).length() / (TILE as f32 / 2.0)).ceil().clamp(1.0, 4096.0) as usize;
+        let at = |i: usize| a + (b - a) * (i as f32 / n as f32);
+        for i in 0..n {
+            self.add(Rect::from_two_pos(at(i), at(i + 1)).expand(reach));
+        }
+    }
+
+    pub fn union(&mut self, o: &Tiles) {
+        for (a, &b) in self.on.iter_mut().zip(&o.on) {
+            *a |= b;
+        }
+    }
+
+    /// The tiles in `self` but not in `o`.
+    pub fn minus(&self, o: &Tiles) -> Tiles {
+        let on = self.on.iter().zip(&o.on).map(|(&a, &b)| a && !b).collect();
+        Tiles { on, ..*self }
+    }
+
+    /// The tiles as pixel rectangles, neighbours in a row merged into one, clipped to the image.
+    pub fn runs(&self) -> Vec<PxRect> {
+        let mut out = Vec::new();
+        for (ty, row) in self.on.chunks(self.cols.max(1)).enumerate() {
+            let mut tx = 0;
+            while tx < row.len() {
+                if !row[tx] {
+                    tx += 1;
+                    continue;
+                }
+                let start = tx;
+                while tx < row.len() && row[tx] {
+                    tx += 1;
+                }
+                out.push(PxRect {
+                    x0: start * TILE,
+                    y0: ty * TILE,
+                    x1: (tx * TILE).min(self.size[0]),
+                    y1: ((ty + 1) * TILE).min(self.size[1]),
+                });
+            }
+        }
+        out
+    }
+}
+
+/// The image pixels a patch with top-left pixel `at` covers.
+fn patch_rect(patch: &ColorImage, at: [usize; 2]) -> PxRect {
+    PxRect { x0: at[0], y0: at[1], x1: at[0] + patch.size[0], y1: at[1] + patch.size[1] }
+}
+
+/// Raises `cover` (one value per pixel of `r`) to the coverage of round-capped segments of radius
+/// `rad`. Taking the max means overlaps and self-crossings never add up.
+fn cover_segments(cover: &mut [f32], r: PxRect, segments: impl Iterator<Item = (Pos2, Pos2)>, rad: f32) {
+    let bw = r.x1 - r.x0;
+    for (a, b) in segments {
+        let sb = Rect::from_two_pos(a, b).expand(rad + 1.0);
+        let sx0 = (sb.min.x.floor().max(0.0) as usize).max(r.x0);
+        let sy0 = (sb.min.y.floor().max(0.0) as usize).max(r.y0);
+        let sx1 = (sb.max.x.ceil().max(0.0) as usize).min(r.x1);
+        let sy1 = (sb.max.y.ceil().max(0.0) as usize).min(r.y1);
+        for y in sy0..sy1 {
+            let row = &mut cover[(y - r.y0) * bw..(y - r.y0 + 1) * bw];
+            for x in sx0..sx1 {
+                let d = dist_to_segment(Pos2::new(x as f32 + 0.5, y as f32 + 0.5), a, b);
+                let c = (rad + 0.5 - d).clamp(0.0, 1.0);
+                let slot = &mut row[x - r.x0];
+                if c > *slot {
+                    *slot = c;
+                }
+            }
+        }
+    }
+}
+
+/// Opaque `ink` over the premultiplied pixel `px` at coverage `k`.
+fn over(px: Color32, ink: Color32, k: f32) -> Color32 {
+    let [r0, g0, b0, a0] = px.to_array();
+    let [cr, cg, cb, _] = ink.to_array();
+    let mix = |base: u8, ink: u8| (base as f32 * (1.0 - k) + ink as f32 * k).round() as u8;
+    let a = (a0 as f32 + (255.0 - a0 as f32) * k).round() as u8;
+    Color32::from_rgba_premultiplied(mix(r0, cr), mix(g0, cg), mix(b0, cb), a)
+}
+
+/// Opaque `ink` multiplied into the premultiplied pixel `px` at coverage `k` (the W3C multiply
+/// blend, source-over). On an opaque pixel this is `lerp(base, base * ink, k)`; where the picture is
+/// see-through (outside a freeform snip) the ink shows as itself.
+fn multiply(px: Color32, ink: Color32, k: f32) -> Color32 {
+    let [r0, g0, b0, a0] = px.to_array();
+    let [cr, cg, cb, _] = ink.to_array();
+    let clear = 1.0 - a0 as f32 / 255.0;
+    let mix = |base: u8, ink: u8| {
+        let (b, i) = (base as f32, ink as f32);
+        (b + k * (i * clear + b * i / 255.0 - b)).round() as u8
+    };
+    let a = (a0 as f32 + (255.0 - a0 as f32) * k).round() as u8;
+    Color32::from_rgba_premultiplied(mix(r0, cr), mix(g0, cg), mix(b0, cb), a)
 }
 
 #[derive(Clone)]
@@ -281,10 +386,6 @@ pub struct PxRect {
 }
 
 impl PxRect {
-    pub fn union(self, o: PxRect) -> PxRect {
-        PxRect { x0: self.x0.min(o.x0), y0: self.y0.min(o.y0), x1: self.x1.max(o.x1), y1: self.y1.max(o.y1) }
-    }
-
     pub fn pos(self) -> [usize; 2] {
         [self.x0, self.y0]
     }
@@ -356,34 +457,23 @@ fn dist_to_segment(p: Pos2, a: Pos2, b: Pos2) -> f32 {
     p.distance(a + ab * t)
 }
 
+/// Burns one mark into `img`, tile run by tile run.
 pub fn burn(img: &mut ColorImage, m: &Mark) {
-    match m {
-        Mark::Stroke(s) => burn_stroke(img, s),
+    let mut tiles = Tiles::new(img.size);
+    m.footprint(&mut tiles);
+    for r in tiles.runs() {
+        let mut patch = sub_image(img, r.x0, r.y0, r.x1 - r.x0, r.y1 - r.y0);
+        m.paint(&mut patch, r.pos());
+        paste(img, &patch, r.pos());
     }
 }
 
-/// Rasterises one stroke with soft edges. Coverage is collected first so a
-/// highlighter that crosses itself doesn't get darker where it overlaps.
-fn burn_stroke(img: &mut ColorImage, s: &Stroke) {
-    let Some(r) = s.bounds_from(0, img.size) else { return };
-    let w = img.size[0];
-    let bw = r.x1 - r.x0;
-    let cover = s.coverage(r);
-    let alpha = s.alpha();
-    let [cr, cg, cb, _] = s.color.to_array();
-    for y in r.y0..r.y1 {
-        for x in r.x0..r.x1 {
-            let k = cover[(y - r.y0) * bw + (x - r.x0)] * alpha;
-            if k <= 0.0 {
-                continue;
-            }
-            let px = &mut img.pixels[y * w + x];
-            let [r0, g0, b0, a0] = px.to_array();
-            let mix = |base: u8, ink: u8| (base as f32 * (1.0 - k) + ink as f32 * k).round() as u8;
-            // Pixels are premultiplied: ink adds its own coverage to alpha.
-            let a = (a0 as f32 + (255.0 - a0 as f32) * k).round() as u8;
-            *px = Color32::from_rgba_premultiplied(mix(r0, cr), mix(g0, cg), mix(b0, cb), a);
-        }
+/// Copies `patch` into `img` with its top-left pixel at `at`.
+pub fn paste(img: &mut ColorImage, patch: &ColorImage, at: [usize; 2]) {
+    let (w, pw) = (img.size[0], patch.size[0]);
+    for (row, line) in patch.pixels.chunks(pw.max(1)).enumerate() {
+        let start = (at[1] + row) * w + at[0];
+        img.pixels[start..start + pw].copy_from_slice(line);
     }
 }
 
@@ -448,69 +538,117 @@ mod tests {
         }
     }
 
-    fn paste(dst: &mut ColorImage, tile: &ColorImage, at: [usize; 2]) {
-        for y in 0..tile.size[1] {
-            for x in 0..tile.size[0] {
-                dst.pixels[(at[1] + y) * dst.size[0] + at[0] + x] = tile.pixels[y * tile.size[0] + x];
-            }
+    /// A picture with every channel varying, so blend mistakes show up.
+    fn gradient(w: usize, h: usize) -> ColorImage {
+        let px = (0..w * h).map(|i| Color32::from_rgb((i % w * 255 / w) as u8, (i / w * 255 / h) as u8, ((i * 7) % 256) as u8)).collect();
+        ColorImage::new([w, h], px)
+    }
+
+    /// What the editor does while a mark is drawn: repaint the given tiles from the pristine picture.
+    fn repaint(shown: &mut ColorImage, pristine: &ColorImage, m: &Mark, tiles: &Tiles) {
+        for r in tiles.runs() {
+            let mut patch = sub_image(pristine, r.x0, r.y0, r.x1 - r.x0, r.y1 - r.y0);
+            m.paint(&mut patch, r.pos());
+            paste(shown, &patch, r.pos());
         }
     }
 
     #[test]
-    fn highlighter_tile_is_uniform_at_crossings_and_corners() {
+    fn highlighter_turns_white_into_its_colour_and_keeps_dark_text_dark() {
+        let ink = Color32::from_rgb(255, 220, 0);
+        let mut img = white(40, 20);
+        for y in 0..20 {
+            for x in 20..40 {
+                img.pixels[y * 40 + x] = Color32::from_rgb(30, 30, 30);
+            }
+        }
+        let mut d = Doc::new(img);
+        d.add_mark(Stroke { ink: Ink::Highlighter, color: ink, width: 10.0, points: vec![Pos2::new(2.0, 10.0), Pos2::new(38.0, 10.0)] });
+        let out = d.flatten();
+        assert_eq!(out.pixels[10 * 40 + 8], ink, "white becomes the highlight colour");
+        let dark = out.pixels[10 * 40 + 30];
+        assert!(dark.r() <= 30 && dark.g() <= 30 && dark.b() <= 30, "dark text stays dark, got {dark:?}");
+        assert_eq!(dark, Color32::from_rgb(30, 26, 0), "multiplied, not covered");
+        assert_eq!(out.pixels[2 * 40 + 8], Color32::WHITE, "outside the stroke untouched");
+    }
+
+    #[test]
+    fn highlighter_is_uniform_at_crossings_and_corners() {
         let s = zigzag();
-        let r = s.bounds_from(0, [40, 40]).unwrap();
-        let tile = s.ink_tile(r);
-        let alpha_at = |x: usize, y: usize| tile.pixels[(y - r.y0) * tile.size[0] + (x - r.x0)].a();
-        let single = alpha_at(10, 10);
-        assert_eq!(single, (255.0 * HIGHLIGHT_ALPHA).round() as u8);
-        assert_eq!(alpha_at(20, 20), single, "self-crossing is no darker");
-        assert_eq!(alpha_at(34, 34), single, "joint is no darker");
-        assert_eq!(alpha_at(35, 36), single, "corner is filled round, not notched");
+        let mut img = white(40, 40);
+        burn(&mut img, &Mark::Stroke(s.clone()));
+        let at = |x: usize, y: usize| img.pixels[y * 40 + x];
+        assert_eq!(at(10, 10), s.color);
+        assert_eq!(at(20, 20), s.color, "self-crossing is no darker");
+        assert_eq!(at(34, 34), s.color, "joint is no darker");
+        assert_eq!(at(35, 36), s.color, "corner is filled round, not notched");
     }
 
     #[test]
-    fn ink_tile_over_picture_matches_saved_pixels() {
-        let mut d = Doc::new(white(40, 40));
-        d.add_mark(zigzag());
-        let saved = d.flatten();
-        let s = stroke(&d.marks[0]);
-        let r = s.bounds_from(0, d.size()).unwrap();
-        let mut shown = white(40, 40);
-        let tile = s.ink_tile(r);
-        for y in r.y0..r.y1 {
-            for x in r.x0..r.x1 {
-                // Premultiplied "over", as the GPU composites the live layer.
-                let ink = tile.pixels[(y - r.y0) * tile.size[0] + (x - r.x0)].to_array();
-                let px = &mut shown.pixels[y * 40 + x];
-                let base = px.to_array();
-                let o = |i: usize| (ink[i] as f32 + base[i] as f32 * (1.0 - ink[3] as f32 / 255.0)).round() as u8;
-                *px = Color32::from_rgba_premultiplied(o(0), o(1), o(2), o(3));
+    fn highlighter_on_see_through_pixels_shows_its_own_colour() {
+        let ink = Color32::from_rgb(255, 220, 0);
+        let mut img = ColorImage::new([20, 20], vec![Color32::TRANSPARENT; 400]);
+        burn(&mut img, &Mark::Stroke(Stroke { ink: Ink::Highlighter, color: ink, width: 8.0, points: vec![Pos2::new(10.0, 10.0)] }));
+        assert_eq!(img.pixels[10 * 20 + 10], ink);
+    }
+
+    #[test]
+    fn live_tiles_built_point_by_point_match_the_saved_snip() {
+        for ink in [Ink::Pen, Ink::Highlighter] {
+            let full = Stroke { ink, ..zigzag() };
+            let pristine = gradient(70, 50);
+            let mut shown = pristine.clone();
+            let mut done = 0;
+            for n in 1..=full.points.len() {
+                let s = Stroke { points: full.points[..n].to_vec(), ..full.clone() };
+                let mut fresh = Tiles::new(pristine.size);
+                s.footprint_from(done, &mut fresh);
+                repaint(&mut shown, &pristine, &Mark::Stroke(s), &fresh);
+                done = n;
             }
-        }
-        for (a, b) in shown.pixels.iter().zip(&saved.pixels) {
-            for (ca, cb) in a.to_array().into_iter().zip(b.to_array()) {
-                assert!(ca.abs_diff(cb) <= 1, "shown {a:?} vs saved {b:?}");
-            }
+            let mut d = Doc::new(pristine);
+            d.add_mark(full);
+            assert!(shown.pixels == d.flatten().pixels, "{ink:?}: screen and saved snip differ");
         }
     }
 
     #[test]
-    fn live_tiles_built_point_by_point_match_one_pass() {
-        let full = zigzag();
-        let size = [40, 40];
-        let mut layer = ColorImage::new(size, vec![Color32::TRANSPARENT; 1600]);
-        let mut done = 0;
-        for n in 1..=full.points.len() {
-            let s = Stroke { points: full.points[..n].to_vec(), ..full.clone() };
-            let r = s.bounds_from(done, size).unwrap();
-            paste(&mut layer, &s.ink_tile(r), r.pos());
-            done = n;
+    fn footprint_never_misses_a_pixel() {
+        let marks = [
+            Mark::Stroke(zigzag()),
+            Mark::Stroke(Stroke { ink: Ink::Pen, color: Color32::RED, width: 30.0, points: vec![Pos2::new(66.0, 2.0)] }),
+            Mark::Stroke(Stroke { ink: Ink::Pen, color: Color32::BLUE, width: 3.0, points: vec![Pos2::new(-5.0, 48.0), Pos2::new(75.0, 1.0)] }),
+        ];
+        for m in &marks {
+            let mut by_runs = gradient(70, 50);
+            burn(&mut by_runs, m);
+            let mut whole = gradient(70, 50);
+            m.paint(&mut whole, [0, 0]);
+            assert!(by_runs.pixels == whole.pixels, "{m:?} paints outside its footprint");
         }
-        let mut once = ColorImage::new(size, vec![Color32::TRANSPARENT; 1600]);
-        let r = full.bounds_from(0, size).unwrap();
-        paste(&mut once, &full.ink_tile(r), r.pos());
-        assert!(layer.pixels == once.pixels);
+    }
+
+    #[test]
+    fn tiles_merge_into_runs_clipped_to_the_image() {
+        let mut t = Tiles::new([70, 40]);
+        assert!(t.is_empty());
+        t.add(Rect::from_min_max(Pos2::new(1.0, 1.0), Pos2::new(65.0, 5.0)));
+        assert_eq!(t.runs(), vec![PxRect { x0: 0, y0: 0, x1: 70, y1: 32 }]);
+        t.add(Rect::from_min_max(Pos2::new(-10.0, 33.0), Pos2::new(2.0, 90.0)));
+        assert_eq!(t.runs()[1], PxRect { x0: 0, y0: 32, x1: 32, y1: 40 });
+        let mut away = Tiles::new([70, 40]);
+        away.add(Rect::from_min_max(Pos2::new(80.0, 0.0), Pos2::new(90.0, 5.0)));
+        away.add(Rect::NOTHING);
+        assert!(away.is_empty(), "nothing outside the image or empty");
+        assert_eq!(t.minus(&t), Tiles::new([70, 40]));
+    }
+
+    #[test]
+    fn a_long_diagonal_claims_only_the_tiles_along_it() {
+        let mut t = Tiles::new([3200, 3200]);
+        t.add_segment(Pos2::new(0.0, 0.0), Pos2::new(3200.0, 3200.0), 3.0);
+        let on = t.on.iter().filter(|&&b| b).count();
+        assert!(on < 400, "{on} of 10000 tiles");
     }
 
     #[test]

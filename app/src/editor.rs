@@ -16,7 +16,7 @@ use eframe::egui::{
 use windows_sys::Win32::Foundation::HWND;
 
 use crate::icons::{self, Icon};
-use crate::markup::{self, Doc, Ink, Mark, PxRect, Stroke};
+use crate::markup::{self, Doc, Ink, Mark, Stroke, Tiles};
 use crate::widgets::{
     self, dim_outside, divider, escape_for_app, icon_button, Note, Notifier, PopupClickGuard, ACCENT, BTN, BUTTON_HOVER, DIVIDER_W, GAP, GROUP_GAP, ICON,
     ICON_OFF, MIN_WINDOW_H, MIN_WINDOW_W, TOOLBAR_BG,
@@ -89,7 +89,8 @@ pub struct Snip {
     pub doc: Doc,
     pub tools: Tools,
     texture: Option<CanvasTex>,
-    drawing: Option<Stroke>,
+    /// The mark being drawn, in image pixels.
+    drawing: Option<Mark>,
     erase_marked: bool,
     crop: Option<(Pos2, Pos2)>,
     /// `None` fits the snip to the window; otherwise 1.0 is one screen pixel per pixel.
@@ -241,15 +242,11 @@ impl Snip {
             match texture {
                 Some(c) => {
                     c.tex.set(shown.clone(), TextureOptions::LINEAR);
-                    if c.rev.0 != rev.0 {
-                        c.live = None;
-                    }
-                    c.shown = shown;
-                    c.rev = rev;
+                    *c = CanvasTex::new(c.tex.clone(), shown, rev);
                 }
                 None => {
                     let tex = ctx.load_texture("snip", shown.clone(), TextureOptions::LINEAR);
-                    *texture = Some(CanvasTex { tex, shown, rev, live: None });
+                    *texture = Some(CanvasTex::new(tex, shown, rev));
                 }
             }
         }
@@ -305,22 +302,19 @@ impl Snip {
                     let width_px = width * k;
                     if resp.drag_started() || resp.clicked() {
                         if let Some(p) = origin {
-                            *drawing = Some(Stroke { ink, color, width: width_px, points: vec![to_px(p)] });
+                            *drawing = Some(Mark::Stroke(Stroke { ink, color, width: width_px, points: vec![to_px(p)] }));
                         }
                     }
-                    if let (Some(s), Some(p)) = (drawing.as_mut(), pointer) {
+                    if let (Some(Mark::Stroke(s)), Some(p)) = (drawing.as_mut(), pointer) {
                         let p = to_px(p);
                         if s.points.last().is_none_or(|l| l.distance(p) > 0.75 * k) {
                             s.points.push(p);
                         }
                     }
                     if resp.drag_stopped() || resp.clicked() {
-                        if let Some(s) = drawing.take() {
-                            canvas.commit(doc, Mark::Stroke(s));
+                        if let Some(m) = drawing.take() {
+                            canvas.commit(doc, m);
                         }
-                    }
-                    if let Some(s) = drawing.as_ref() {
-                        canvas.show_live(&ctx, painter, img_rect, s, doc.size());
                     }
                 }
                 Tool::Eraser => {
@@ -374,6 +368,10 @@ impl Snip {
                         );
                     }
                 }
+            }
+            match drawing {
+                Some(m) => canvas.show_live(m),
+                None => canvas.clear_live(),
             }
         });
         zoom_badge(ui.painter(), view_rect, zoom);
@@ -844,75 +842,97 @@ fn unique_title<'a>(want: &str, taken: impl Iterator<Item = &'a str> + Clone) ->
     (2..).map(|n| format!("{want} ({n})")).find(|t| free(t)).unwrap_or_else(|| want.to_string())
 }
 
-/// The snip as shown: the picture with committed ink burned in by the same
-/// rasteriser that saves it, plus a layer for the stroke being drawn.
+/// The snip as shown: the picture with committed marks burned in by the same rasteriser that saves
+/// it. A mark still being drawn is painted over `shown` on the CPU, tile run by tile run, straight
+/// into the texture, so the preview is pixel for pixel what the mark will burn (multiply included).
 struct CanvasTex {
     tex: TextureHandle,
+    /// The picture and its committed marks: exactly what copy and save write.
     shown: Arc<ColorImage>,
     /// `(image_rev, ink_rev)` of the doc that `shown` was built from.
     rev: (u64, u64),
-    live: Option<LiveInk>,
+    live: Live,
 }
 
-/// Image-sized, see-through texture holding the stroke being drawn. Only the
-/// pixels its newest segments touch are re-rasterised and uploaded each frame.
-struct LiveInk {
-    tex: TextureHandle,
-    /// Points of the stroke already rasterised into `tex`.
+/// The texture tiles that show a mark still being drawn instead of `shown`.
+struct Live {
+    tiles: Tiles,
+    /// Points of the stroke already painted into `tiles`.
     done: usize,
-    /// Pixels written so far, cleared when the stroke ends.
-    dirty: Option<PxRect>,
 }
 
-impl LiveInk {
-    fn clear(&mut self) {
-        if let Some(r) = self.dirty.take() {
-            let (w, h) = (r.x1 - r.x0, r.y1 - r.y0);
-            self.tex.set_partial(r.pos(), ColorImage::new([w, h], vec![Color32::TRANSPARENT; w * h]), TextureOptions::LINEAR);
-        }
-        self.done = 0;
+impl Live {
+    fn new(size: [usize; 2]) -> Self {
+        Self { tiles: Tiles::new(size), done: 0 }
     }
 }
 
 impl CanvasTex {
-    /// Adds a finished mark, burning just that mark into the texture
-    /// rather than re-flattening the whole snip.
+    fn new(tex: TextureHandle, shown: Arc<ColorImage>, rev: (u64, u64)) -> Self {
+        let live = Live::new(shown.size);
+        Self { tex, shown, rev, live }
+    }
+
+    /// Uploads the runs of `tiles` with `m` painted over the committed picture, or plain when `m` is `None`.
+    fn upload(&mut self, tiles: &Tiles, m: Option<&Mark>) {
+        for r in tiles.runs() {
+            let mut patch = markup::sub_image(&self.shown, r.x0, r.y0, r.x1 - r.x0, r.y1 - r.y0);
+            if let Some(m) = m {
+                m.paint(&mut patch, r.pos());
+            }
+            self.tex.set_partial(r.pos(), patch, TextureOptions::LINEAR);
+        }
+    }
+
+    /// Adds a finished mark, burning just that mark into the picture and texture rather than
+    /// re-flattening the whole snip.
     fn commit(&mut self, doc: &mut Doc, m: Mark) {
         let current = self.rev == (doc.image_rev, doc.ink_rev);
         if current {
-            if let Some(r) = m.bounds(doc.size()) {
-                let shown = Arc::make_mut(&mut self.shown);
-                markup::burn(shown, &m);
-                let patch = markup::sub_image(shown, r.x0, r.y0, r.x1 - r.x0, r.y1 - r.y0);
+            let mut tiles = Tiles::new(doc.size());
+            m.footprint(&mut tiles);
+            let shown = Arc::make_mut(&mut self.shown);
+            for r in tiles.runs() {
+                let mut patch = markup::sub_image(shown, r.x0, r.y0, r.x1 - r.x0, r.y1 - r.y0);
+                m.paint(&mut patch, r.pos());
+                markup::paste(shown, &patch, r.pos());
                 self.tex.set_partial(r.pos(), patch, TextureOptions::LINEAR);
             }
+            // Live tiles the mark no longer reaches go back to the picture.
+            let stale = self.live.tiles.minus(&tiles);
+            self.upload(&stale, None);
         }
         doc.add_mark(m);
         if current {
             self.rev.1 = doc.ink_rev;
         }
-        if let Some(live) = &mut self.live {
-            live.clear();
-        }
+        self.live = Live::new(self.shown.size);
     }
 
-    fn show_live(&mut self, ctx: &egui::Context, painter: &egui::Painter, img_rect: Rect, s: &Stroke, size: [usize; 2]) {
-        let live = self.live.get_or_insert_with(|| LiveInk {
-            tex: ctx.load_texture("live ink", ColorImage::new(size, vec![Color32::TRANSPARENT; size[0] * size[1]]), TextureOptions::LINEAR),
-            done: 0,
-            dirty: None,
-        });
-        if s.points.len() < live.done {
-            live.clear();
+    /// Shows `m`, the mark being drawn. A stroke only grows, so only the tiles its newest segments
+    /// reach are repainted.
+    fn show_live(&mut self, m: &Mark) {
+        let Mark::Stroke(s) = m;
+        if s.points.len() < self.live.done {
+            self.clear_live();
         }
-        if live.done < s.points.len() {
-            if let Some(r) = s.bounds_from(live.done, size) {
-                live.tex.set_partial(r.pos(), s.ink_tile(r), TextureOptions::LINEAR);
-                live.dirty = Some(live.dirty.map_or(r, |d| d.union(r)));
-            }
-            live.done = s.points.len();
+        if s.points.len() == self.live.done {
+            return;
         }
-        painter.image(live.tex.id(), img_rect, Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)), Color32::WHITE);
+        let mut fresh = Tiles::new(self.shown.size);
+        s.footprint_from(self.live.done, &mut fresh);
+        self.live.done = s.points.len();
+        self.live.tiles.union(&fresh);
+        self.upload(&fresh, Some(m));
+    }
+
+    /// Puts back the committed picture wherever a cancelled mark was showing.
+    fn clear_live(&mut self) {
+        if !self.live.tiles.is_empty() {
+            let tiles = std::mem::replace(&mut self.live.tiles, Tiles::new([0, 0]));
+            self.upload(&tiles, None);
+        }
+        self.live = Live::new(self.shown.size);
     }
 }
 
@@ -952,8 +972,8 @@ fn zoom_badge(painter: &egui::Painter, view: Rect, zoom: f32) {
 
 /// Undoes or redoes one step. The pending crop box is in pixels of the image it was drawn on,
 /// and the restored image can be a different size, so the box is dropped rather than applied to it.
-/// A stroke still being drawn is in the old image's coordinates, so it is dropped as well.
-fn step_history(doc: &mut Doc, crop: &mut Option<(Pos2, Pos2)>, drawing: &mut Option<Stroke>, redo: bool) {
+/// A mark still being drawn is in the old image's coordinates, so it is dropped as well.
+fn step_history(doc: &mut Doc, crop: &mut Option<(Pos2, Pos2)>, drawing: &mut Option<Mark>, redo: bool) {
     if redo {
         doc.redo();
     } else {
@@ -1051,7 +1071,7 @@ mod tests {
     fn undo_drops_a_stroke_in_progress() {
         let mut doc = Doc::new(white(100, 80));
         doc.crop(Rect::from_min_max(pos2(10.0, 10.0), pos2(60.0, 50.0)));
-        let mut drawing = Some(Stroke { ink: Ink::Pen, color: Color32::RED, width: 4.0, points: vec![pos2(1.0, 1.0)] });
+        let mut drawing = Some(Mark::Stroke(Stroke { ink: Ink::Pen, color: Color32::RED, width: 4.0, points: vec![pos2(1.0, 1.0)] }));
         step_history(&mut doc, &mut None, &mut drawing, false);
         assert!(drawing.is_none(), "a stroke in the old image's coordinates must not land on the restored one");
     }
@@ -1286,11 +1306,103 @@ mod tests {
         let ctx = egui::Context::default();
         let tex = ctx.load_texture("t", ColorImage::new([1, 1], vec![Color32::BLACK]), TextureOptions::LINEAR);
         let shown = Arc::new(snip.doc.flatten());
-        snip.texture = Some(CanvasTex { tex, shown: shown.clone(), rev: (snip.doc.image_rev, snip.doc.ink_rev), live: None });
+        snip.texture = Some(CanvasTex::new(tex, shown.clone(), (snip.doc.image_rev, snip.doc.ink_rev)));
         assert!(Arc::ptr_eq(&snip.flattened(), &shown), "a current canvas is reused, not re-burned");
         snip.doc.erase_at(pos2(3.0, 3.0), 2.0);
         assert!(!Arc::ptr_eq(&snip.flattened(), &shown), "a stale canvas is never copied");
         assert_eq!(*snip.flattened(), snip.doc.flatten());
+    }
+
+    /// A picture with every channel varying, so blend mistakes show up.
+    fn gradient(w: usize, h: usize) -> ColorImage {
+        let px = (0..w * h).map(|i| Color32::from_rgb((i % w * 255 / w) as u8, (i / w * 255 / h) as u8, ((i * 7) % 256) as u8)).collect();
+        ColorImage::new([w, h], px)
+    }
+
+    /// The canvas texture as the GPU holds it, rebuilt from the uploads egui hands the backend.
+    struct Screen {
+        image: Option<ColorImage>,
+    }
+
+    impl Screen {
+        fn apply(&mut self, delta: &egui::TexturesDelta, id: Option<egui::TextureId>) {
+            let Some(id) = id else { return };
+            for d in delta.set.get(&id).into_iter().flatten() {
+                let egui::ImageData::Color(img) = &d.image;
+                match (d.pos, self.image.as_mut()) {
+                    (None, _) => self.image = Some((**img).clone()),
+                    (Some(at), Some(screen)) => markup::paste(screen, img, at),
+                    (Some(_), None) => panic!("partial upload before the texture exists"),
+                }
+            }
+        }
+
+        fn pixels(&self) -> &[Color32] {
+            &self.image.as_ref().expect("the canvas uploaded its texture").pixels
+        }
+    }
+
+    /// One headless frame of the snip's canvas (1280x800 window at 100%), applying its texture uploads to `screen`.
+    fn canvas_frame(ctx: &egui::Context, snip: &mut Snip, screen: &mut Screen, events: Vec<Event>) {
+        let input = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1280.0, 800.0))), events, ..Default::default() };
+        let guard = PopupClickGuard::default();
+        let mut out = ctx.run_ui(input, |ui| {
+            egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| snip.canvas(ui, &guard));
+        });
+        screen.apply(&out.textures_delta, snip.texture.as_ref().map(|c| c.tex.id()));
+        out.textures_delta.clear();
+    }
+
+    fn pointer(pos: Pos2, pressed: bool) -> Event {
+        Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Modifiers::NONE }
+    }
+
+    /// Drags along `path` over a snip shown at 100% (a 300x200 one is centred on (640, 400)) with the
+    /// current tool, checking at every frame that the screen shows exactly what would be saved.
+    fn drag_and_compare(snip: &mut Snip, path: &[Pos2]) {
+        let ctx = egui::Context::default();
+        let mut screen = Screen { image: None };
+        // A fresh context means a fresh GPU: the canvas must upload its texture again.
+        snip.texture = None;
+        let marks = snip.doc.marks.len();
+        canvas_frame(&ctx, snip, &mut screen, vec![]);
+        canvas_frame(&ctx, snip, &mut screen, vec![Event::PointerMoved(path[0]), pointer(path[0], true)]);
+        for &p in &path[1..] {
+            canvas_frame(&ctx, snip, &mut screen, vec![Event::PointerMoved(p)]);
+            let mut want = snip.doc.flatten();
+            markup::burn(&mut want, snip.drawing.as_ref().expect("a drag in progress draws"));
+            assert!(screen.pixels() == want.pixels, "mid-drag screen differs from the saved snip");
+        }
+        canvas_frame(&ctx, snip, &mut screen, vec![pointer(*path.last().unwrap(), false)]);
+        canvas_frame(&ctx, snip, &mut screen, vec![]);
+        assert!(snip.drawing.is_none() && snip.doc.marks.len() == marks + 1, "the drag committed one mark");
+        assert!(screen.pixels() == snip.doc.flatten().pixels, "after the drag the screen differs from the saved snip");
+        assert!(*snip.flattened() == snip.doc.flatten(), "copy and save write what is shown");
+    }
+
+    const PATH: [Pos2; 5] = [pos2(600.0, 380.0), pos2(640.0, 400.0), pos2(700.0, 390.0), pos2(620.0, 420.0), pos2(600.0, 360.0)];
+
+    #[test]
+    fn pen_and_highlighter_show_exactly_what_is_saved() {
+        for tool in [Tool::Pen, Tool::Highlighter] {
+            let mut snip = Snip::new(gradient(300, 200), Tools { tool, ..Tools::default() });
+            drag_and_compare(&mut snip, &PATH);
+            drag_and_compare(&mut snip, &PATH[1..]);
+        }
+    }
+
+    #[test]
+    fn a_cancelled_stroke_leaves_the_picture_as_it_was() {
+        let ctx = egui::Context::default();
+        let mut snip = Snip::new(gradient(300, 200), Tools { tool: Tool::Highlighter, ..Tools::default() });
+        let mut screen = Screen { image: None };
+        canvas_frame(&ctx, &mut snip, &mut screen, vec![]);
+        canvas_frame(&ctx, &mut snip, &mut screen, vec![Event::PointerMoved(PATH[0]), pointer(PATH[0], true)]);
+        canvas_frame(&ctx, &mut snip, &mut screen, vec![Event::PointerMoved(PATH[2])]);
+        assert!(screen.pixels() != snip.doc.image.pixels, "the stroke shows while drawn");
+        snip.step(false);
+        canvas_frame(&ctx, &mut snip, &mut screen, vec![]);
+        assert!(screen.pixels() == snip.doc.image.pixels, "undo mid-stroke puts the picture back");
     }
 
     /// One headless frame of every open editor. Without a native backend egui embeds each viewport in
