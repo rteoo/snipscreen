@@ -1,9 +1,10 @@
 //! The look shared by the home window, the editor windows and the picker: colours sampled from
 //! the original, toolbar sizes, egui style, small painted widgets, toasts and the Esc / popup rules.
 
+use std::sync::mpsc::Sender;
 use std::time::Duration;
 
-use eframe::egui::{self, pos2, vec2, Align2, Color32, CornerRadius, FontId, Key, Modifiers, Rect, RichText, Sense, StrokeKind, Vec2};
+use eframe::egui::{self, pos2, vec2, Align2, Color32, CornerRadius, FontId, Key, Modifiers, Rect, RichText, Sense, StrokeKind, Vec2, ViewportId};
 
 use crate::icons::{self, Icon};
 
@@ -92,6 +93,25 @@ pub fn live_note(note: &mut Option<Note>, ctx: &egui::Context) -> Option<String>
         ctx.request_repaint_after(Duration::from_secs_f64(NOTE_SECS + 0.1));
     }
     Some(n.msg.clone())
+}
+
+/// Hands background work's messages to one window's toast and wakes that window to show them.
+#[derive(Clone)]
+pub struct Notifier {
+    tx: Sender<String>,
+    ctx: egui::Context,
+    viewport: ViewportId,
+}
+
+impl Notifier {
+    pub fn new(tx: Sender<String>, ctx: egui::Context, viewport: ViewportId) -> Self {
+        Self { tx, ctx, viewport }
+    }
+
+    pub fn send(&self, msg: String) {
+        let _ = self.tx.send(msg);
+        self.ctx.request_repaint_of(self.viewport);
+    }
 }
 
 /// Draws `msg` as a toast; `video_top` is the top of the content area while a video view is showing.
