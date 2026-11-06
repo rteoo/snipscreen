@@ -1291,7 +1291,8 @@ impl Doc {
         true
     }
 
-    /// Crops to `r` (image pixels); marks move with the picture.
+    /// Crops to `r` (image pixels); marks move with the picture, and those it leaves wholly outside go
+    /// (undo brings them back with the picture).
     pub fn crop(&mut self, r: Rect) {
         let [w, h] = self.size();
         let x0 = (r.min.x.round().max(0.0) as usize).min(w);
@@ -1309,6 +1310,8 @@ impl Doc {
         for m in &mut self.marks {
             Arc::make_mut(m).translate(-shift);
         }
+        let picture = Rect::from_min_size(Pos2::ZERO, eframe::egui::vec2((x1 - x0) as f32, (y1 - y0) as f32));
+        self.marks.retain(|m| m.bounds().intersects(picture));
     }
 
     /// Tiles whose pixels differ between the picture burned with `before` and with the current
@@ -1542,6 +1545,19 @@ mod tests {
         assert!(d.marks.is_empty());
         d.redo();
         assert_eq!(d.marks.len(), 1);
+    }
+
+    #[test]
+    fn crop_drops_the_marks_it_leaves_outside_and_undo_brings_them_back() {
+        let mut d = Doc::new(white(200, 100));
+        d.add_mark(shape(ShapeKind::Line, 4.0, (150.0, 80.0), (190.0, 90.0)));
+        d.add_mark(Text { text: "far".into(), color: Color32::RED, size: 20.0, outline: true, pos: Pos2::new(150.0, 10.0) });
+        d.add_mark(shape(ShapeKind::Line, 4.0, (10.0, 10.0), (60.0, 20.0)));
+        d.crop(Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(100.0, 100.0)));
+        assert_eq!(d.marks.len(), 1, "only the mark inside stays");
+        assert!(!d.hits(Pos2::new(170.0, 85.0), 30.0), "nothing invisible is left to hit");
+        d.undo();
+        assert_eq!(d.marks.len(), 3, "undo restores them");
     }
 
     #[test]
