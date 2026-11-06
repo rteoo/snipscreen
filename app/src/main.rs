@@ -351,12 +351,14 @@ impl App {
     /// Hides the window, waits for its hide animation, then copies the screen.
     fn hide_and_grab(&mut self, ctx: &egui::Context) {
         self.restore_corner = win::window_corner(self.hwnd as HWND);
+        // A snip from the tray has no window to wait for.
+        let settle = if win::is_visible(self.hwnd as HWND) { HIDE_SETTLE } else { Duration::ZERO };
         ctx.send_viewport_cmd(ViewportCommand::Visible(false));
         self.stage = Stage::Waiting;
         self.sync_escape_hotkey();
         let (tx, ctx) = (self.grab_tx.clone(), ctx.clone());
         std::thread::spawn(move || {
-            std::thread::sleep(HIDE_SETTLE);
+            std::thread::sleep(settle);
             let _ = tx.send(win::grab_screen());
             ctx.request_repaint();
         });
@@ -1580,6 +1582,10 @@ fn start_resident(intent: tray::Intent, hotkey: Hotkey) -> Option<Boot> {
     let waker: Arc<OnceLock<egui::Context>> = Arc::new(OnceLock::new());
     let (tx, events) = channel();
     let w = waker.clone();
+    // ceiling: eframe holds back every repaint of a hidden window by >= 100 ms
+    // (INVISIBLE_WINDOW_REPAINT_INTERVAL), so a shortcut, tray click or notification click reaches
+    // `logic` ~100 ms late while the home window is closed. Keeping the root window shown but
+    // cloaked (and off the taskbar) while "hidden" would remove that, if the delay ever matters.
     let wake = move |e| {
         let _ = tx.send(e);
         if let Some(ctx) = w.get() {

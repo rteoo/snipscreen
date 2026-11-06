@@ -220,6 +220,11 @@ pub fn window_corner(hwnd: HWND) -> Option<[i32; 2]> {
     }
 }
 
+/// Whether the window is shown (minimized counts as shown).
+pub fn is_visible(hwnd: HWND) -> bool {
+    unsafe { IsWindowVisible(hwnd) != 0 }
+}
+
 /// Un-minimizes the window without activating it, so a hotkey snip from another
 /// app can show its countdown without taking focus.
 pub fn restore_inactive(hwnd: HWND) {
