@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/rteoo/snipscreen/releases/tag/v0.1.0"><img src="https://img.shields.io/badge/stable-v0.1.0-blue.svg" alt="Stable v0.1.0"></a>
+  <a href="https://github.com/rteoo/snipscreen/releases/tag/v0.1.1"><img src="https://img.shields.io/badge/stable-v0.1.1-blue.svg" alt="Stable v0.1.1"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT license"></a>
 </p>
 
@@ -19,8 +19,8 @@ Press Alt+Shift+S, pick an area, and the snip is on the clipboard and in
 eraser, and crop, then copy or save it again. Switch to video to record an area
 of the screen to MP4, with the computer's sound, your microphone, or both.
 
-SnipScreen follows the Windows Snipping Tool's workflow in a single portable
-executable. It is a sibling of [SnipType](https://github.com/rteoo/sniptype) and
+SnipScreen follows the Windows Snipping Tool's workflow in a single executable,
+installed per user or run portable. It is a sibling of [SnipType](https://github.com/rteoo/sniptype) and
 [SnipVoice](https://github.com/rteoo/snipvoice), with no shared data or settings.
 
 ## Highlights
@@ -35,14 +35,15 @@ executable. It is a sibling of [SnipType](https://github.com/rteoo/sniptype) and
 - Recordings survive UAC prompts, the lock screen, full-screen apps, and resolution changes.
 - A recording that stops early keeps everything captured up to that point.
 - Portrait (rotated) monitors record upright.
-- No installer, no administrator rights, no telemetry, and no network access.
+- Per-user installation with no administrator rights, no telemetry, and no network access.
 
 ## Quick start
 
-Download `snipscreen-v0.1.0-windows-x64.zip` from the
-[stable v0.1.0 release](https://github.com/rteoo/snipscreen/releases/tag/v0.1.0),
-extract it, and run `snipscreen.exe`. To build from source with Rust and the
-MSVC build tools (which include the Windows SDK) installed:
+Download `SnipscreenSetup-0.1.1.exe` from the
+[stable v0.1.1 release](https://github.com/rteoo/snipscreen/releases/tag/v0.1.1)
+and run it, or extract the portable `Snipscreen-0.1.1-windows-x64.zip` and run
+`snipscreen.exe`. To build from source with Rust and the MSVC build tools (which
+include the Windows SDK) installed:
 
 ```powershell
 git clone https://github.com/rteoo/snipscreen.git
@@ -53,18 +54,26 @@ cargo build --release
 
 Use `cargo run` for a development build.
 
-### Releases
+### Releases and installer
 
 The current stable release is
-[`v0.1.0`](https://github.com/rteoo/snipscreen/releases/tag/v0.1.0):
+[`v0.1.1`](https://github.com/rteoo/snipscreen/releases/tag/v0.1.1):
 
 | Platform | Package |
 | --- | --- |
-| Windows 10 2004+ x64 (Windows 11 recommended) | Portable ZIP with `snipscreen.exe` |
+| Windows 10 2004+ x64 (Windows 11 recommended) | Per-user installer and portable ZIP |
 
-The executable is not publisher-signed, so Windows SmartScreen may show
-**More info → Run anyway** on first launch. SnipScreen has no installer: keep the
-executable anywhere and delete it to remove the app.
+The installer and executable are not publisher-signed, so Windows SmartScreen
+may show **More info → Run anyway** on first launch. The installer needs no
+administrator rights and installs for the current user in
+`%LOCALAPPDATA%\Programs\SnipScreen`, with a Start menu entry and an optional
+desktop shortcut; uninstall it from Windows Settings. Your snips and recordings
+in Pictures and Videos are never removed. The portable ZIP needs no install:
+keep `snipscreen.exe` anywhere and delete it to remove the app.
+
+To build the installer, run `cargo build --release` in `app\`, then
+`build_installer.bat` with [Inno Setup 6](https://jrsoftware.org/isdl.php)
+installed; the result is in `installer\Output\`.
 
 ## First use
 
