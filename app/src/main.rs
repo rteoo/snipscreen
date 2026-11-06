@@ -26,7 +26,7 @@ use icons::Icon;
 use settings::{AfterCapture, Hotkey, Mode, Settings, Shape as Shape_, DELAYS};
 use widgets::{
     dim_outside, divider, dropdown, icon_button, style, take_escape, Note, Notifier, PopupClickGuard, ACCENT, BTN, BUTTON_BG, BUTTON_HOVER, DIM, DIVIDER_W,
-    GAP, ICON, ICON_OFF, MIN_WINDOW_H, MIN_WINDOW_W, OUTLINE, TOOLBAR_BG,
+    GAP, GLYPH, ICON, ICON_OFF, MIN_WINDOW_H, MIN_WINDOW_W, OUTLINE, RADIUS, TOOLBAR_BG,
 };
 use windows_sys::Win32::Foundation::HWND;
 
@@ -159,6 +159,8 @@ enum Shot {
 /// runs), the capture settings, the global hotkeys, and the open editor windows.
 struct App {
     hwnd: isize,
+    /// The home window's toolbar doubles as its title bar.
+    bar: win::TitleBar,
     /// Everything the person chose, including the capture mode, shape, delay and sound choices.
     settings: Settings,
     /// `settings` as last handed to `saver`; any difference is saved at the end of the pass.
@@ -249,8 +251,12 @@ impl App {
             }
             None => (None, None, None, None, None),
         };
+        let bar = win::TitleBar::default();
+        let wake = cc.egui_ctx.clone();
+        let bar_failed = bar.attach(hwnd as HWND, move || wake.request_repaint_of(ViewportId::ROOT)).err();
         let mut app = Self {
             hwnd,
+            bar,
             settings,
             saved,
             saver,
@@ -286,6 +292,9 @@ impl App {
             settings_window: None,
             icon,
         };
+        if let Some(e) = bar_failed {
+            app.say(&cc.egui_ctx, e);
+        }
         if !loaded.problems.is_empty() && !shot_run {
             app.say(&cc.egui_ctx, format!("Some settings couldn't be read and were reset: {}", loaded.problems.join(", ")));
         }
@@ -484,7 +493,7 @@ impl App {
 
     /// Puts the home window back to its size; `settle_window` then returns it to its old corner.
     fn place_window(&mut self, ctx: &egui::Context) {
-        ctx.send_viewport_cmd(ViewportCommand::InnerSize(HOME_SIZE));
+        ctx.send_viewport_cmd(ViewportCommand::InnerSize(self.bar.inner_size_for(HOME_SIZE, ctx.pixels_per_point())));
         self.settle = 8;
     }
 
@@ -495,6 +504,9 @@ impl App {
             return;
         }
         self.settle -= 1;
+        // Normally a no-op: corrects the size if Windows rescaled the window on its way back.
+        let px = HOME_SIZE * ctx.pixels_per_point();
+        win::size_client(self.hwnd as HWND, px.x.round() as i32, px.y.round() as i32);
         win::place_on_screen(self.hwnd as HWND, self.restore_corner.take());
         ctx.request_repaint();
     }
@@ -848,6 +860,9 @@ impl eframe::App for App {
         }
         self.drive_screenshot(&ctx);
         self.persist();
+        // After this pass's stage changes, before eframe applies its window commands: the picker and
+        // the recording bar are frameless, and winit lays those out.
+        self.bar.set_active(!matches!(self.stage, Stage::Picking(_) | Stage::Recording(_)));
     }
 }
 
@@ -857,16 +872,15 @@ impl App {
         if ctx.input_mut(|i| i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::N))) {
             self.start_snip(&ctx);
         }
-        egui::Panel::top("home_toolbar")
-            .frame(egui::Frame::new().fill(TOOLBAR_BG).inner_margin(egui::Margin::symmetric(12, 6)))
-            .show(ui, |ui| {
-                ui.spacing_mut().item_spacing = vec2(GAP, 0.0);
-                let row = Rect::from_min_size(ui.available_rect_before_wrap().min, vec2(ui.available_width(), BTN.y));
-                ui.allocate_rect(row, Sense::hover());
-                let layout = |l| egui::UiBuilder::new().max_rect(row).layout(l);
-                self.capture_controls(&mut ui.new_child(layout(Layout::left_to_right(Align::Center))));
-                self.home_menu(&mut ui.new_child(layout(Layout::right_to_left(Align::Center))));
-            });
+        let bar = self.bar.clone();
+        widgets::title_bar(ui, "home_toolbar", &bar, |ui, row| {
+            let layout = |l| egui::UiBuilder::new().max_rect(row).layout(l);
+            let mut left = ui.new_child(layout(Layout::left_to_right(Align::Center)));
+            self.capture_controls(&mut left);
+            let mut right = ui.new_child(layout(Layout::right_to_left(Align::Center)));
+            self.home_menu(&mut right);
+            vec![left.min_rect(), right.min_rect()]
+        });
         egui::CentralPanel::default().frame(egui::Frame::new().fill(ui.style().visuals.extreme_bg_color)).show(ui, |ui| {
             if let Stage::Counting { end } = self.stage {
                 self.countdown_view(ui, end);
@@ -921,24 +935,26 @@ impl App {
     }
 
     fn mode_switch(&mut self, ui: &mut egui::Ui) {
-        let (group, _) = ui.allocate_exact_size(vec2(BTN.x * 2.0 + 6.0, BTN.y), Sense::hover());
-        ui.painter().rect_stroke(group, 5.0, (1.0, OUTLINE), StrokeKind::Inside);
+        const INSET: f32 = 2.0;
+        let (group, _) = ui.allocate_exact_size(vec2(BTN.x * 2.0 + 2.0 * INSET, BTN.y), Sense::hover());
+        // Concentric corners: the cells' radius plus the inset between them and the outline.
+        ui.painter().rect_stroke(group, RADIUS as f32 + INSET, (1.0, OUTLINE), StrokeKind::Inside);
         for (i, (mode, icon, tip)) in
             [(Mode::Photo, Icon::Camera, "Snip a picture"), (Mode::Video, Icon::Video, "Record a video")]
                 .into_iter()
                 .enumerate()
         {
-            let cell = Rect::from_min_size(group.min + vec2(3.0 + i as f32 * BTN.x, 3.0), BTN - vec2(0.0, 6.0));
+            let cell = Rect::from_min_size(group.min + vec2(INSET + i as f32 * BTN.x, INSET), BTN - vec2(0.0, 2.0 * INSET));
             let resp = ui.interact(cell, ui.scope_id().with(("mode", i)), Sense::click()).on_hover_text(tip);
             let p = ui.painter();
             if self.settings.mode == mode {
-                p.rect_filled(cell, 4.0, BUTTON_HOVER);
-                let bar = Rect::from_center_size(cell.center_bottom() - vec2(0.0, 3.0), vec2(14.0, 3.0));
+                p.rect_filled(cell, RADIUS, BUTTON_HOVER);
+                let bar = Rect::from_center_size(cell.center_bottom() - vec2(0.0, 2.5), vec2(12.0, 3.0));
                 p.rect_filled(bar, 1.5, ACCENT);
             } else if resp.hovered() {
-                p.rect_filled(cell, 4.0, BUTTON_BG);
+                p.rect_filled(cell, RADIUS, BUTTON_BG);
             }
-            icons::paint(p, Rect::from_center_size(cell.center() - vec2(0.0, 1.0), vec2(18.0, 18.0)), icon, ICON, None);
+            icons::paint(p, Rect::from_center_size(cell.center() - vec2(0.0, 1.0), Vec2::splat(GLYPH)), icon, ICON, None);
             if resp.clicked() {
                 self.set_mode(mode);
             }
@@ -959,13 +975,13 @@ impl App {
                 let (rect, item) = ui.allocate_exact_size(vec2(150.0, 32.0), Sense::click());
                 let p = ui.painter();
                 if item.hovered() {
-                    p.rect_filled(rect, 4.0, BUTTON_HOVER);
+                    p.rect_filled(rect, RADIUS, BUTTON_HOVER);
                 }
                 if self.settings.shape == s {
                     let pill = Rect::from_center_size(rect.left_center() + vec2(3.0, 0.0), vec2(3.0, 16.0));
                     p.rect_filled(pill, 1.5, ACCENT);
                 }
-                icons::paint(p, Rect::from_center_size(rect.left_center() + vec2(22.0, 0.0), vec2(18.0, 18.0)), s.icon(), ICON, None);
+                icons::paint(p, Rect::from_center_size(rect.left_center() + vec2(22.0, 0.0), Vec2::splat(GLYPH)), s.icon(), ICON, None);
                 p.text(rect.left_center() + vec2(42.0, 0.0), Align2::LEFT_CENTER, s.label(), FontId::proportional(14.0), ICON);
                 if item.clicked() {
                     self.settings.shape = s;
@@ -1054,7 +1070,7 @@ impl App {
                     Some(s) => {
                         let shown = Rect::from_min_max(to_pt(s.min), to_pt(s.max));
                         dim_outside(painter, rect, shown);
-                        painter.rect_stroke(shown, 0.0, (1.0, Color32::WHITE), StrokeKind::Outside);
+                        widgets::dashed_outline(painter, shown);
                         size_tag(painter, shown, s.size());
                         if resp.drag_stopped() {
                             pk.start = None;
@@ -1801,15 +1817,8 @@ fn area_outline(ctx: &egui::Context, [x, y, w, h]: [i32; 4]) {
             win::exclude_from_capture(hwnd, true);
             win::fit_client(hwnd, x - PAD, y - PAD, w + 2 * PAD, h + 2 * PAD);
         }
-        let r = ui.max_rect().shrink(1.5);
-        let p = ui.painter();
-        let dash = |a: Pos2, b: Pos2| {
-            p.add(Shape::dashed_line(&[a, b], (2.0, Color32::from_white_alpha(230)), 7.0, 5.0));
-        };
-        dash(r.left_top(), r.right_top());
-        dash(r.right_top(), r.right_bottom());
-        dash(r.right_bottom(), r.left_bottom());
-        dash(r.left_bottom(), r.left_top());
+        // The window reaches PAD pixels past the area on every side; the dashes go just outside it.
+        widgets::dashed_outline(ui.painter(), ui.max_rect().shrink(PAD as f32 / ui.ctx().pixels_per_point()));
     });
 }
 
