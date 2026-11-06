@@ -360,7 +360,7 @@ impl App {
         std::thread::spawn(move || {
             std::thread::sleep(settle);
             let _ = tx.send(win::grab_screen());
-            ctx.request_repaint();
+            wake_root(&ctx);
         });
     }
 
@@ -552,7 +552,7 @@ impl App {
         self.spawn_worker(move || {
             if let Err(msg) = deliver_by_notification(id, &image, hwnd, copy, save_to) {
                 let _ = tx.send(SnipEvent::NotShown { id, msg });
-                ctx.request_repaint();
+                wake_root(&ctx);
             }
         });
     }
@@ -577,7 +577,7 @@ impl App {
         let (tx, ctx) = (self.snip_tx.clone(), ctx.clone());
         std::thread::spawn(move || {
             let _ = tx.send(SnipEvent::Loaded(notify::load_png(&path)));
-            ctx.request_repaint();
+            wake_root(&ctx);
         });
     }
 
@@ -1206,7 +1206,7 @@ impl App {
         let (tx, c) = (self.rec_tx.clone(), ctx.clone());
         bar.rec = Some(recorder::start(settings, move |event| {
             let _ = tx.send(event);
-            c.request_repaint();
+            wake_root(&c);
         }));
     }
 
@@ -1417,6 +1417,13 @@ impl App {
     }
 }
 
+/// Wakes the shell from another thread. `request_repaint` would target whichever viewport is in a
+/// pass right now (an editor or Settings, whose passes share the context), leaving the event unread
+/// until something else repaints the root.
+fn wake_root(ctx: &egui::Context) {
+    ctx.request_repaint_of(ViewportId::ROOT);
+}
+
 /// Messages show in the home window while it is on screen, and always in the recording bar, which
 /// draws them itself; otherwise they go to the newest editor.
 fn note_goes_home(home_visible: bool, recording: bool) -> bool {
@@ -1604,7 +1611,7 @@ fn start_resident(intent: tray::Intent, hotkey: Hotkey) -> Option<Boot> {
     let wake = move |e| {
         let _ = tx.send(e);
         if let Some(ctx) = w.get() {
-            ctx.request_repaint();
+            wake_root(ctx);
         }
     };
     let (agent, hotkey) = match tray::Agent::start(hotkey, true, wake) {
@@ -1847,6 +1854,30 @@ mod tests {
         let taken = new_tooltip(Mode::Photo, None, Some("Alt+Shift+S is already used by another app"));
         assert_eq!(taken, "New snip (Ctrl+N). Alt+Shift+S is already used by another app");
         assert!(!new_tooltip(Mode::Video, None, None).contains("Alt+Shift+S"));
+    }
+
+    /// A worker that finishes while an editor's pass runs must still wake the root, which reads the
+    /// channels. The pass below is an editor's own, as eframe runs it for a deferred viewport.
+    #[test]
+    fn workers_wake_the_root_even_during_another_windows_pass() {
+        let ctx = egui::Context::default();
+        let woken = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = woken.clone();
+        ctx.set_repaint_observer(move |info| log.lock().unwrap().push(info.viewport_id));
+        let editor = ViewportId::from_hash_of("an editor");
+        let mut plain_went_to = Vec::new();
+        let mut input = egui::RawInput { viewport_id: editor, ..Default::default() };
+        input.viewports.insert(editor, egui::ViewportInfo::default());
+        let mut out = ctx.run_ui(input, |ui| {
+            woken.lock().unwrap().clear();
+            let (plain, root) = (ui.ctx().clone(), ui.ctx().clone());
+            std::thread::spawn(move || plain.request_repaint()).join().unwrap();
+            plain_went_to = woken.lock().unwrap().split_off(0);
+            std::thread::spawn(move || wake_root(&root)).join().unwrap();
+        });
+        out.textures_delta.clear();
+        assert_eq!(plain_went_to, [editor], "the trap: a bare request_repaint goes to the window in its pass");
+        assert!(woken.lock().unwrap().starts_with(&[ViewportId::ROOT]), "{:?}", woken.lock().unwrap());
     }
 
     #[test]
