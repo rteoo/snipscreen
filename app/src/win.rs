@@ -28,7 +28,7 @@ use windows_sys::Win32::UI::Controls::Dialogs::{
     GetSaveFileNameW, OFN_NOCHANGEDIR, OFN_OVERWRITEPROMPT, OFN_PATHMUSTEXIST, OPENFILENAMEW,
 };
 
-use windows_sys::Win32::UI::Shell::{FOLDERID_Pictures, FOLDERID_RoamingAppData, FOLDERID_Videos, SHGetKnownFolderPath};
+use windows_sys::Win32::UI::Shell::{FOLDERID_LocalAppData, FOLDERID_Pictures, FOLDERID_RoamingAppData, FOLDERID_Videos, SHGetKnownFolderPath};
 use windows_sys::Win32::System::Com::CoTaskMemFree;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     EnumWindows, FindWindowW, GetClientRect, GetCursorPos, GetWindowPlacement, WINDOWPLACEMENT, SetWindowDisplayAffinity, WDA_EXCLUDEFROMCAPTURE, WDA_NONE, GetSystemMetrics, GetWindowLongW, GetWindowRect,
@@ -264,6 +264,11 @@ pub fn place_on_screen(hwnd: HWND, corner: Option<[i32; 2]>) {
 /// Puts the picture on the clipboard as a bitmap (for every app) and as PNG
 /// (keeps transparency for apps that read it).
 pub fn copy_image(owner: HWND, img: &ColorImage) -> Result<(), String> {
+    copy_image_with_png(owner, img, &encode_png(img)?)
+}
+
+/// `copy_image` with the PNG already encoded, for a caller that also saves it.
+pub fn copy_image_with_png(owner: HWND, img: &ColorImage, png: &[u8]) -> Result<(), String> {
     let [w, h] = img.size;
     let mut dib = Vec::with_capacity(size_of::<BITMAPINFOHEADER>() + w * h * 4);
     let header = bitmap_header(w as i32, h as i32);
@@ -281,8 +286,6 @@ pub fn copy_image(owner: HWND, img: &ColorImage) -> Result<(), String> {
             dib.extend_from_slice(&[mix(b), mix(g), mix(r), 255]);
         }
     }
-    let png = encode_png(img)?;
-
     unsafe {
         let mut opened = false;
         for _ in 0..10 {
@@ -297,7 +300,7 @@ pub fn copy_image(owner: HWND, img: &ColorImage) -> Result<(), String> {
         }
         EmptyClipboard();
         let png_format = RegisterClipboardFormatW(wide("PNG").as_ptr());
-        let result = set_clipboard(CF_DIB as u32, &dib).and_then(|_| set_clipboard(png_format, &png));
+        let result = set_clipboard(CF_DIB as u32, &dib).and_then(|_| set_clipboard(png_format, png));
         CloseClipboard();
         result
     }
@@ -346,12 +349,11 @@ pub fn save_png(path: &std::path::Path, img: &ColorImage) -> Result<(), String> 
     std::fs::write(path, encode_png(img)?).map_err(|e| format!("{}: {e}", path.display()))
 }
 
-/// Saves into a new file at `path`, or at the first free "name (2).png",
-/// "name (3).png"… beside it, and returns where it went. Never overwrites.
-pub fn save_png_new(path: &Path, img: &ColorImage) -> Result<PathBuf, String> {
-    let png = encode_png(img)?;
+/// Writes `bytes` into a new file at `path`, or at the first free "name (2).png", "name (3).png"…
+/// beside it, and returns where it went. Never overwrites.
+pub fn save_new(path: &Path, bytes: &[u8]) -> Result<PathBuf, String> {
     let (path, mut file) = create_unique(path)?;
-    if let Err(e) = file.write_all(&png) {
+    if let Err(e) = file.write_all(bytes) {
         drop(file);
         let _ = std::fs::remove_file(&path);
         return Err(format!("{}: {e}", path.display()));
@@ -403,6 +405,11 @@ pub fn videos_dir() -> Option<PathBuf> {
 /// `%APPDATA%`: settings that follow the person between PCs.
 pub fn roaming_app_data_dir() -> Option<PathBuf> {
     known_folder(&FOLDERID_RoamingAppData)
+}
+
+/// `%LOCALAPPDATA%`: this PC's caches (notification pictures, the icon file).
+pub fn local_app_data_dir() -> Option<PathBuf> {
+    known_folder(&FOLDERID_LocalAppData)
 }
 
 fn known_folder(id: &windows_sys::core::GUID) -> Option<PathBuf> {
@@ -601,8 +608,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let want = dir.join("Snip 2026-11-05 141530.png");
         let img = ColorImage::new([2, 2], vec![Color32::RED; 4]);
-        let first = save_png_new(&want, &img);
-        let second = save_png_new(&want, &img);
+        let png = encode_png(&img).unwrap();
+        let first = save_new(&want, &png);
+        let second = save_new(&want, &png);
         let third = create_unique(&want).map(|(p, _)| p);
         let sizes: Vec<_> = [&first, &second].iter().map(|r| r.as_ref().ok().and_then(|p| std::fs::metadata(p).ok()).map(|m| m.len())).collect();
         let _ = std::fs::remove_dir_all(&dir);

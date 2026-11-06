@@ -24,6 +24,8 @@ windows = { version = "0.62", features = [
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
     "Win32_Graphics_Gdi",
+    "UI_Notifications",
+    "Data_Xml_Dom",
 ] }
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
