@@ -931,7 +931,6 @@ impl eframe::App for App {
 
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.keep_concealed(ctx);
-        self.on_home_close(ctx);
         while let Ok(msg) = self.bg_rx.try_recv() {
             self.say(ctx, msg);
         }
@@ -951,6 +950,9 @@ impl eframe::App for App {
                 tray::Event::HotkeyLost(why) => self.on_hotkey_lost(ctx, why),
             }
         }
+        // After the agent's events: `taskkill` closes the root window and the agent's at once, and a
+        // close cancelled in the same pass as the agent's Quit would cancel the Quit too.
+        self.on_home_close(ctx);
         self.poll_settings_window(ctx);
         while let Ok(event) = self.snip_rx.try_recv() {
             self.on_snip_event(ctx, event);
