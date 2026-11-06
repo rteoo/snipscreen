@@ -18,7 +18,7 @@ use eframe::egui::{
 use windows_sys::Win32::Foundation::HWND;
 
 use crate::icons::{self, Icon};
-use crate::markup::{self, Doc, Ink, Mark, Shape, ShapeKind, Stroke, Text, TextRaster, Tiles};
+use crate::markup::{self, Doc, Ink, Mark, PxRect, Shape, ShapeKind, Stroke, Text, TextRaster, Tiles};
 use crate::widgets::{
     self, dim_outside, divider, escape_for_app, icon_button, Note, Notifier, PopupClickGuard, ACCENT, BTN, BUTTON_HOVER, DIVIDER_W, GAP, GROUP_GAP, ICON,
     ICON_OFF, MIN_WINDOW_H, MIN_WINDOW_W, TOOLBAR_BG,
@@ -495,7 +495,7 @@ impl Snip {
 
             let painter = ui.painter();
             // Committed ink is already burned into the texture, exactly as it will be saved.
-            painter.image(canvas.tex.id(), img_rect, Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)), Color32::WHITE);
+            canvas.tex.paint(painter, img_rect, doc.size());
 
             let pointer = resp.interact_pointer_pos().or(resp.hover_pos());
             // Drags are noticed a few pixels after the button goes down; start where it went down.
@@ -1176,11 +1176,79 @@ fn unique_title<'a>(want: &str, taken: impl Iterator<Item = &'a str> + Clone) ->
     (2..).map(|n| format!("{want} ({n})")).find(|t| free(t)).unwrap_or_else(|| want.to_string())
 }
 
+/// The canvas texture, cut into pieces no wider or taller than the GPU takes (`max_texture_side`, as
+/// low as 8192 on some integrated GPUs; three 4K monitors side by side are 11520 wide). A picture
+/// that fits is one piece sharing `shown`'s pixels.
+// ceiling: neighbouring pieces are filtered separately, so a faint seam can show where they meet when
+// the snip is scaled; overlap the pieces by a pixel if anyone ever sees it.
+struct Chunks {
+    ctx: egui::Context,
+    /// Each piece and the image pixels it shows.
+    parts: Vec<(PxRect, TextureHandle)>,
+}
+
+impl Chunks {
+    fn new(ctx: &egui::Context, img: &Arc<ColorImage>) -> Self {
+        let mut chunks = Self { ctx: ctx.clone(), parts: Vec::new() };
+        chunks.set(img);
+        chunks
+    }
+
+    /// The pieces' rectangles for a picture of `size`: tile-aligned, so a tile run splits cleanly.
+    fn layout(&self, size: [usize; 2]) -> Vec<PxRect> {
+        let side = (self.ctx.input(|i| i.max_texture_side) / markup::TILE).max(1) * markup::TILE;
+        let mut out = Vec::new();
+        for y0 in (0..size[1].max(1)).step_by(side) {
+            for x0 in (0..size[0].max(1)).step_by(side) {
+                out.push(PxRect { x0, y0, x1: (x0 + side).min(size[0]), y1: (y0 + side).min(size[1]) });
+            }
+        }
+        out
+    }
+
+    /// Replaces the whole picture.
+    fn set(&mut self, img: &Arc<ColorImage>) {
+        let layout = self.layout(img.size);
+        let piece = |r: &PxRect| if layout.len() == 1 { egui::ImageData::Color(img.clone()) } else { markup::sub_image(img, r.x0, r.y0, r.x1 - r.x0, r.y1 - r.y0).into() };
+        if layout.len() == self.parts.len() && layout.iter().zip(&self.parts).all(|(a, (b, _))| a == b) {
+            for (r, tex) in &mut self.parts {
+                tex.set(piece(r), TextureOptions::LINEAR);
+            }
+        } else {
+            self.parts = layout.iter().map(|r| (*r, self.ctx.load_texture("snip", piece(r), TextureOptions::LINEAR))).collect();
+        }
+    }
+
+    /// Replaces the pixels from `at` on with `patch`, in whichever pieces they fall.
+    fn set_partial(&mut self, at: [usize; 2], patch: ColorImage) {
+        let r = PxRect { x0: at[0], y0: at[1], x1: at[0] + patch.size[0], y1: at[1] + patch.size[1] };
+        if let [(_, tex)] = self.parts.as_mut_slice() {
+            tex.set_partial(at, patch, TextureOptions::LINEAR);
+            return;
+        }
+        for (c, tex) in &mut self.parts {
+            let (x0, y0, x1, y1) = (r.x0.max(c.x0), r.y0.max(c.y0), r.x1.min(c.x1), r.y1.min(c.y1));
+            if x0 < x1 && y0 < y1 {
+                let piece = markup::sub_image(&patch, x0 - r.x0, y0 - r.y0, x1 - x0, y1 - y0);
+                tex.set_partial([x0 - c.x0, y0 - c.y0], piece, TextureOptions::LINEAR);
+            }
+        }
+    }
+
+    /// Draws the picture, `size` pixels, into `rect` (points).
+    fn paint(&self, painter: &egui::Painter, rect: Rect, size: [usize; 2]) {
+        let at = |x: usize, y: usize| rect.min + vec2(x as f32 / size[0] as f32 * rect.width(), y as f32 / size[1] as f32 * rect.height());
+        for (c, tex) in &self.parts {
+            painter.image(tex.id(), Rect::from_min_max(at(c.x0, c.y0), at(c.x1, c.y1)), Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)), Color32::WHITE);
+        }
+    }
+}
+
 /// The snip as shown: the picture with committed marks burned in by the same rasteriser that saves
 /// it. A mark still being drawn is painted over `shown` on the CPU, tile run by tile run, straight
 /// into the texture, so the preview is pixel for pixel what the mark will burn (multiply included).
 struct CanvasTex {
-    tex: TextureHandle,
+    tex: Chunks,
     /// The picture and its committed marks: exactly what copy and save write.
     shown: Arc<ColorImage>,
     /// `(image_rev, ink_rev)` of the doc that `shown` was built from.
@@ -1216,7 +1284,7 @@ impl CanvasTex {
     /// The canvas for `doc`, flattened in full.
     fn new(ctx: &egui::Context, doc: &Doc) -> Self {
         let shown = if doc.marks.is_empty() { doc.image.clone() } else { Arc::new(doc.flatten()) };
-        let tex = ctx.load_texture("snip", shown.clone(), TextureOptions::LINEAR);
+        let tex = Chunks::new(ctx, &shown);
         let live = Live::new(shown.size);
         Self { tex, shown, rev: (doc.image_rev, doc.ink_rev), burned: doc.marks.clone(), live, copying: None }
     }
@@ -1269,11 +1337,11 @@ impl CanvasTex {
             let shown = Arc::make_mut(&mut self.shown);
             for (r, patch) in doc.render_runs(&tiles) {
                 markup::paste(shown, &patch, r.pos());
-                self.tex.set_partial(r.pos(), patch, TextureOptions::LINEAR);
+                self.tex.set_partial(r.pos(), patch);
             }
         } else {
             self.shown = if doc.marks.is_empty() { doc.image.clone() } else { Arc::new(doc.flatten()) };
-            self.tex.set(self.shown.clone(), TextureOptions::LINEAR);
+            self.tex.set(&self.shown);
         }
         self.rev = rev;
         self.burned = doc.marks.clone();
@@ -1302,7 +1370,7 @@ impl CanvasTex {
                     self.live.patches.remove(&(first + i));
                 }
             }
-            self.tex.set_partial(r.pos(), patch, TextureOptions::LINEAR);
+            self.tex.set_partial(r.pos(), patch);
         }
     }
 
@@ -1351,7 +1419,7 @@ impl CanvasTex {
                 let mut patch = markup::sub_image(shown, r.x0, r.y0, r.x1 - r.x0, r.y1 - r.y0);
                 raster.paint(&mut patch, r.pos());
                 markup::paste(shown, &patch, r.pos());
-                self.tex.set_partial(r.pos(), patch, TextureOptions::LINEAR);
+                self.tex.set_partial(r.pos(), patch);
             }
             // Live tiles the mark no longer reaches go back to the picture.
             let stale = self.live.tiles.minus(&tiles);
@@ -1953,14 +2021,25 @@ Arc::ptr_eq(&snip.flattened(), &shown), "a current canvas is reused, not re-burn
     }
 
     impl Screen {
-        fn apply(&mut self, delta: &egui::TexturesDelta, id: Option<egui::TextureId>) {
-            let Some(id) = id else { return };
-            for d in delta.set.get(&id).into_iter().flatten() {
-                let egui::ImageData::Color(img) = &d.image;
-                match (d.pos, self.image.as_mut()) {
-                    (None, _) => self.image = Some((**img).clone()),
-                    (Some(at), Some(screen)) => markup::paste(screen, img, at),
-                    (Some(_), None) => panic!("partial upload before the texture exists"),
+        /// Applies the uploads to the canvas's texture pieces, each at its place in the picture.
+        fn apply(&mut self, delta: &egui::TexturesDelta, tex: Option<&Chunks>) {
+            let Some(tex) = tex else { return };
+            let size = tex.parts.iter().fold([0, 0], |s, (r, _)| [s[0].max(r.x1), s[1].max(r.y1)]);
+            for (c, t) in &tex.parts {
+                for d in delta.set.get(&t.id()).into_iter().flatten() {
+                    let egui::ImageData::Color(img) = &d.image;
+                    assert!(img.size[0] <= c.x1 - c.x0 && img.size[1] <= c.y1 - c.y0, "an upload larger than its piece");
+                    match (d.pos, self.image.as_mut()) {
+                        (None, screen) => {
+                            let screen = match screen {
+                                Some(s) if s.size == size => s,
+                                _ => self.image.insert(ColorImage::new(size, vec![Color32::TRANSPARENT; size[0] * size[1]])),
+                            };
+                            markup::paste(screen, img, c.pos());
+                        }
+                        (Some(at), Some(screen)) => markup::paste(screen, img, [c.x0 + at[0], c.y0 + at[1]]),
+                        (Some(_), None) => panic!("partial upload before the texture exists"),
+                    }
                 }
             }
         }
@@ -1977,7 +2056,7 @@ Arc::ptr_eq(&snip.flattened(), &shown), "a current canvas is reused, not re-burn
         let mut out = ctx.run_ui(input, |ui| {
             egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| snip.canvas(ui, &guard));
         });
-        screen.apply(&out.textures_delta, snip.texture.as_ref().map(|c| c.tex.id()));
+        screen.apply(&out.textures_delta, snip.texture.as_ref().map(|c| &c.tex));
         out.textures_delta.clear();
     }
 
@@ -2027,6 +2106,18 @@ Arc::ptr_eq(&snip.flattened(), &shown), "a current canvas is reused, not re-burn
             // A second stroke starting on the first keeps reading the picture as shown.
             drag_and_compare(&mut snip, &PATH[1..]);
         }
+    }
+
+    #[test]
+    fn a_snip_wider_than_the_gpu_allows_is_shown_in_pieces_exactly_as_saved() {
+        // Headless egui allows 2048 px a side; a 12000 x 2000 snip (three 4K monitors and more) needs six pieces.
+        let mut snip = Snip::new(gradient(12000, 2000), Tools { tool: Tool::Highlighter, ..Tools::default() });
+        drag_and_compare(&mut snip, &PATH);
+        let parts: Vec<PxRect> = snip.texture.as_ref().unwrap().tex.parts.iter().map(|(r, _)| *r).collect();
+        assert_eq!(parts.len(), 6, "{parts:?}");
+        assert!(parts.iter().all(|r| r.x1 - r.x0 <= 2048 && r.y1 - r.y0 <= 2048));
+        let s = &snip.doc.marks[0].bounds();
+        assert!(parts.iter().filter(|r| s.intersects(r.rect())).count() > 1, "the stroke crosses a seam between pieces");
     }
 
     #[test]
@@ -2123,7 +2214,8 @@ Arc::ptr_eq(&snip.flattened(), &shown), "a current canvas is reused, not re-burn
             canvas_frame(&ctx, &mut snip, &mut screen, vec![pointer(*path.last().unwrap(), false)]);
         }
         assert_eq!(snip.doc.marks.len(), 2);
-        let full = snip.texture.as_ref().map(|c| c.tex.id());
+        let ids = |s: &Snip| s.texture.as_ref().map(|c| c.tex.parts.iter().map(|(_, t)| t.id()).collect::<Vec<_>>());
+        let full = ids(&snip);
         snip.tools.tool = Tool::Eraser;
         canvas_frame(&ctx, &mut snip, &mut screen, vec![Event::PointerMoved(PATH[0]), pointer(PATH[0], true)]);
         canvas_frame(&ctx, &mut snip, &mut screen, vec![pointer(PATH[0], false)]);
@@ -2132,7 +2224,7 @@ Arc::ptr_eq(&snip.flattened(), &shown), "a current canvas is reused, not re-burn
         snip.step(false);
         canvas_frame(&ctx, &mut snip, &mut screen, vec![]);
         assert!(screen.pixels() == snip.doc.flatten().pixels, "undo shows the stroke again");
-        assert_eq!(snip.texture.as_ref().map(|c| c.tex.id()), full, "the same texture, patched rather than replaced");
+        assert_eq!(ids(&snip), full, "the same texture, patched rather than replaced");
         assert!(*snip.flattened() == snip.doc.flatten());
     }
 
@@ -2501,7 +2593,7 @@ Arc::ptr_eq(&snip.flattened(), &shown), "a current canvas is reused, not re-burn
             let mut out = ctx.run_ui(input, |ui| {
                 egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| snip.canvas(ui, &guard));
             });
-            screen.apply(&out.textures_delta, snip.texture.as_ref().map(|c| c.tex.id()));
+            screen.apply(&out.textures_delta, snip.texture.as_ref().map(|c| &c.tex));
             out.textures_delta.clear();
             out.platform_output.ime
         };
