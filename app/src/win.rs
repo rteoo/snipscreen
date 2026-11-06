@@ -225,11 +225,6 @@ pub fn window_corner(hwnd: HWND) -> Option<[i32; 2]> {
     }
 }
 
-/// Whether the window is shown (minimized counts as shown).
-pub fn is_visible(hwnd: HWND) -> bool {
-    unsafe { IsWindowVisible(hwnd) != 0 }
-}
-
 /// Un-minimizes the window without activating it, so a hotkey snip from another
 /// app can show its countdown without taking focus.
 pub fn restore_inactive(hwnd: HWND) {
@@ -490,12 +485,106 @@ pub fn become_dpi_aware() {
     unsafe { SetProcessDpiAwarenessContext(PER_MONITOR_AWARE_V2) };
 }
 
-/// Cloaks or uncloaks a window: a cloaked window may be shown, but DWM draws none of it and the
-/// taskbar and Alt+Tab leave it out. A start in the tray (`--tray`) cloaks the root window across
-/// eframe's show-after-the-first-frame, so nothing flashes.
+/// Cloaks or uncloaks a window: a cloaked window may be shown, but DWM draws none of it and clicks
+/// go through it. The taskbar keeps its button (see `set_taskbar_button`).
 pub fn cloak(hwnd: HWND, on: bool) {
     let value: i32 = on.into();
     unsafe { DwmSetWindowAttribute(hwnd, DWMWA_CLOAK as _, &value as *const i32 as *const c_void, size_of::<i32>() as u32) };
+}
+
+/// Whether DWM is keeping the window off the screen (our cloak, or another virtual desktop's).
+fn is_cloaked(hwnd: HWND) -> bool {
+    let mut value = 0u32;
+    let ok = unsafe { DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED as _, &mut value as *mut u32 as *mut c_void, size_of::<u32>() as u32) } == 0;
+    ok && value != 0
+}
+
+/// Blocks until DWM has composed the screen twice, so a window cloaked just before is gone from
+/// what a screen copy sees.
+pub fn wait_for_composition() {
+    use windows_sys::Win32::Graphics::Dwm::DwmFlush;
+    for _ in 0..2 {
+        if unsafe { DwmFlush() } != 0 {
+            // Composition is off or failed; give it a frame's worth of time instead.
+            std::thread::sleep(std::time::Duration::from_millis(17));
+        }
+    }
+}
+
+/// `ITaskbarList`'s vtable: `IUnknown`, then `HrInit`, `AddTab`, `DeleteTab`, …
+#[repr(C)]
+struct TaskbarListVtbl {
+    query_interface: usize,
+    add_ref: usize,
+    release: usize,
+    hr_init: unsafe extern "system" fn(*mut c_void) -> i32,
+    add_tab: unsafe extern "system" fn(*mut c_void, HWND) -> i32,
+    delete_tab: unsafe extern "system" fn(*mut c_void, HWND) -> i32,
+}
+
+thread_local! {
+    /// The shell's taskbar list, made once per thread; null when it couldn't be (no Explorer).
+    static TASKBAR: std::cell::Cell<*mut *const TaskbarListVtbl> = const { std::cell::Cell::new(null_mut()) };
+}
+
+/// Shows or removes the window's taskbar button without touching its styles (the shell keeps a
+/// cloaked window's button). Explorer forgets a removal when it restarts; call again after
+/// `TaskbarCreated`. Call on the window's own thread, which has COM up (winit's UI thread does).
+pub fn set_taskbar_button(hwnd: HWND, on: bool) {
+    use windows_sys::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
+    use windows_sys::Win32::UI::Shell::TaskbarList;
+    const IID_ITASKBARLIST: windows_sys::core::GUID = windows_sys::core::GUID::from_u128(0x56fdf342_fd6d_11d0_958a_006097c9a090);
+    TASKBAR.with(|cell| unsafe {
+        if cell.get().is_null() {
+            let mut list: *mut *const TaskbarListVtbl = null_mut();
+            if CoCreateInstance(&TaskbarList, null_mut(), CLSCTX_INPROC_SERVER, &IID_ITASKBARLIST, &mut list as *mut _ as *mut *mut c_void) != 0 || list.is_null() {
+                return;
+            }
+            if ((**list).hr_init)(list as *mut c_void) != 0 {
+                return;
+            }
+            cell.set(list);
+        }
+        let list = cell.get();
+        if on {
+            ((**list).add_tab)(list as *mut c_void, hwnd);
+        } else {
+            ((**list).delete_tab)(list as *mut c_void, hwnd);
+        }
+    });
+}
+
+pub fn is_foreground(hwnd: HWND) -> bool {
+    unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow() == hwnd }
+}
+
+/// Passes the foreground from `hwnd`, which is shown but cloaked, to the window below it that a
+/// person can see and use, the way Windows does when the foreground window is hidden; the
+/// desktop when there is none. Hiding would do this for us, but it would also stop eframe
+/// repainting the window promptly.
+pub fn activate_next(hwnd: HWND) {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetShellWindow, GetWindow, SetForegroundWindow, GW_HWNDNEXT, GW_OWNER, WS_EX_NOACTIVATE};
+    unsafe {
+        let usable = |w: HWND| {
+            let ex = GetWindowLongW(w, GWL_EXSTYLE) as u32;
+            let mut r: RECT = zeroed();
+            IsWindowVisible(w) != 0
+                && IsWindowEnabled(w) != 0
+                && IsIconic(w) == 0
+                && !is_cloaked(w)
+                && ex & (WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW) == 0
+                && GetWindow(w, GW_OWNER).is_null()
+                && GetWindowRect(w, &mut r) != 0
+                && r.right > r.left
+                && r.bottom > r.top
+        };
+        let mut next = GetWindow(hwnd, GW_HWNDNEXT);
+        while !next.is_null() && !usable(next) {
+            next = GetWindow(next, GW_HWNDNEXT);
+        }
+        SetForegroundWindow(if next.is_null() { GetShellWindow() } else { next });
+    }
 }
 
 /// A string value under `HKEY_CURRENT_USER\subkey`; `None` when it (or the key) doesn't exist.

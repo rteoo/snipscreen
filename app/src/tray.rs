@@ -134,6 +134,8 @@ pub enum Event {
     Recorded(Option<Hotkey>),
     /// Settings… in the tray menu.
     Settings,
+    /// Explorer (re)started and rebuilt the taskbar.
+    TaskbarCreated,
 }
 
 /// True when this is the only running copy. The mutex lives as long as the process.
@@ -533,10 +535,13 @@ unsafe extern "system" fn agent_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM)
                 add_tray_icon(hwnd, st);
             }
         }
-        // Only when an icon was asked for: one that was added, or one still being retried.
-        _ if msg == st.taskbar_created && st.taskbar_created != 0 && (st.tray_added || st.tray_retries > 0) => {
-            st.tray_retries = 0;
-            add_tray_icon(hwnd, st);
+        _ if msg == st.taskbar_created && st.taskbar_created != 0 => {
+            // Only when an icon was asked for: one that was added, or one still being retried.
+            if st.tray_added || st.tray_retries > 0 {
+                st.tray_retries = 0;
+                add_tray_icon(hwnd, st);
+            }
+            (st.on_event)(Event::TaskbarCreated);
         }
         WM_QUERYENDSESSION => return 1,
         // Windows is signing out, or the installer's Restart Manager wants the file: leave cleanly.

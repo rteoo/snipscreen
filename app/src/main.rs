@@ -32,8 +32,6 @@ use windows_sys::Win32::Foundation::HWND;
 
 /// The home window: a toolbar to start a capture over an empty canvas.
 const HOME_SIZE: Vec2 = vec2(620.0, 330.0);
-/// Time for the window's hide animation to finish before the screen is copied.
-const HIDE_SETTLE: Duration = Duration::from_millis(250);
 
 impl Shape_ {
     const ALL: [Shape_; 4] = [Shape_::Rectangle, Shape_::Window, Shape_::FullScreen, Shape_::Freeform];
@@ -84,6 +82,8 @@ struct Picker {
     outline: Vec<Pos2>,
     /// Screen pixels the window's drawing area must cover: x, y, w, h.
     target: [i32; 4],
+    /// The window covered `target` when a pass began, so what it painted is the picker.
+    fitted: bool,
     shown: bool,
     tries: u8,
     /// Monitor under the mouse when picking began, in image pixels; the
@@ -189,8 +189,16 @@ struct App {
     /// The agent is running, so the app lives in the tray: closing the home window only hides it.
     resident: bool,
     /// Started out of sight (`--tray`): eframe shows the root window once its first frame is painted,
-    /// so it stays cloaked until that show has been undone.
+    /// which puts its taskbar button back; see `HiddenStart`.
     hidden_start: HiddenStart,
+    /// The root window is out of sight: cloaked and off the taskbar, but still shown as far as
+    /// eframe knows, so events reach `logic` at once (eframe holds back a hidden window's repaints
+    /// by 100 ms or more, and its timers with them). See `conceal`.
+    concealed: bool,
+    /// Passes left before an uncloak that waits for the window's new shape to be painted.
+    reveal_in: u8,
+    /// When to take the taskbar button off again after Explorer restarted (it re-adds buttons).
+    retab_at: Option<Instant>,
     note: Option<Note>,
     /// Window corner before the picker took over the screen, in pixels.
     restore_corner: Option<[i32; 2]>,
@@ -239,6 +247,7 @@ impl App {
         let (snip_tx, snip_rx) = channel();
         let hidden = boot.as_ref().is_some_and(|b| b.starts_hidden());
         if hidden {
+            // Before eframe's show after the first frame; `HiddenStart` takes the taskbar button off.
             win::cloak(hwnd as HWND, true);
         }
         let (agent, agent_rx, hotkey, hotkey_note, intent) = match boot {
@@ -277,6 +286,9 @@ impl App {
             quitting: false,
             resident: false,
             hidden_start: if hidden { HiddenStart::FirstFrame } else { HiddenStart::Done },
+            concealed: hidden,
+            reveal_in: 0,
+            retab_at: None,
             note: None,
             restore_corner: None,
             settle: 0,
@@ -339,9 +351,7 @@ impl App {
         // Pressing New / Ctrl+N / the hotkey during the countdown starts it over.
         self.stage = Stage::Counting { end: Instant::now() + Duration::from_secs(delay) };
         // The countdown shows in the home window, even when it had been closed.
-        if !self.home_visible {
-            ctx.send_viewport_cmd(ViewportCommand::Visible(true));
-        }
+        self.reveal();
         // On top and un-minimized without taking focus, so a hotkey snip from
         // another app still shows the countdown without disturbing what is on screen.
         win::restore_inactive(self.hwnd as HWND);
@@ -362,17 +372,24 @@ impl App {
         }
     }
 
-    /// Hides the window, waits for its hide animation, then copies the screen.
+    /// Conceals the window, then copies the screen.
     fn hide_and_grab(&mut self, ctx: &egui::Context) {
         self.restore_corner = win::window_corner(self.hwnd as HWND);
-        // A snip from the tray has no window to wait for.
-        let settle = if win::is_visible(self.hwnd as HWND) { HIDE_SETTLE } else { Duration::ZERO };
-        ctx.send_viewport_cmd(ViewportCommand::Visible(false));
+        // Cloaking has no animation: once DWM has composed the screen without the window, it is out
+        // of the copy. A snip from the tray has no window to wait for.
+        let on_screen = !self.concealed;
+        self.conceal();
         self.stage = Stage::Waiting;
         self.sync_escape_hotkey();
         let (tx, ctx) = (self.grab_tx.clone(), ctx.clone());
         std::thread::spawn(move || {
-            std::thread::sleep(settle);
+            if on_screen {
+                win::wait_for_composition();
+            }
+            // ceiling: one GDI copy of the whole virtual screen, most of a shortcut snip's wait:
+            // ~80-110 ms at 6400x1447, and on a hybrid-GPU laptop DWM then holds our next frame
+            // ~100 ms more. A per-monitor Windows.Graphics.Capture copy (DXGI duplication hands
+            // over nothing on a still screen) if shortcut-to-picker has to get under 100 ms.
             let _ = tx.send(win::grab_screen());
             wake_root(&ctx);
         });
@@ -432,7 +449,7 @@ impl App {
         let target = [grab.origin[0], grab.origin[1], grab.image.size[0] as i32, grab.image.size[1] as i32];
         let [mx, my, mw, mh] = win::monitor_at_cursor();
         let home = [mx - grab.origin[0], my - grab.origin[1], mw, mh];
-        self.stage = Stage::Picking(Box::new(Picker { home, grab, texture, start: None, outline: Vec::new(), target, shown: false, tries: 0 }));
+        self.stage = Stage::Picking(Box::new(Picker { home, grab, texture, start: None, outline: Vec::new(), target, fitted: false, shown: false, tries: 0 }));
         ctx.request_repaint();
     }
 
@@ -444,13 +461,90 @@ impl App {
         }
         let [x, y, w, h] = pk.target;
         if win::fit_client(self.hwnd as HWND, x, y, w, h) || pk.tries > 30 {
+            // Uncloaked one pass later: the pass that starts fitted paints the frozen screen at its
+            // real size, so the uncloak never shows the home window stretched over the screen.
+            if !pk.fitted {
+                pk.fitted = true;
+                ctx.request_repaint();
+                return;
+            }
             pk.shown = true;
-            for cmd in [ViewportCommand::Minimized(false), ViewportCommand::Visible(true), ViewportCommand::Focus] {
+            self.reveal();
+            for cmd in [ViewportCommand::Minimized(false), ViewportCommand::Focus] {
                 ctx.send_viewport_cmd(cmd);
             }
         } else {
             pk.tries += 1;
             ctx.request_repaint_after(Duration::from_millis(10));
+        }
+    }
+
+    /// Takes the root window out of sight without hiding it: cloaked (DWM draws none of it and
+    /// clicks go through), off the taskbar, and, from the next pass, without the foreground.
+    fn conceal(&mut self) {
+        if !self.concealed {
+            self.concealed = true;
+            self.reveal_in = 0;
+            win::cloak(self.hwnd as HWND, true);
+            win::set_taskbar_button(self.hwnd as HWND, false);
+        }
+    }
+
+    /// Puts a concealed root window back on screen and on the taskbar, as it was last painted.
+    fn reveal(&mut self) {
+        if self.concealed {
+            self.concealed = false;
+            self.reveal_in = 0;
+            win::set_taskbar_button(self.hwnd as HWND, true);
+            win::cloak(self.hwnd as HWND, false);
+        }
+    }
+
+    /// Once per pass: what a concealed window needs that `conceal` alone can't give it.
+    fn keep_concealed(&mut self, ctx: &egui::Context) {
+        let hwnd = self.hwnd as HWND;
+        if self.hidden_start == HiddenStart::Painted {
+            self.hidden_start = HiddenStart::Done;
+            if self.concealed {
+                win::set_taskbar_button(hwnd, false);
+            }
+        }
+        if self.reveal_in > 0 {
+            self.reveal_in -= 1;
+            if self.reveal_in == 0 {
+                self.reveal();
+            } else {
+                ctx.request_repaint();
+            }
+        }
+        if let Some(at) = self.retab_at {
+            let now = Instant::now();
+            if now >= at {
+                self.retab_at = None;
+                if self.concealed {
+                    win::set_taskbar_button(hwnd, false);
+                }
+            } else {
+                ctx.request_repaint_after(at - now);
+            }
+        }
+        // A hidden window would have handed the foreground on; a cloaked one keeps it (after the
+        // picker, the close button, or Windows activating it when another window closes), and the
+        // person's keys would go to a window they can't see. Checked after eframe has applied this
+        // window's commands, some of which re-show (and can re-activate) it. While a capture is
+        // under way the window is about to come back, and takes focus itself when it does.
+        if self.concealed && matches!(self.stage, Stage::Idle) && win::is_foreground(hwnd) {
+            win::activate_next(hwnd);
+        }
+    }
+
+    /// Explorer restarted: it, and winit, put a taskbar button back on every window. Taken off now,
+    /// and again a moment later in case winit's own re-add lands after this.
+    fn on_taskbar_created(&mut self, ctx: &egui::Context) {
+        if self.concealed {
+            win::set_taskbar_button(self.hwnd as HWND, false);
+            self.retab_at = Some(Instant::now() + Duration::from_secs(2));
+            ctx.request_repaint_after(Duration::from_secs(2));
         }
     }
 
@@ -461,11 +555,12 @@ impl App {
             ctx.send_viewport_cmd(cmd);
         }
         if self.home_visible {
-            for cmd in [ViewportCommand::Minimized(false), ViewportCommand::Visible(true), ViewportCommand::Focus] {
+            self.reveal();
+            for cmd in [ViewportCommand::Minimized(false), ViewportCommand::Focus] {
                 ctx.send_viewport_cmd(cmd);
             }
         } else {
-            ctx.send_viewport_cmd(ViewportCommand::Visible(false));
+            self.conceal();
         }
     }
 
@@ -479,7 +574,7 @@ impl App {
         match self.stage {
             Stage::Idle => {
                 self.home_visible = false;
-                ctx.send_viewport_cmd(ViewportCommand::Visible(false));
+                self.conceal();
             }
             Stage::Counting { .. } => {
                 self.home_visible = false;
@@ -792,10 +887,7 @@ impl eframe::App for App {
     }
 
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if self.hidden_start == HiddenStart::Painted {
-            win::cloak(self.hwnd as HWND, false);
-            self.hidden_start = HiddenStart::Done;
-        }
+        self.keep_concealed(ctx);
         self.on_home_close(ctx);
         while let Ok(msg) = self.bg_rx.try_recv() {
             self.say(ctx, msg);
@@ -812,6 +904,7 @@ impl eframe::App for App {
                 tray::Event::HotkeySet(result) => self.on_hotkey_set(ctx, result),
                 tray::Event::Recorded(caught) => self.on_recorded(ctx, caught),
                 tray::Event::Settings => self.open_settings(ctx),
+                tray::Event::TaskbarCreated => self.on_taskbar_created(ctx),
             }
         }
         self.poll_settings_window(ctx);
@@ -836,9 +929,8 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         if self.hidden_start == HiddenStart::FirstFrame {
-            // Processed right after eframe's first-frame show, which the cloak keeps off the screen
-            // (and `with_active(false)` keeps from taking focus).
-            ctx.send_viewport_cmd(ViewportCommand::Visible(false));
+            // eframe shows the window right after this pass; the cloak keeps it off the screen (and
+            // `with_active(false)` keeps it from taking focus).
             self.hidden_start = HiddenStart::Painted;
             ctx.request_repaint();
         }
@@ -1195,10 +1287,14 @@ impl App {
             ViewportCommand::Resizable(false),
             ViewportCommand::WindowLevel(WindowLevel::AlwaysOnTop),
             ViewportCommand::Minimized(false),
-            ViewportCommand::Visible(true),
             ViewportCommand::Focus,
         ] {
             ctx.send_viewport_cmd(cmd);
+        }
+        // Straight from the tray the window is still the cloaked home window: uncloaked once the bar
+        // has been laid out and painted (`rec_bar_ui` fits it on the first pass).
+        if self.concealed {
+            self.reveal_in = 3;
         }
         ctx.request_repaint();
     }
@@ -1493,7 +1589,8 @@ fn no_window_left(resident: bool, home_visible: bool, no_editors: bool, idle: bo
 enum HiddenStart {
     /// The first frame hasn't been painted yet; eframe shows the window right after it.
     FirstFrame,
-    /// Painted, shown by eframe while cloaked, and hidden again. Uncloak on the next pass.
+    /// Painted and shown by eframe while cloaked, which gave it a taskbar button; the next pass
+    /// takes the button off if the window is still concealed.
     Painted,
     Done,
 }
@@ -1656,10 +1753,6 @@ fn start_resident(intent: tray::Intent, hotkey: Hotkey) -> Option<Boot> {
     let waker: Arc<OnceLock<egui::Context>> = Arc::new(OnceLock::new());
     let (tx, events) = channel();
     let w = waker.clone();
-    // ceiling: eframe holds back every repaint of a hidden window by >= 100 ms
-    // (INVISIBLE_WINDOW_REPAINT_INTERVAL), so a shortcut, tray click or notification click reaches
-    // `logic` ~100 ms late while the home window is closed. Keeping the root window shown but
-    // cloaked (and off the taskbar) while "hidden" would remove that, if the delay ever matters.
     let wake = move |e| {
         let _ = tx.send(e);
         if let Some(ctx) = w.get() {
