@@ -280,6 +280,11 @@ impl Text {
         let halo = self.halo();
         let mut cache = GLYPHS.lock().unwrap_or_else(PoisonError::into_inner);
         self.lay_out(&font, |id, x, baseline| {
+            // Far past any picture (a long pasted line at a big size): left out, as it can't show,
+            // and before its 1/256 px origin outgrows an i32.
+            if x.abs() > MAX_ORIGIN || baseline.abs() > MAX_ORIGIN {
+                return;
+            }
             let edges = cache.get(&font, id, self.size, halo);
             if edges.bbox[0] <= edges.bbox[2] {
                 out.push(Placed { edges, at: [fixed(x), fixed(baseline)] });
@@ -296,6 +301,10 @@ impl Text {
 
 /// Precision of glyph edges: 1/256 of a pixel, as FreeType keeps them.
 const SUB: i32 = 256;
+/// Glyphs placed farther than this many pixels from the picture's corner are dropped. In 1/256 px
+/// it is half of what an i32 holds, which leaves room for the glyph's own edges (well under 1M px
+/// even at the largest text size and zoom).
+const MAX_ORIGIN: f32 = (1 << 22) as f32;
 /// How far a flattened curve may stray from the true one, in pixels (vello's tolerance, which drew text before).
 const FLATNESS: f64 = 0.25;
 
@@ -2034,6 +2043,24 @@ mod tests {
         burn(&mut a, &Mark::Text(with));
         burn(&mut b, &Mark::Text(without));
         assert!(a.pixels == b.pixels, "and draws nothing");
+    }
+
+    #[test]
+    fn a_line_running_millions_of_pixels_past_the_picture_is_cut_short_not_a_panic() {
+        // A long paste at a big size: past ~8.4M px a 1/256 px origin no longer fits an i32.
+        let mut t = Text { text: "W".repeat(6000), color: Color32::RED, size: 2000.0, outline: true, pos: Pos2::ZERO };
+        // Baseline across the middle of the picture, so the first letter shows.
+        t.pos = Pos2::new(-200.0, 128.0 - t.line_metrics(&Text::font().unwrap()).ascent);
+        assert!(t.caret().x > 1.0e7, "the line does run that far");
+        let burn = |t: &Text| {
+            let mut d = Doc::new(white(256, 256));
+            d.add_mark(t.clone());
+            d.flatten()
+        };
+        let out = burn(&t);
+        assert!(out.pixels.iter().any(|&p| p != Color32::WHITE), "its start still shows");
+        assert!(out == burn(&Text { text: "WW".into(), ..t.clone() }), "exactly as the start of the line alone");
+        assert!(t.bounds().max.x <= MAX_ORIGIN + 4000.0);
     }
 
     #[test]
