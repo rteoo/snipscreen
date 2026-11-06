@@ -271,8 +271,10 @@ pub struct Editor {
     note: Option<Note>,
     note_tx: Sender<String>,
     note_rx: Receiver<String>,
-    /// The New button's tooltip, kept current by the shell (it knows the capture mode and hotkey).
+    /// The New button's tooltip, copied each frame from `shared_tip`, which the shell keeps current (it
+    /// knows the capture mode and hotkey).
     new_tip: String,
+    shared_tip: Arc<Mutex<String>>,
     /// New button or Ctrl+N pressed; the shell starts the capture.
     new_requested: bool,
     /// The window's close button was pressed; the shell drops this editor.
@@ -645,7 +647,7 @@ impl Snip {
 }
 
 impl Editor {
-    fn new(content: Content, title: String, viewport: ViewportId, root_hwnd: isize, place: Option<[i32; 2]>, new_tip: String, min_width: f32) -> Self {
+    fn new(content: Content, title: String, viewport: ViewportId, root_hwnd: isize, place: Option<[i32; 2]>, shared_tip: Arc<Mutex<String>>, min_width: f32) -> Self {
         let (note_tx, note_rx) = channel();
         Self {
             content,
@@ -662,7 +664,8 @@ impl Editor {
             note: None,
             note_tx,
             note_rx,
-            new_tip,
+            new_tip: String::new(),
+            shared_tip,
             new_requested: false,
             closed: false,
         }
@@ -694,6 +697,12 @@ impl Editor {
         }
         while let Ok(msg) = self.note_rx.try_recv() {
             self.say(msg);
+        }
+        // The shell holds this lock only to replace the string, so a busy one just waits for the next frame.
+        if let Ok(tip) = self.shared_tip.try_lock() {
+            if *tip != self.new_tip {
+                self.new_tip.clone_from(&tip);
+            }
         }
         self.attach_title_bar(&ctx);
         self.settle_window(&ctx);
@@ -985,6 +994,8 @@ struct Slot {
     title: String,
     builder: ViewportBuilder,
     editor: Arc<Mutex<Editor>>,
+    /// The editor's toast channel, so the shell can reach it without taking the editor's lock.
+    note_tx: Sender<String>,
 }
 
 /// All open editor windows, oldest first.
@@ -992,7 +1003,8 @@ pub struct Editors {
     slots: Vec<Slot>,
     next: u64,
     icon: Option<Arc<egui::IconData>>,
-    new_tip: String,
+    /// The New buttons' tooltip, shared with every editor.
+    new_tip: Arc<Mutex<String>>,
 }
 
 /// What the editor windows asked of the shell since the last `Editors::poll`.
@@ -1004,7 +1016,7 @@ pub struct Requests {
 
 impl Editors {
     pub fn new(icon: Option<Arc<egui::IconData>>) -> Self {
-        Self { slots: Vec::new(), next: 0, icon, new_tip: String::new() }
+        Self { slots: Vec::new(), next: 0, icon, new_tip: Arc::default() }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -1016,10 +1028,12 @@ impl Editors {
         self.slots.iter().map(|s| s.id).collect()
     }
 
-    /// Runs `f` on the editor in window `id`, if it is still open.
+    /// Runs `f` on the editor in window `id`, if it is still open and not in the middle of a frame.
+    /// The root never waits on an editor: windows run on this same thread, so a busy lock means a
+    /// re-entry that waiting would deadlock.
     pub fn with<R>(&self, id: ViewportId, f: impl FnOnce(&mut Editor) -> R) -> Option<R> {
         let slot = self.slots.iter().find(|s| s.id == id)?;
-        let mut ed = slot.editor.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut ed = slot.editor.try_lock().ok()?;
         Some(f(&mut ed))
     }
 
@@ -1067,7 +1081,8 @@ impl Editors {
         });
         let editor = Editor::new(content, title.clone(), id, root_hwnd, corner, self.new_tip.clone(), min_w);
         let report = editor.notifier(ctx);
-        self.slots.push(Slot { id, title, builder, editor: Arc::new(Mutex::new(editor)) });
+        let note_tx = editor.note_tx.clone();
+        self.slots.push(Slot { id, title, builder, editor: Arc::new(Mutex::new(editor)), note_tx });
         ctx.request_repaint_of(id);
         (id, report)
     }
@@ -1099,22 +1114,19 @@ impl Editors {
         req
     }
 
-    /// Keeps every New button's tooltip in step with the shell's capture mode and hotkey.
+    /// Keeps every New button's tooltip in step with the shell's capture mode and hotkey. Each editor
+    /// picks the new text up on its next frame.
     pub fn set_new_tip(&mut self, tip: String) {
-        if tip == self.new_tip {
-            return;
+        let mut shared = self.new_tip.lock().unwrap_or_else(PoisonError::into_inner);
+        if *shared != tip {
+            *shared = tip;
         }
-        for slot in &self.slots {
-            slot.editor.lock().unwrap_or_else(PoisonError::into_inner).new_tip = tip.clone();
-        }
-        self.new_tip = tip;
     }
 
     /// The toast of the newest editor window; `None` when none is open.
     pub fn newest_notifier(&self, ctx: &egui::Context) -> Option<Notifier> {
         let slot = self.slots.last()?;
-        let ed = slot.editor.lock().unwrap_or_else(PoisonError::into_inner);
-        Some(ed.notifier(ctx))
+        Some(Notifier::new(slot.note_tx.clone(), ctx.clone(), slot.id))
     }
 }
 
@@ -2098,7 +2110,7 @@ Arc::ptr_eq(&snip.flattened(), &shown), "a current canvas is reused, not re-burn
     fn esc_drops_the_draft_empty_text_is_never_placed_and_a_crop_places_it_first() {
         let ctx = egui::Context::default();
         let fresh = Snip::new(white(300, 200), Tools { tool: Tool::Text, ..Tools::default() });
-        let mut ed = Editor::new(Content::Snip(Box::new(fresh)), "t".into(), ViewportId::ROOT, 0, None, String::new(), MIN_EDIT_W);
+        let mut ed = Editor::new(Content::Snip(Box::new(fresh)), "t".into(), ViewportId::ROOT, 0, None, Default::default(), MIN_EDIT_W);
         let mut screen = Screen { image: None };
         fn snip(ed: &mut Editor) -> &mut Snip {
             match &mut ed.content {
@@ -2260,12 +2272,30 @@ Arc::ptr_eq(&snip.flattened(), &shown), "a current canvas is reused, not re-burn
     }
 
     #[test]
+    fn the_shell_never_waits_on_an_editor_mid_frame() {
+        let ctx = egui::Context::default();
+        let mut editors = Editors::new(None);
+        let (a, _, _) = editors.open_snip(&ctx, white(10, 10), 0, None);
+        // Hold the editor as its own frame would; on this thread a blocking lock would never return.
+        let held = editors.slots[0].editor.clone();
+        let guard = held.lock().unwrap();
+        editors.set_new_tip("New snip (Alt+Shift+S)".into());
+        editors.newest_notifier(&ctx).expect("a notifier without the lock").send("Saved".into());
+        assert!(editors.with(a, |_| ()).is_none(), "a busy editor is skipped, not waited for");
+        assert_eq!(editors.poll(), Requests::default());
+        drop(guard);
+        frame(&ctx, &editors, vec![]);
+        assert_eq!(editors.with(a, |e| (e.new_tip.clone(), e.note.as_ref().map(|n| n.msg.clone()))).unwrap(), ("New snip (Alt+Shift+S)".to_string(), Some("Saved".to_string())));
+    }
+
+    #[test]
     fn new_button_tooltips_follow_the_shell() {
         let ctx = egui::Context::default();
         let mut editors = Editors::new(None);
         let (a, _, _) = editors.open_snip(&ctx, white(10, 10), 0, None);
         editors.set_new_tip("New recording (Ctrl+N)".into());
         let (b, _, _) = editors.open_snip(&ctx, white(10, 10), 0, None);
+        frame(&ctx, &editors, vec![]);
         for id in [a, b] {
             assert_eq!(editors.with(id, |e| e.new_tip.clone()).unwrap(), "New recording (Ctrl+N)");
         }
@@ -2275,7 +2305,7 @@ Arc::ptr_eq(&snip.flattened(), &shown), "a current canvas is reused, not re-burn
     fn typing(typed: &str) -> (egui::Context, Editor, Screen) {
         let ctx = egui::Context::default();
         let fresh = Snip::new(gradient(300, 200), Tools { tool: Tool::Text, ..Tools::default() });
-        let mut ed = Editor::new(Content::Snip(Box::new(fresh)), "t".into(), ViewportId::ROOT, 0, None, String::new(), MIN_EDIT_W);
+        let mut ed = Editor::new(Content::Snip(Box::new(fresh)), "t".into(), ViewportId::ROOT, 0, None, Default::default(), MIN_EDIT_W);
         let mut screen = Screen { image: None };
         let at = pos2(640.0, 400.0);
         for events in [vec![], vec![Event::PointerMoved(at), pointer(at, true)], vec![pointer(at, false)]] {
