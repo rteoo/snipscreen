@@ -517,8 +517,7 @@ impl Snip {
                     if resp.drag_stopped() {
                         *crop_drag = None;
                     }
-                    let held = crop_drag.map(|(g, _, _)| g).or_else(
-|| resp.hover_pos().and_then(|p| grip_at(frame_pt, p, GRIP_REACH)));
+                    let held = crop_drag.map(|(g, _, _)| g).or_else(|| resp.hover_pos().and_then(|p| grip_at(frame_pt, p, GRIP_REACH)));
                     if let Some(g) = held {
                         ctx.set_cursor_icon(g.cursor());
                     }

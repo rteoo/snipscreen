@@ -996,7 +996,6 @@ fn cover_segments(cover: &mut [f32], r: PxRect, segments: impl Iterator<Item = (
                     *slot = c;
                 }
             }
-
         }
     }
 }
