@@ -669,8 +669,13 @@ impl Snip {
             }
             // An erase above changed the doc after the first sync: show it in this same frame.
             canvas.sync(doc);
-            if drawing.is_some() {
-                canvas.own_picture();
+            // A pen or highlighter press always ends in a mark, a click too, so the copy starts then.
+            let pressing_ink = resp.is_pointer_button_down_on() && matches!(tools.tool, Tool::Pen | Tool::Highlighter) && crop.is_none();
+            if drawing.is_some() || pressing_ink {
+                canvas.own_picture(drawing.is_some());
+            } else if !resp.is_pointer_button_down_on() {
+                // A copy started for a press that drew nothing (it only closed a popup) isn't kept.
+                canvas.copying = None;
             }
             match drawing {
                 Some(Mark::Text(t)) if !draft.preedit.is_empty() => canvas.show_live(&Mark::Text(with_preedit(t, &draft.preedit))),
@@ -1355,10 +1360,13 @@ impl CanvasTex {
     /// Makes sure `shown` will be this canvas's own when the mark being drawn is burned into it. Until
     /// the first mark it is the doc's bare picture (which undo needs untouched), and a copy or save
     /// worker may still hold it; copying 33 MB of 4K picture then would stall the mouse-up, so the copy
-    /// is made on a worker while the mark is drawn and adopted once it is ready.
-    fn own_picture(&mut self) {
+    /// is made on a worker from the press on (a click is a mark too) and adopted once it is ready, if
+    /// `adopt` (a mark is being drawn).
+    fn own_picture(&mut self, adopt: bool) {
         if self.copying.is_some() {
-            self.adopt_copy();
+            if adopt {
+                self.adopt_copy(false);
+            }
         } else if Arc::strong_count(&self.shown) > 1 {
             let (tx, rx) = channel();
             let from = self.shown.clone();
@@ -1370,10 +1378,12 @@ impl CanvasTex {
         }
     }
 
-    /// Takes the copy `own_picture` started, if it is ready and still of the picture shown.
-    fn adopt_copy(&mut self) {
+    /// Takes the copy `own_picture` started, if it is ready (or, with `wait`, once it is: it is
+    /// already under way, and sooner done than a copy made from scratch) and still of the picture shown.
+    fn adopt_copy(&mut self, wait: bool) {
         if let Some((from, rx)) = &self.copying {
-            match rx.try_recv() {
+            let copy = if wait { rx.recv().map_err(|_| std::sync::mpsc::TryRecvError::Disconnected) } else { rx.try_recv() };
+            match copy {
                 Ok(copy) => {
                     if Arc::ptr_eq(from, &self.shown) {
                         self.shown = Arc::new(copy);
@@ -1464,8 +1474,8 @@ impl CanvasTex {
         if current {
             let mut tiles = Tiles::new(size);
             m.footprint(&mut tiles);
-            // Takes the copy made while the mark was drawn if it is ready; otherwise `make_mut` copies here.
-            self.adopt_copy();
+            // Takes the copy made while the mark was drawn; without one `make_mut` copies here.
+            self.adopt_copy(true);
             self.copying = None;
             let shown = Arc::make_mut(&mut self.shown);
             let cols = size[0].div_ceil(markup::TILE);
@@ -2525,6 +2535,30 @@ Arc::ptr_eq(&snip.flattened(), &shown), "a current canvas is reused, not re-burn
         assert_eq!(snip.texture.as_ref().map(|c| Arc::as_ptr(&c.shown)).unwrap(), own, "the mark went into the copy made while drawing");
         assert!(screen.pixels() == snip.doc.flatten().pixels);
         assert_eq!(*snip.doc.image, gradient(300, 200), "the doc's picture is untouched");
+    }
+
+    #[test]
+    fn a_click_dot_takes_the_copy_started_at_the_press() {
+        let ctx = egui::Context::default();
+        let mut snip = Snip::new(gradient(300, 200), Tools::default());
+        let mut screen = Screen { image: None };
+        canvas_frame(&ctx, &mut snip, &mut screen, vec![]);
+        let at = pos2(640.0, 400.0);
+        canvas_frame(&ctx, &mut snip, &mut screen, vec![Event::PointerMoved(at), pointer(at, true)]);
+        assert!(snip.texture.as_ref().unwrap().copying.is_some(), "the copy starts on the press, before egui knows it's a click");
+        canvas_frame(&ctx, &mut snip, &mut screen, vec![pointer(at, false)]);
+        let canvas = snip.texture.as_ref().unwrap();
+        assert!(canvas.copying.is_none() && !Arc::ptr_eq(&canvas.shown, &snip.doc.image));
+        assert_eq!(snip.doc.marks.len(), 1, "the click drew a dot");
+        assert!(screen.pixels() == snip.doc.flatten().pixels);
+        assert_eq!(*snip.doc.image, gradient(300, 200), "the doc's picture is untouched");
+        // A press with a tool that draws nothing on a click starts no copy.
+        let mut snip = Snip::new(gradient(300, 200), Tools { tool: Tool::Shape, ..Tools::default() });
+        canvas_frame(&ctx, &mut snip, &mut screen, vec![]);
+        canvas_frame(&ctx, &mut snip, &mut screen, vec![Event::PointerMoved(at), pointer(at, true)]);
+        assert!(snip.texture.as_ref().unwrap().copying.is_none());
+        canvas_frame(&ctx, &mut snip, &mut screen, vec![pointer(at, false)]);
+        assert!(Arc::ptr_eq(&snip.texture.as_ref().unwrap().shown, &snip.doc.image), "nothing drawn, nothing copied");
     }
 
     #[test]
