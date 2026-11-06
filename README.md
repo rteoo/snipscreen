@@ -41,7 +41,8 @@ executable. It is a sibling of [SnipType](https://github.com/rteoo/sniptype) and
 
 Download `snipscreen-v0.1.0-windows-x64.zip` from the
 [stable v0.1.0 release](https://github.com/rteoo/snipscreen/releases/tag/v0.1.0),
-extract it, and run `snipscreen.exe`. To build from source with Rust installed:
+extract it, and run `snipscreen.exe`. To build from source with Rust and the
+MSVC build tools (which include the Windows SDK) installed:
 
 ```powershell
 git clone https://github.com/rteoo/snipscreen.git
@@ -156,7 +157,7 @@ UI changes are checked without driving the desktop.
 | `app/src/audio.rs` | WASAPI loopback and microphone capture |
 | `app/src/win.rs` | Win32: screen grab, clipboard, dialogs, hotkeys |
 | `app/src/icons.rs` | Vector toolbar icons |
-| `app/assets/` | App icon sources (`.svg`), renders (`.png`), and `snipscreen.ico` |
+| `app/assets/` | App icon sources (`.svg`), renders (`.png`), and `snipscreen.ico`, which `app/build.rs` embeds in the `.exe` |
 
 Contributor and agent conventions are in [AGENTS.md](AGENTS.md).
 
