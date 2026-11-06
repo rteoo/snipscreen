@@ -6,6 +6,7 @@ mod icons;
 mod markup;
 mod recorder;
 mod settings;
+mod settings_window;
 mod tray;
 mod widgets;
 mod win;
@@ -150,6 +151,7 @@ struct ScreenshotJob {
 enum Shot {
     Home(PathBuf),
     Editor(PathBuf),
+    Settings(PathBuf),
 }
 
 /// The shell: the home window (which the picker and the recording bar take over while a capture
@@ -200,6 +202,8 @@ struct App {
     rec_tx: Sender<recorder::Event>,
     rec_rx: Receiver<recorder::Event>,
     editors: Editors,
+    settings_window: Option<settings_window::SettingsWindow>,
+    icon: Option<Arc<egui::IconData>>,
 }
 
 impl App {
@@ -264,7 +268,9 @@ impl App {
             mics: Vec::new(),
             rec_tx,
             rec_rx,
-            editors: Editors::new(icon),
+            editors: Editors::new(icon.clone()),
+            settings_window: None,
+            icon,
         };
         if !loaded.problems.is_empty() && !shot_run {
             app.say(&cc.egui_ctx, format!("Some settings couldn't be read and were reset: {}", loaded.problems.join(", ")));
@@ -279,6 +285,11 @@ impl App {
         }
         app.screenshot = shot.map(|shot| match shot {
             Shot::Home(path) => ScreenshotJob { path, target: ViewportId::ROOT, frames: 0, rx: None },
+            Shot::Settings(path) => {
+                app.open_settings(&cc.egui_ctx);
+                let target = app.settings_window.as_ref().map_or(ViewportId::ROOT, |w| w.id());
+                ScreenshotJob { path, target, frames: 0, rx: None }
+            }
             Shot::Editor(path) => {
                 let target = app.open_sample_editor(&cc.egui_ctx);
                 ScreenshotJob { path, target, frames: 0, rx: None }
@@ -552,6 +563,54 @@ impl App {
         ctx.send_viewport_cmd(ViewportCommand::Close);
     }
 
+    /// Opens the Settings window, or brings it forward if it is open.
+    fn open_settings(&mut self, ctx: &egui::Context) {
+        match &self.settings_window {
+            Some(w) => w.focus(ctx),
+            None => self.settings_window = Some(settings_window::SettingsWindow::new(ctx, &self.settings, self.hotkey, self.hotkey_note.as_deref(), self.icon.clone())),
+        }
+    }
+
+    /// Takes what the Settings window changed: the after-snip and startup choices apply at once, the
+    /// recorder is started or stopped on the agent.
+    fn poll_settings_window(&mut self, ctx: &egui::Context) {
+        let Some(w) = &self.settings_window else { return };
+        let req = w.poll();
+        if let Some(s) = req.settings {
+            (self.settings.after_capture, self.settings.auto_copy, self.settings.auto_save) = (s.after_capture, s.auto_copy, s.auto_save);
+            self.settings.start_with_windows = s.start_with_windows;
+        }
+        match (req.record, &self.agent) {
+            (Some(on), Some(agent)) => agent.record(on),
+            (Some(true), None) => w.recorded(ctx, Some(Err("Global shortcuts are off, so there is nothing to change".into()))),
+            _ => {}
+        }
+        if req.closed {
+            self.settings_window = None;
+        }
+    }
+
+    /// The recorder caught a combination: a usable one goes to the agent to register.
+    fn on_recorded(&mut self, ctx: &egui::Context, caught: Option<Hotkey>) {
+        let verdict = caught.map(Hotkey::check);
+        if let (Some(Ok(h)), Some(agent)) = (&verdict, &self.agent) {
+            agent.set_hotkey(*h);
+        }
+        if let Some(w) = &self.settings_window {
+            w.recorded(ctx, verdict);
+        }
+    }
+
+    /// The agent registered a new shortcut, or refused it and kept the old one.
+    fn on_hotkey_set(&mut self, ctx: &egui::Context, result: Result<Hotkey, String>) {
+        if let Ok(h) = result {
+            (self.hotkey, self.hotkey_note, self.settings.shortcut) = (Some(h), None, h);
+        }
+        if let Some(w) = &self.settings_window {
+            w.hotkey_result(ctx, &result, self.hotkey);
+        }
+    }
+
     /// Brings the sign-in entry in line with "Start SnipScreen with Windows", off the UI thread.
     fn sync_startup(&self) {
         let (on, report) = (self.settings.start_with_windows, self.bg.clone());
@@ -635,9 +694,12 @@ impl eframe::App for App {
                 tray::Event::Snip => hotkey = true,
                 tray::Event::Escape => self.global_esc = true,
                 tray::Event::Intent(intent) => self.on_intent(ctx, intent),
-                tray::Event::HotkeySet(_) => {}
+                tray::Event::HotkeySet(result) => self.on_hotkey_set(ctx, result),
+                tray::Event::Recorded(caught) => self.on_recorded(ctx, caught),
+                tray::Event::Settings => self.open_settings(ctx),
             }
         }
+        self.poll_settings_window(ctx);
         if self.editors.poll().new_snip || hotkey {
             self.start_snip(ctx);
         }
@@ -669,8 +731,11 @@ impl eframe::App for App {
         } else {
             self.home_ui(ui);
         }
-        // Every pass, or egui closes the editor windows.
+        // Every pass, or egui closes the editor and settings windows.
         self.editors.show(&ctx);
+        if let Some(w) = &self.settings_window {
+            w.show(&ctx);
+        }
         self.drive_screenshot(&ctx);
         self.persist();
     }
@@ -710,8 +775,9 @@ impl App {
     fn home_menu(&mut self, ui: &mut egui::Ui) {
         let more = icon_button(ui, Icon::More, None, false, true, "More");
         egui::Popup::menu(&more).show(|ui| {
-            ui.checkbox(&mut self.settings.auto_copy, "Copy snips to the clipboard automatically");
-            ui.checkbox(&mut self.settings.auto_save, "Save snips to Pictures\\Screenshots automatically");
+            if ui.button("Settings…").clicked() {
+                self.open_settings(ui.ctx());
+            }
             if ui.button("Open the Screenshots folder").clicked() {
                 if let Some(dir) = win::pictures_dir().map(|d| d.join("Screenshots")) {
                     let _ = std::fs::create_dir_all(&dir);
@@ -1323,6 +1389,7 @@ fn main() -> eframe::Result {
         let make = match a.as_str() {
             "--screenshot" => Shot::Home,
             "--screenshot-editor" => Shot::Editor,
+            "--screenshot-settings" => Shot::Settings,
             _ => continue,
         };
         match args.next() {
