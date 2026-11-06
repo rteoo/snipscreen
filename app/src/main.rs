@@ -522,7 +522,7 @@ impl App {
         self.editors.with(id, |e| {
             if let editor::Content::Snip(snip) = &mut e.content {
                 for s in sample_strokes() {
-                    snip.doc.add_stroke(s);
+                    snip.doc.add_mark(s);
                 }
             }
         });

@@ -1,4 +1,4 @@
-//! Snip document: picture, ink strokes, crop and undo history.
+//! Snip document: picture, marks (ink strokes), crop and undo history.
 
 use std::sync::Arc;
 
@@ -13,7 +13,7 @@ pub enum Ink {
 /// Highlighter ink is see-through; it is stored opaque and faded when drawn.
 pub const HIGHLIGHT_ALPHA: f32 = 0.42;
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub struct Stroke {
     pub ink: Ink,
     pub color: Color32,
@@ -107,20 +107,53 @@ impl Stroke {
     }
 }
 
+/// Anything drawn on the snip. Each mark is burned into the picture on its own, in order.
+#[derive(Clone, PartialEq)]
+pub enum Mark {
+    Stroke(Stroke),
+}
+
+impl From<Stroke> for Mark {
+    fn from(s: Stroke) -> Self {
+        Mark::Stroke(s)
+    }
+}
+
+impl Mark {
+    /// Pixels of an image of `size` that the mark can touch.
+    pub fn bounds(&self, size: [usize; 2]) -> Option<PxRect> {
+        match self {
+            Mark::Stroke(s) => s.bounds_from(0, size),
+        }
+    }
+
+    fn touches(&self, p: Pos2, radius: f32) -> bool {
+        match self {
+            Mark::Stroke(s) => s.touches(p, radius),
+        }
+    }
+
+    fn translate(&mut self, d: eframe::egui::Vec2) {
+        match self {
+            Mark::Stroke(s) => s.points.iter_mut().for_each(|p| *p += d),
+        }
+    }
+}
+
 #[derive(Clone)]
 struct Snapshot {
     image: Arc<ColorImage>,
-    strokes: Vec<Stroke>,
+    marks: Vec<Mark>,
 }
 
 pub struct Doc {
     pub image: Arc<ColorImage>,
-    pub strokes: Vec<Stroke>,
+    pub marks: Vec<Mark>,
     undo: Vec<Snapshot>,
     redo: Vec<Snapshot>,
     /// Bumped whenever `image` changes so the texture can be refreshed.
     pub image_rev: u64,
-    /// Bumped whenever `strokes` change, for the same reason.
+    /// Bumped whenever `marks` change, for the same reason.
     pub ink_rev: u64,
 }
 
@@ -130,7 +163,7 @@ impl Doc {
     pub fn new(image: ColorImage) -> Self {
         Self {
             image: Arc::new(image),
-            strokes: Vec::new(),
+            marks: Vec::new(),
             undo: Vec::new(),
             redo: Vec::new(),
             image_rev: 0,
@@ -152,7 +185,7 @@ impl Doc {
     }
 
     fn snapshot(&self) -> Snapshot {
-        Snapshot { image: self.image.clone(), strokes: self.strokes.clone() }
+        Snapshot { image: self.image.clone(), marks: self.marks.clone() }
     }
 
     fn restore(&mut self, s: Snapshot) {
@@ -160,7 +193,7 @@ impl Doc {
             self.image_rev += 1;
         }
         self.image = s.image;
-        self.strokes = s.strokes;
+        self.marks = s.marks;
         self.ink_rev += 1;
     }
 
@@ -186,29 +219,29 @@ impl Doc {
         }
     }
 
-    /// Adds a finished stroke as one undoable step.
-    pub fn add_stroke(&mut self, s: Stroke) {
+    /// Adds a finished mark as one undoable step.
+    pub fn add_mark(&mut self, m: impl Into<Mark>) {
         self.checkpoint();
-        self.strokes.push(s);
+        self.marks.push(m.into());
         self.ink_rev += 1;
     }
 
     pub fn hits(&self, p: Pos2, radius: f32) -> bool {
-        self.strokes.iter().any(|s| s.touches(p, radius))
+        self.marks.iter().any(|m| m.touches(p, radius))
     }
 
-    /// Removes every stroke within `radius` of `p`. Returns whether any went.
+    /// Removes every mark within `radius` of `p`. Returns whether any went.
     pub fn erase_at(&mut self, p: Pos2, radius: f32) -> bool {
-        let before = self.strokes.len();
-        self.strokes.retain(|s| !s.touches(p, radius));
-        let gone = self.strokes.len() != before;
+        let before = self.marks.len();
+        self.marks.retain(|m| !m.touches(p, radius));
+        let gone = self.marks.len() != before;
         if gone {
             self.ink_rev += 1;
         }
         gone
     }
 
-    /// Crops to `r` (image pixels); strokes move with the picture.
+    /// Crops to `r` (image pixels); marks move with the picture.
     pub fn crop(&mut self, r: Rect) {
         let [w, h] = self.size();
         let x0 = (r.min.x.round().max(0.0) as usize).min(w);
@@ -223,18 +256,16 @@ impl Doc {
         self.image_rev += 1;
         self.ink_rev += 1;
         let shift = eframe::egui::vec2(x0 as f32, y0 as f32);
-        for s in &mut self.strokes {
-            for p in &mut s.points {
-                *p -= shift;
-            }
+        for m in &mut self.marks {
+            m.translate(-shift);
         }
     }
 
     /// The picture with all ink burned in, ready to copy or save.
     pub fn flatten(&self) -> ColorImage {
         let mut out = (*self.image).clone();
-        for s in &self.strokes {
-            burn_stroke(&mut out, s);
+        for m in &self.marks {
+            burn(&mut out, m);
         }
         out
     }
@@ -325,9 +356,15 @@ fn dist_to_segment(p: Pos2, a: Pos2, b: Pos2) -> f32 {
     p.distance(a + ab * t)
 }
 
+pub fn burn(img: &mut ColorImage, m: &Mark) {
+    match m {
+        Mark::Stroke(s) => burn_stroke(img, s),
+    }
+}
+
 /// Rasterises one stroke with soft edges. Coverage is collected first so a
 /// highlighter that crosses itself doesn't get darker where it overlaps.
-pub fn burn_stroke(img: &mut ColorImage, s: &Stroke) {
+fn burn_stroke(img: &mut ColorImage, s: &Stroke) {
     let Some(r) = s.bounds_from(0, img.size) else { return };
     let w = img.size[0];
     let bw = r.x1 - r.x0;
@@ -358,37 +395,43 @@ mod tests {
         ColorImage::new([w, h], vec![Color32::WHITE; w * h])
     }
 
+    fn stroke(m: &Mark) -> &Stroke {
+        match m {
+            Mark::Stroke(s) => s,
+        }
+    }
+
     #[test]
     fn crop_moves_strokes_and_undo_restores() {
         let mut d = Doc::new(white(100, 80));
         d.checkpoint();
-        d.strokes.push(Stroke {
+        d.marks.push(Mark::Stroke(Stroke {
             ink: Ink::Pen,
             color: Color32::RED,
             width: 4.0,
             points: vec![Pos2::new(50.0, 40.0)],
-        });
+        }));
         d.crop(Rect::from_min_max(Pos2::new(10.0, 20.0), Pos2::new(60.0, 70.0)));
         assert_eq!(d.size(), [50, 50]);
-        assert_eq!(d.strokes[0].points[0], Pos2::new(40.0, 20.0));
+        assert_eq!(stroke(&d.marks[0]).points[0], Pos2::new(40.0, 20.0));
         d.undo();
         assert_eq!(d.size(), [100, 80]);
-        assert_eq!(d.strokes[0].points[0], Pos2::new(50.0, 40.0));
+        assert_eq!(stroke(&d.marks[0]).points[0], Pos2::new(50.0, 40.0));
         d.undo();
-        assert!(d.strokes.is_empty());
+        assert!(d.marks.is_empty());
         d.redo();
-        assert_eq!(d.strokes.len(), 1);
+        assert_eq!(d.marks.len(), 1);
     }
 
     #[test]
     fn flatten_burns_pen_ink() {
         let mut d = Doc::new(white(20, 20));
-        d.strokes.push(Stroke {
+        d.marks.push(Mark::Stroke(Stroke {
             ink: Ink::Pen,
             color: Color32::BLACK,
             width: 6.0,
             points: vec![Pos2::new(2.0, 10.0), Pos2::new(18.0, 10.0)],
-        });
+        }));
         let out = d.flatten();
         assert_eq!(out.pixels[10 * 20 + 10], Color32::BLACK);
         assert_eq!(out.pixels[0], Color32::WHITE);
@@ -429,9 +472,9 @@ mod tests {
     #[test]
     fn ink_tile_over_picture_matches_saved_pixels() {
         let mut d = Doc::new(white(40, 40));
-        d.add_stroke(zigzag());
+        d.add_mark(zigzag());
         let saved = d.flatten();
-        let s = &d.strokes[0];
+        let s = stroke(&d.marks[0]);
         let r = s.bounds_from(0, d.size()).unwrap();
         let mut shown = white(40, 40);
         let tile = s.ink_tile(r);
@@ -473,7 +516,7 @@ mod tests {
     #[test]
     fn ink_changes_bump_ink_rev() {
         let mut d = Doc::new(white(40, 40));
-        d.add_stroke(zigzag());
+        d.add_mark(zigzag());
         assert_eq!(d.ink_rev, 1);
         assert!(!d.erase_at(Pos2::new(20.0, 2.0), 0.5));
         assert_eq!(d.ink_rev, 1);
@@ -482,23 +525,23 @@ mod tests {
         assert_eq!(d.ink_rev, 2);
         d.undo();
         assert_eq!(d.ink_rev, 3);
-        assert_eq!(d.strokes.len(), 1);
+        assert_eq!(d.marks.len(), 1);
     }
 
     #[test]
     fn eraser_removes_touched_stroke_only() {
         let mut d = Doc::new(white(50, 50));
         for y in [10.0, 40.0] {
-            d.strokes.push(Stroke {
+            d.marks.push(Mark::Stroke(Stroke {
                 ink: Ink::Highlighter,
                 color: Color32::YELLOW,
                 width: 4.0,
                 points: vec![Pos2::new(5.0, y), Pos2::new(45.0, y)],
-            });
+            }));
         }
         assert!(d.erase_at(Pos2::new(25.0, 12.0), 2.0));
-        assert_eq!(d.strokes.len(), 1);
-        assert_eq!(d.strokes[0].points[0].y, 40.0);
+        assert_eq!(d.marks.len(), 1);
+        assert_eq!(stroke(&d.marks[0]).points[0].y, 40.0);
     }
 
     #[test]

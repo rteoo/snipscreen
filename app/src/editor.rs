@@ -16,7 +16,7 @@ use eframe::egui::{
 use windows_sys::Win32::Foundation::HWND;
 
 use crate::icons::{self, Icon};
-use crate::markup::{self, Doc, Ink, PxRect, Stroke};
+use crate::markup::{self, Doc, Ink, Mark, PxRect, Stroke};
 use crate::widgets::{
     self, dim_outside, divider, escape_for_app, icon_button, Note, Notifier, PopupClickGuard, ACCENT, BTN, BUTTON_HOVER, DIVIDER_W, GAP, GROUP_GAP, ICON,
     ICON_OFF, MIN_WINDOW_H, MIN_WINDOW_W, TOOLBAR_BG,
@@ -237,7 +237,7 @@ impl Snip {
         let rev = (doc.image_rev, doc.ink_rev);
         if texture.as_ref().is_none_or(|c| c.rev != rev) {
             // ceiling: erase/undo re-flatten the whole snip (~150 ms for 20 long strokes on 4K); burn per-stroke tiles if erasing feels sticky.
-            let shown = if doc.strokes.is_empty() { doc.image.clone() } else { Arc::new(doc.flatten()) };
+            let shown = if doc.marks.is_empty() { doc.image.clone() } else { Arc::new(doc.flatten()) };
             match texture {
                 Some(c) => {
                     c.tex.set(shown.clone(), TextureOptions::LINEAR);
@@ -316,7 +316,7 @@ impl Snip {
                     }
                     if resp.drag_stopped() || resp.clicked() {
                         if let Some(s) = drawing.take() {
-                            canvas.commit(doc, s);
+                            canvas.commit(doc, Mark::Stroke(s));
                         }
                     }
                     if let Some(s) = drawing.as_ref() {
@@ -875,19 +875,19 @@ impl LiveInk {
 }
 
 impl CanvasTex {
-    /// Adds a finished stroke, burning just that stroke into the texture
+    /// Adds a finished mark, burning just that mark into the texture
     /// rather than re-flattening the whole snip.
-    fn commit(&mut self, doc: &mut Doc, s: Stroke) {
+    fn commit(&mut self, doc: &mut Doc, m: Mark) {
         let current = self.rev == (doc.image_rev, doc.ink_rev);
         if current {
-            if let Some(r) = s.bounds_from(0, doc.size()) {
+            if let Some(r) = m.bounds(doc.size()) {
                 let shown = Arc::make_mut(&mut self.shown);
-                markup::burn_stroke(shown, &s);
+                markup::burn(shown, &m);
                 let patch = markup::sub_image(shown, r.x0, r.y0, r.x1 - r.x0, r.y1 - r.y0);
                 self.tex.set_partial(r.pos(), patch, TextureOptions::LINEAR);
             }
         }
-        doc.add_stroke(s);
+        doc.add_mark(m);
         if current {
             self.rev.1 = doc.ink_rev;
         }
@@ -1281,7 +1281,7 @@ mod tests {
     fn copy_and_save_use_the_canvas_picture_only_while_it_is_current() {
         let mut snip = Snip::new(white(8, 8), Tools::default());
         let stroke = || Stroke { ink: Ink::Pen, color: Color32::RED, width: 2.0, points: vec![pos2(1.0, 1.0), pos2(6.0, 6.0)] };
-        snip.doc.add_stroke(stroke());
+        snip.doc.add_mark(stroke());
         assert_eq!(*snip.flattened(), snip.doc.flatten(), "no canvas yet: flattened from the doc");
         let ctx = egui::Context::default();
         let tex = ctx.load_texture("t", ColorImage::new([1, 1], vec![Color32::BLACK]), TextureOptions::LINEAR);
@@ -1313,7 +1313,7 @@ mod tests {
 
         editors.with(a, |e| {
             let Content::Snip(s) = &mut e.content else { panic!("a snip") };
-            s.doc.add_stroke(Stroke { ink: Ink::Pen, color: Color32::RED, width: 2.0, points: vec![pos2(1.0, 1.0)] });
+            s.doc.add_mark(Stroke { ink: Ink::Pen, color: Color32::RED, width: 2.0, points: vec![pos2(1.0, 1.0)] });
         });
         let undo = |id| editors.with(id, |e| e.snip().is_some_and(|s| s.doc.can_undo())).unwrap();
         assert!(undo(a) && !undo(b), "undo stacks are separate");
