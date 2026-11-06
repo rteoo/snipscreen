@@ -246,6 +246,9 @@ pub struct Snip {
     key_zoom: f32,
     /// The rest of the text being typed, while `drawing` is text.
     draft: Draft,
+    /// Text was placed with an input method's composition in it; the editor cancels the composition
+    /// the input method still holds, so it isn't committed a second time.
+    ime_taken: bool,
 }
 
 pub enum Content {
@@ -299,7 +302,7 @@ impl Drop for Busy {
 
 impl Snip {
     pub fn new(image: ColorImage, tools: Tools) -> Self {
-        Self { doc: Doc::new(image), tools, texture: None, drawing: None, erase_marked: false, crop: None, crop_drag: None, zoom: None, key_zoom: 1.0, draft: Draft::default() }
+        Self { doc: Doc::new(image), tools, texture: None, drawing: None, erase_marked: false, crop: None, crop_drag: None, zoom: None, key_zoom: 1.0, draft: Draft::default(), ime_taken: false }
     }
 
     /// The picture with its ink, as it would be copied or saved. The canvas texture already holds
@@ -337,7 +340,7 @@ impl Snip {
 
     /// Places the text being typed, if it has anything in it.
     fn finish_text(&mut self) {
-        if let (Some(m), Some(canvas)) = (placeable(self.drawing.take()), self.texture.as_mut()) {
+        if let (Some(m), Some(canvas)) = (take_typed(&mut self.drawing, &mut self.draft, &mut self.ime_taken), self.texture.as_mut()) {
             canvas.commit(&mut self.doc, m);
         }
     }
@@ -477,7 +480,7 @@ impl Snip {
 
     fn canvas(&mut self, ui: &mut egui::Ui, guard: &PopupClickGuard) {
         let ctx = ui.ctx().clone();
-        let Snip { doc, tools, texture, drawing, erase_marked, crop, crop_drag, zoom: zoom_choice, key_zoom, draft } = self;
+        let Snip { doc, tools, texture, drawing, erase_marked, crop, crop_drag, zoom: zoom_choice, key_zoom, draft, ime_taken } = self;
         let canvas = texture.get_or_insert_with(|| CanvasTex::new(&ctx, doc));
         canvas.sync(doc);
 
@@ -600,7 +603,7 @@ impl Snip {
                     if resp.clicked() {
                         if let Some(p) = pointer {
                             // A click places the text being typed and starts new text there, its first line centred on the click.
-                            if let Some(m) = placeable(drawing.take()) {
+                            if let Some(m) = take_typed(drawing, draft, ime_taken) {
                                 canvas.commit(doc, m);
                             }
                             let mut t = Text { text: String::new(), color: tools.text.0, size: tools.text.1 * k, outline: tools.text_outline, pos: to_px(p) };
@@ -618,7 +621,7 @@ impl Snip {
                             (t.size, draft.size_pt) = (tools.text.1 * k, tools.text.1);
                         }
                         if type_into(&ctx, &mut t.text, draft) {
-                            if let Some(m) = placeable(drawing.take()) {
+                            if let Some(m) = take_typed(drawing, draft, ime_taken) {
                                 canvas.commit(doc, m);
                             }
                         }
@@ -756,6 +759,15 @@ impl Editor {
         });
         if let Some(msg) = widgets::live_note(&mut self.note, &ctx) {
             widgets::toast(&ctx, &msg, video_top);
+        }
+        let ime_taken = match &mut self.content {
+            Content::Snip(s) => std::mem::take(&mut s.ime_taken),
+            Content::Video(_) => false,
+        };
+        if ime_taken {
+            if let Some(hwnd) = self.own_hwnd() {
+                win::cancel_ime_composition(hwnd);
+            }
         }
     }
 
@@ -1563,6 +1575,19 @@ fn placeable(m: Option<Mark>) -> Option<Mark> {
         Some(Mark::Text(t)) if !t.text.trim().is_empty() => Some(Mark::Text(t)),
         _ => None,
     }
+}
+
+/// Takes the text being typed to be placed, with an input method's composition, which shows after
+/// it, taken in as if committed: what is placed is what was on screen. Sets `ime_taken` when it did.
+fn take_typed(drawing: &mut Option<Mark>, draft: &mut Draft, ime_taken: &mut bool) -> Option<Mark> {
+    let mut m = drawing.take();
+    if let Some(Mark::Text(t)) = &mut m {
+        if !draft.preedit.is_empty() {
+            t.text.push_str(&std::mem::take(&mut draft.preedit));
+            *ime_taken = true;
+        }
+    }
+    placeable(m)
 }
 
 /// `t` with an input method's uncommitted `preedit` after it, as it shows while composing.
@@ -2624,6 +2649,28 @@ Arc::ptr_eq(&snip.flattened(), &shown), "a current canvas is reused, not re-burn
         shortcut(&ctx, &mut ed, Key::Z, Modifiers::COMMAND);
         assert_eq!(draft_text(&mut ed), None, "Ctrl+Z on the empty draft cancels it");
         assert!(snip_of(&mut ed).doc.marks.is_empty(), "and never touched the snip's own history");
+    }
+
+    #[test]
+    fn placing_text_mid_composition_keeps_what_the_input_method_showed() {
+        let (ctx, mut ed, mut screen) = typing("Hi ");
+        canvas_frame(&ctx, snip_of(&mut ed), &mut screen, vec![Event::Ime(egui::ImeEvent::Preedit { text: "にほ".into(), active_range_chars: None })]);
+        let shown = screen.pixels();
+        // Switching tools places the text, as copy and save do.
+        snip_of(&mut ed).finish_text();
+        let snip = snip_of(&mut ed);
+        assert!(matches!(&*snip.doc.marks[0], Mark::Text(t) if t.text == "Hi にほ"), "the composition is placed with it");
+        assert!(snip.ime_taken && snip.draft.preedit.is_empty(), "and the input method is told to drop its copy");
+        assert!(snip.doc.flatten().pixels == shown, "exactly as it showed");
+        // A click elsewhere places it too, then starts new text there without the composition.
+        let (ctx, mut ed, mut screen) = typing("Hi ");
+        canvas_frame(&ctx, snip_of(&mut ed), &mut screen, vec![Event::Ime(egui::ImeEvent::Preedit { text: "にほ".into(), active_range_chars: None })]);
+        let at = pos2(100.0, 100.0);
+        canvas_frame(&ctx, snip_of(&mut ed), &mut screen, vec![Event::PointerMoved(at), pointer(at, true)]);
+        canvas_frame(&ctx, snip_of(&mut ed), &mut screen, vec![pointer(at, false)]);
+        assert!(matches!(&*snip_of(&mut ed).doc.marks[0], Mark::Text(t) if t.text == "Hi にほ"));
+        assert_eq!(draft_text(&mut ed).as_deref(), Some(""));
+        assert!(snip_of(&mut ed).draft.preedit.is_empty());
     }
 
     #[test]

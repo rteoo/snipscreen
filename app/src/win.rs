@@ -552,6 +552,27 @@ extern "system" {
     fn SetProcessDpiAwarenessContext(value: isize) -> i32;
 }
 
+#[link(name = "imm32")]
+extern "system" {
+    fn ImmGetContext(hwnd: HWND) -> isize;
+    fn ImmNotifyIME(himc: isize, action: u32, index: u32, value: u32) -> i32;
+    fn ImmReleaseContext(hwnd: HWND, himc: isize) -> i32;
+}
+
+/// Throws away what the window's input method is composing, without committing it: the app has
+/// already taken it in as typed. Call on the window's own thread.
+pub fn cancel_ime_composition(hwnd: HWND) {
+    const NI_COMPOSITIONSTR: u32 = 0x15;
+    const CPS_CANCEL: u32 = 0x4;
+    unsafe {
+        let himc = ImmGetContext(hwnd);
+        if himc != 0 {
+            ImmNotifyIME(himc, NI_COMPOSITIONSTR, CPS_CANCEL, 0);
+            ImmReleaseContext(hwnd, himc);
+        }
+    }
+}
+
 /// Per-monitor DPI awareness (v2), as winit sets it when the window is made; done first so the tray
 /// icon, loaded before any window exists, comes out at the screen's real size instead of a blurry 16 px.
 pub fn become_dpi_aware() {
