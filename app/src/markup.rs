@@ -13,9 +13,9 @@ use vello_cpu::kurbo;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Ink {
     Pen,
-    /// Blends into the picture like a real highlighter instead of a see-through coat laid on top: on
-    /// light content it multiplies (white turns the ink's colour, dark text stays dark), on dark
-    /// content it screens (black turns the ink's colour, light text stays light). See `Stroke::on_dark`.
+    /// Multiplies into the picture like a real highlighter instead of a see-through coat laid on top:
+    /// white and light text turn the ink's colour, dark text stays dark, and a dark page only takes a
+    /// faint tint, so what is highlighted is the content, not a band over it.
     Highlighter,
 }
 
@@ -27,10 +27,6 @@ pub struct Stroke {
     pub width: f32,
     /// Points in image pixels.
     pub points: Vec<Pos2>,
-    /// Highlighter only: the stroke began on dark content (`is_dark_under`), so it screens rather
-    /// than multiplies. Chosen once for the whole stroke, so it never tints dark text on a light page
-    /// and the result is the same wherever it is painted.
-    pub on_dark: bool,
 }
 
 impl Stroke {
@@ -56,10 +52,9 @@ impl Stroke {
     fn paint(&self, patch: &mut ColorImage, at: [usize; 2]) {
         let mut cover = vec![0f32; patch.pixels.len()];
         cover_segments(&mut cover, patch_rect(patch, at), self.segments_from(0), self.radius());
-        let blend = match (self.ink, self.on_dark) {
-            (Ink::Pen, _) => over,
-            (Ink::Highlighter, false) => multiply,
-            (Ink::Highlighter, true) => screen,
+        let blend = match self.ink {
+            Ink::Pen => over,
+            Ink::Highlighter => multiply,
         };
         for (px, &k) in patch.pixels.iter_mut().zip(&cover) {
             if k > 0.0 {
@@ -1216,47 +1211,6 @@ fn multiply(px: Color32, ink: Color32, k: f32) -> Color32 {
     Color32::from_rgba_premultiplied(mix(r0, cr), mix(g0, cg), mix(b0, cb), a)
 }
 
-/// How much of its colour a highlighter screens onto dark content. At full strength light text ends up
-/// near-white on bright yellow (about 1.2:1); at half, the page turns a muted shade of the ink and the
-/// text keeps about 3.4:1 against it.
-const SCREEN_STRENGTH: f32 = 0.5;
-
-/// `ink` at `SCREEN_STRENGTH` screened onto the premultiplied pixel `px` at coverage `k` (the W3C
-/// screen blend, source-over): `1 - (1 - base)(1 - ink)`, which lightens. On premultiplied colour that
-/// is `base + ink - base * ink` whatever the pixel's alpha, so see-through pixels show the ink itself.
-fn screen(px: Color32, ink: Color32, k: f32) -> Color32 {
-    let [r0, g0, b0, a0] = px.to_array();
-    let [cr, cg, cb, _] = ink.to_array();
-    let mix = |base: u8, ink: u8| {
-        let (b, i) = (base as f32, ink as f32 * SCREEN_STRENGTH);
-        (b + k * (i - b * i / 255.0)).round() as u8
-    };
-    let a = (a0 as f32 + (255.0 - a0 as f32) * k).round() as u8;
-    Color32::from_rgba_premultiplied(mix(r0, cr), mix(g0, cg), mix(b0, cb), a)
-}
-
-/// Content under a dab of `radius` at `p` reads as dark: its mean luminance is under half. See-through
-/// pixels (outside a freeform snip) don't count; with none opaque it is not dark.
-pub fn is_dark_under(img: &ColorImage, p: Pos2, radius: f32) -> bool {
-    let r = radius.max(4.0);
-    let [w, h] = img.size;
-    let span = |c: f32, lim: usize| ((c - r).floor().max(0.0) as usize, ((c + r).ceil().max(0.0) as usize).min(lim));
-    let ((x0, x1), (y0, y1)) = (span(p.x, w), span(p.y, h));
-    let (mut sum, mut weight) = (0.0f64, 0.0f64);
-    for y in y0..y1 {
-        for x in x0..x1 {
-            if (Pos2::new(x as f32 + 0.5, y as f32 + 0.5) - p).length_sq() > r * r {
-                continue;
-            }
-            let [cr, cg, cb, a] = img.pixels[y * w + x].to_srgba_unmultiplied();
-            let lum = 0.2126 * cr as f64 + 0.7152 * cg as f64 + 0.0722 * cb as f64;
-            sum += lum * a as f64;
-            weight += 255.0 * a as f64;
-        }
-    }
-    weight > 0.0 && sum / weight < 0.5
-}
-
 #[derive(Clone)]
 struct Snapshot {
     image: Arc<ColorImage>,
@@ -1642,7 +1596,6 @@ mod tests {
         let mut d = Doc::new(white(100, 80));
         d.checkpoint();
         d.marks.push(Arc::new(Mark::Stroke(Stroke {
-            on_dark: false,
             ink: Ink::Pen,
             color: Color32::RED,
             width: 4.0,
@@ -1677,7 +1630,6 @@ mod tests {
     fn flatten_burns_pen_ink() {
         let mut d = Doc::new(white(20, 20));
         d.marks.push(Arc::new(Mark::Stroke(Stroke {
-            on_dark: false,
             ink: Ink::Pen,
             color: Color32::BLACK,
             width: 6.0,
@@ -1692,7 +1644,6 @@ mod tests {
     fn zigzag() -> Stroke {
         // Crosses itself at (20, 20) and turns sharp corners at (35, 35) and (35, 5).
         Stroke {
-            on_dark: false,
             ink: Ink::Highlighter,
             color: Color32::from_rgb(255, 220, 0),
             width: 8.0,
@@ -1725,7 +1676,7 @@ mod tests {
             }
         }
         let mut d = Doc::new(img);
-        d.add_mark(Stroke { on_dark: false, ink: Ink::Highlighter, color: ink, width: 10.0, points: vec![Pos2::new(2.0, 10.0), Pos2::new(38.0, 10.0)] });
+        d.add_mark(Stroke { ink: Ink::Highlighter, color: ink, width: 10.0, points: vec![Pos2::new(2.0, 10.0), Pos2::new(38.0, 10.0)] });
         let out = d.flatten();
         assert_eq!(out.pixels[10 * 40 + 8], ink, "white becomes the highlight colour");
         let dark = out.pixels[10 * 40 + 30];
@@ -1746,68 +1697,35 @@ mod tests {
         assert_eq!(at(35, 36), s.color, "corner is filled round, not notched");
     }
 
-    /// A dark page (30, 30, 30) with a light "text" column (220, 220, 220) in its right half.
-    fn dark_page() -> ColorImage {
-        let mut img = ColorImage::new([40, 20], vec![Color32::from_rgb(30, 30, 30); 800]);
+    #[test]
+    fn on_a_dark_page_the_highlighter_colours_light_text_and_only_tints_the_page() {
+        // A dark page (30, 30, 34) with a light "text" column (220, 220, 220) in its right half.
+        let mut page = ColorImage::new([40, 20], vec![Color32::from_rgb(30, 30, 34); 800]);
         for y in 0..20 {
             for x in 26..32 {
-                img.pixels[y * 40 + x] = Color32::from_gray(220);
+                page.pixels[y * 40 + x] = Color32::from_gray(220);
             }
         }
-        img
-    }
-
-    #[test]
-    fn on_dark_content_the_highlighter_lights_the_page_and_keeps_light_text_light() {
-        let ink = Color32::from_rgb(255, 230, 0);
-        let line = vec![Pos2::new(2.0, 10.0), Pos2::new(38.0, 10.0)];
-        let page = dark_page();
-        assert!(is_dark_under(&page, line[0], 5.0), "a dark page reads as dark");
-        let mut d = Doc::new(page.clone());
-        d.add_mark(Stroke { ink: Ink::Highlighter, color: ink, width: 10.0, points: line.clone(), on_dark: true });
-        let out = d.flatten();
-        assert_eq!(out.pixels[10 * 40 + 8], Color32::from_rgb(143, 131, 30), "the dark page takes a muted shade of the colour");
-        let text = out.pixels[10 * 40 + 28];
-        assert!(text.r() >= 220 && text.g() >= 220 && text.b() >= 220, "light text stays light, got {text:?}");
-        assert_eq!(out.pixels[2 * 40 + 8], Color32::from_rgb(30, 30, 30), "outside the stroke untouched");
-        // Multiplied instead, the same stroke all but vanishes on the dark page.
         let mut d = Doc::new(page);
-        d.add_mark(Stroke { ink: Ink::Highlighter, color: ink, width: 10.0, points: line, on_dark: false });
-        assert_eq!(d.flatten().pixels[10 * 40 + 8], Color32::from_rgb(30, 27, 0));
-    }
-
-    #[test]
-    fn the_blend_is_read_from_what_the_stroke_starts_on() {
-        let mut light = white(40, 20);
-        for x in 10..14 {
-            light.pixels[10 * 40 + x] = Color32::BLACK;
-        }
-        assert!(!is_dark_under(&light, Pos2::new(12.0, 10.0), 6.0), "dark text on a light page is light content");
-        assert!(is_dark_under(&dark_page(), Pos2::new(28.0, 10.0), 10.0), "light text on a dark page is dark content");
-        assert!(!is_dark_under(&ColorImage::new([20, 20], vec![Color32::TRANSPARENT; 400]), Pos2::new(10.0, 10.0), 6.0), "nothing opaque is not dark");
-        assert!(!is_dark_under(&light, Pos2::new(-50.0, -50.0), 6.0), "off the picture is not dark");
-    }
-
-    #[test]
-    fn a_screened_highlighter_on_see_through_pixels_shows_its_colour_at_screen_strength() {
-        let ink = Color32::from_rgb(255, 220, 0);
-        let mut img = ColorImage::new([20, 20], vec![Color32::TRANSPARENT; 400]);
-        burn(&mut img, &Mark::Stroke(Stroke { ink: Ink::Highlighter, color: ink, width: 8.0, points: vec![Pos2::new(10.0, 10.0)], on_dark: true }));
-        assert_eq!(img.pixels[10 * 20 + 10], Color32::from_rgb(128, 110, 0));
+        d.add_mark(Stroke { ink: Ink::Highlighter, color: Color32::from_rgb(255, 255, 0), width: 10.0, points: vec![Pos2::new(2.0, 10.0), Pos2::new(38.0, 10.0)] });
+        let out = d.flatten();
+        assert_eq!(out.pixels[10 * 40 + 28], Color32::from_rgb(220, 220, 0), "light text takes the colour");
+        assert_eq!(out.pixels[10 * 40 + 8], Color32::from_rgb(30, 30, 0), "the page keeps its darkness");
+        assert_eq!(out.pixels[2 * 40 + 8], Color32::from_rgb(30, 30, 34), "outside the stroke untouched");
     }
 
     #[test]
     fn highlighter_on_see_through_pixels_shows_its_own_colour() {
         let ink = Color32::from_rgb(255, 220, 0);
         let mut img = ColorImage::new([20, 20], vec![Color32::TRANSPARENT; 400]);
-        burn(&mut img, &Mark::Stroke(Stroke { on_dark: false, ink: Ink::Highlighter, color: ink, width: 8.0, points: vec![Pos2::new(10.0, 10.0)] }));
+        burn(&mut img, &Mark::Stroke(Stroke { ink: Ink::Highlighter, color: ink, width: 8.0, points: vec![Pos2::new(10.0, 10.0)] }));
         assert_eq!(img.pixels[10 * 20 + 10], ink);
     }
 
     #[test]
     fn live_tiles_built_point_by_point_match_the_saved_snip() {
-        for (ink, on_dark) in [(Ink::Pen, false), (Ink::Highlighter, false), (Ink::Highlighter, true)] {
-            let full = Stroke { ink, on_dark, ..zigzag() };
+        for ink in [Ink::Pen, Ink::Highlighter] {
+            let full = Stroke { ink, ..zigzag() };
             let pristine = gradient(70, 50);
             let mut shown = pristine.clone();
             let mut done = 0;
@@ -1820,7 +1738,7 @@ mod tests {
             }
             let mut d = Doc::new(pristine);
             d.add_mark(full);
-            assert!(shown.pixels == d.flatten().pixels, "{ink:?} (on dark: {on_dark}): screen and saved snip differ");
+            assert!(shown.pixels == d.flatten().pixels, "{ink:?}: screen and saved snip differ");
         }
     }
 
@@ -1828,8 +1746,8 @@ mod tests {
     fn footprint_never_misses_a_pixel() {
         let marks = [
             Mark::Stroke(zigzag()),
-            Mark::Stroke(Stroke { on_dark: false, ink: Ink::Pen, color: Color32::RED, width: 30.0, points: vec![Pos2::new(66.0, 2.0)] }),
-            Mark::Stroke(Stroke { on_dark: false, ink: Ink::Pen, color: Color32::BLUE, width: 3.0, points: vec![Pos2::new(-5.0, 48.0), Pos2::new(75.0, 1.0)] }),
+            Mark::Stroke(Stroke { ink: Ink::Pen, color: Color32::RED, width: 30.0, points: vec![Pos2::new(66.0, 2.0)] }),
+            Mark::Stroke(Stroke { ink: Ink::Pen, color: Color32::BLUE, width: 3.0, points: vec![Pos2::new(-5.0, 48.0), Pos2::new(75.0, 1.0)] }),
             shape(ShapeKind::Arrow, 3.0, (5.0, 45.0), (63.5, 4.2)),
             shape(ShapeKind::Arrow, 12.0, (60.0, 10.0), (10.0, 40.0)),
             shape(ShapeKind::Line, 7.0, (-20.0, 20.0), (90.0, 33.0)),
@@ -1923,9 +1841,9 @@ mod tests {
         // Overlapping marks of every kind, so a redrawn tile must re-burn its neighbours in order.
         d.add_mark(Stroke { ink: Ink::Highlighter, ..zigzag() });
         d.add_mark(shape(ShapeKind::Rectangle, 6.0, (10.0, 10.0), (100.0, 70.0)));
-        d.add_mark(Stroke { on_dark: false, ink: Ink::Pen, color: Color32::BLUE, width: 5.0, points: vec![Pos2::new(0.0, 80.0), Pos2::new(119.0, 5.0)] });
+        d.add_mark(Stroke { ink: Ink::Pen, color: Color32::BLUE, width: 5.0, points: vec![Pos2::new(0.0, 80.0), Pos2::new(119.0, 5.0)] });
         d.add_mark(shape(ShapeKind::Ellipse, 3.0, (30.0, 20.0), (110.0, 85.0)));
-        d.add_mark(Stroke { on_dark: false, ink: Ink::Highlighter, color: Color32::from_rgb(92, 214, 255), width: 14.0, points: vec![Pos2::new(5.0, 40.0), Pos2::new(115.0, 45.0)] });
+        d.add_mark(Stroke { ink: Ink::Highlighter, color: Color32::from_rgb(92, 214, 255), width: 14.0, points: vec![Pos2::new(5.0, 40.0), Pos2::new(115.0, 45.0)] });
         d.add_mark(Text { text: "Ok".into(), color: Color32::BLACK, size: 40.0, outline: true, pos: Pos2::new(40.0, 30.0) });
 
         let mut shown = d.flatten();
@@ -2052,8 +1970,7 @@ mod tests {
         let mut d = Doc::new(white(50, 50));
         for y in [10.0, 40.0] {
             d.marks.push(Arc::new(Mark::Stroke(Stroke {
-                on_dark: false,
-                ink: Ink::Highlighter,
+                    ink: Ink::Highlighter,
                 color: Color32::YELLOW,
                 width: 4.0,
                 points: vec![Pos2::new(5.0, y), Pos2::new(45.0, y)],
