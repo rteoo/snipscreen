@@ -280,6 +280,8 @@ pub struct Loaded {
     pub problems: Vec<String>,
     /// False on a first run: nothing was saved yet.
     pub existed: bool,
+    /// Where changes are saved; `None` when they must not be (no AppData folder, or a file that is
+    /// there but couldn't be read, which a save would overwrite with defaults).
     pub path: Option<PathBuf>,
 }
 
@@ -288,16 +290,27 @@ pub fn path() -> Option<PathBuf> {
 }
 
 pub fn load() -> Loaded {
-    let Some(path) = path() else {
-        return Loaded { settings: Settings::default(), problems: vec!["couldn't find your AppData folder, so settings won't be kept".into()], existed: false, path: None };
-    };
-    match std::fs::read_to_string(&path) {
-        Ok(text) => {
-            let (settings, problems) = Settings::parse(&text);
+    match path() {
+        Some(path) => load_from(path),
+        None => Loaded { settings: Settings::default(), problems: vec!["couldn't find your AppData folder, so settings won't be kept".into()], existed: false, path: None },
+    }
+}
+
+fn load_from(path: PathBuf) -> Loaded {
+    match std::fs::read(&path) {
+        // A stray non-UTF-8 byte (an editor saving in the ANSI code page) costs only the value it is in.
+        Ok(bytes) => {
+            let (settings, problems) = Settings::parse(&String::from_utf8_lossy(&bytes));
             Loaded { settings, problems, existed: true, path: Some(path) }
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Loaded { settings: Settings::default(), problems: Vec::new(), existed: false, path: Some(path) },
-        Err(e) => Loaded { settings: Settings::default(), problems: vec![format!("couldn't read {}: {e}", path.display())], existed: true, path: Some(path) },
+        // Locked by another program, or no permission: the file is still there and must survive.
+        Err(e) => Loaded {
+            settings: Settings::default(),
+            problems: vec![format!("couldn't read {} ({e}), so changes won't be saved until SnipScreen starts again", path.display())],
+            existed: true,
+            path: None,
+        },
     }
 }
 
@@ -444,6 +457,34 @@ mod tests {
         assert!(Hotkey { mods: MOD_SHIFT, vk: VK_SNAPSHOT as u32 }.check().is_ok());
         assert!(Hotkey { mods: MOD_WIN, vk: b'Q' as u32 }.check().is_ok());
         assert!(Hotkey { mods: MOD_CONTROL, vk: 0xE5 }.check().is_err(), "keys without a name are refused");
+    }
+
+    #[test]
+    fn a_file_with_stray_bytes_keeps_its_readable_values() {
+        let dir = std::env::temp_dir().join(format!("snipscreen-lossy-{}", std::process::id()));
+        let path = dir.join("settings.ini");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&path, b"auto_save=false\r\nmic=Microfone (Realtek\xae)\r\ndelay=5\r\n").unwrap();
+        let loaded = load_from(path.clone());
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!((loaded.settings.auto_save, loaded.settings.delay), (false, 5));
+        assert_eq!(loaded.path, Some(path), "still saved to");
+    }
+
+    #[test]
+    fn a_file_that_cant_be_read_is_never_overwritten() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = std::env::temp_dir().join(format!("snipscreen-locked-{}", std::process::id()));
+        let path = dir.join("settings.ini");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&path, "auto_save=false\r\n").unwrap();
+        // Another program holding the file without sharing it: a sharing violation on read.
+        let lock = std::fs::OpenOptions::new().read(true).share_mode(0).open(&path).unwrap();
+        let loaded = load_from(path.clone());
+        drop(lock);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(loaded.path, None, "saving is off for the session");
+        assert!(loaded.problems[0].contains("won't be saved"), "{:?}", loaded.problems);
     }
 
     #[test]
