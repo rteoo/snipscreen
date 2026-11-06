@@ -16,15 +16,15 @@ use eframe::egui::{
 use windows_sys::Win32::Foundation::HWND;
 
 use crate::icons::{self, Icon};
-use crate::markup::{self, Doc, Ink, Mark, Stroke, Tiles};
+use crate::markup::{self, Doc, Ink, Mark, Shape, ShapeKind, Stroke, Tiles};
 use crate::widgets::{
     self, dim_outside, divider, escape_for_app, icon_button, Note, Notifier, PopupClickGuard, ACCENT, BTN, BUTTON_HOVER, DIVIDER_W, GAP, GROUP_GAP, ICON,
     ICON_OFF, MIN_WINDOW_H, MIN_WINDOW_W, TOOLBAR_BG,
 };
 use crate::win;
 
-/// Measured: New button 80 + markup with crop buttons 350 + output group 133 + 2 gaps + 24 toolbar margin = 619.
-pub const MIN_EDIT_W: f32 = 630.0;
+/// Measured: New button 80 + markup with crop buttons 390 + output group 133 + 2 gaps + 24 toolbar margin = 659.
+pub const MIN_EDIT_W: f32 = 670.0;
 const MIN_ZOOM: f32 = 0.05;
 const MAX_ZOOM: f32 = 8.0;
 /// Snip zoom change per Ctrl+Plus / Ctrl+Minus press.
@@ -41,8 +41,20 @@ const CASCADE: i32 = 28;
 pub enum Tool {
     Pen,
     Highlighter,
+    Shape,
     Eraser,
     Crop,
+}
+
+const SHAPES: [(ShapeKind, Icon, &str); 4] = [
+    (ShapeKind::Arrow, Icon::Arrow, "Arrow"),
+    (ShapeKind::Line, Icon::Line, "Line"),
+    (ShapeKind::Rectangle, Icon::RectOutline, "Rectangle"),
+    (ShapeKind::Ellipse, Icon::Ellipse, "Ellipse"),
+];
+
+fn shape_icon(kind: ShapeKind) -> Icon {
+    SHAPES.iter().find(|s| s.0 == kind).map_or(Icon::Arrow, |s| s.1)
 }
 
 const PEN_COLORS: [Color32; 6] = [
@@ -68,11 +80,19 @@ pub struct Tools {
     /// Colour and width in screen points.
     pub pen: (Color32, f32),
     pub highlighter: (Color32, f32),
+    pub shape_kind: ShapeKind,
+    pub shape: (Color32, f32),
 }
 
 impl Default for Tools {
     fn default() -> Self {
-        Self { tool: Tool::Pen, pen: (PEN_COLORS[2], 4.0), highlighter: (HIGHLIGHT_COLORS[0], 18.0) }
+        Self {
+            tool: Tool::Pen,
+            pen: (PEN_COLORS[2], 4.0),
+            highlighter: (HIGHLIGHT_COLORS[0], 18.0),
+            shape_kind: ShapeKind::Arrow,
+            shape: (PEN_COLORS[2], 4.0),
+        }
     }
 }
 
@@ -156,7 +176,7 @@ impl Snip {
     }
 
     fn markup_width(&self) -> f32 {
-        let buttons = if self.crop.is_some() { 8.0 } else { 6.0 };
+        let buttons = if self.crop.is_some() { 9.0 } else { 7.0 };
         let dividers = 2.0;
         buttons * BTN.x + dividers * DIVIDER_W + (buttons + dividers - 1.0) * GAP
     }
@@ -165,11 +185,13 @@ impl Snip {
         for (tool, icon, tip) in [
             (Tool::Pen, Icon::Pen, "Pen (click again for colour and size)"),
             (Tool::Highlighter, Icon::Highlighter, "Highlighter (click again for colour and size)"),
-            (Tool::Eraser, Icon::Eraser, "Eraser: rubs out whole strokes"),
+            (Tool::Shape, shape_icon(self.tools.shape_kind), "Shapes (click again for shape, colour and size; Shift keeps lines at 45° and boxes square)"),
+            (Tool::Eraser, Icon::Eraser, "Eraser: rubs out whole marks"),
         ] {
             let ink = match tool {
                 Tool::Pen => Some(self.tools.pen.0),
                 Tool::Highlighter => Some(self.tools.highlighter.0),
+                Tool::Shape => Some(self.tools.shape.0),
                 _ => None,
             };
             let resp = icon_button(ui, icon, ink, self.tools.tool == tool, true, tip);
@@ -177,6 +199,7 @@ impl Snip {
             if resp.clicked() {
                 self.tools.tool = tool;
                 self.crop = None;
+                self.drawing = None;
             }
             if ink.is_some() {
                 egui::Popup::from_response(&resp)
@@ -207,11 +230,22 @@ impl Snip {
     }
 
     fn ink_options(&mut self, ui: &mut egui::Ui, tool: Tool) {
+        ui.spacing_mut().item_spacing = vec2(6.0, 8.0);
+        if tool == Tool::Shape {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = GAP;
+                for (kind, icon, tip) in SHAPES {
+                    if icon_button(ui, icon, None, self.tools.shape_kind == kind, true, tip).clicked() {
+                        self.tools.shape_kind = kind;
+                    }
+                }
+            });
+        }
         let ((color, width), palette, range) = match tool {
             Tool::Highlighter => (&mut self.tools.highlighter, &HIGHLIGHT_COLORS[..], 6.0..=48.0),
+            Tool::Shape => (&mut self.tools.shape, &PEN_COLORS[..], 1.0..=24.0),
             _ => (&mut self.tools.pen, &PEN_COLORS[..], 1.0..=24.0),
         };
-        ui.spacing_mut().item_spacing = vec2(6.0, 8.0);
         ui.horizontal(|ui| {
             for &c in palette {
                 let (rect, resp) = ui.allocate_exact_size(vec2(24.0, 24.0), Sense::click());
@@ -314,6 +348,30 @@ impl Snip {
                     if resp.drag_stopped() || resp.clicked() {
                         if let Some(m) = drawing.take() {
                             canvas.commit(doc, m);
+                        }
+                    }
+                }
+                Tool::Shape => {
+                    if resp.hovered() {
+                        ctx.set_cursor_icon(CursorIcon::Crosshair);
+                    }
+                    if resp.drag_started() {
+                        if let Some(p) = origin {
+                            let (color, width) = tools.shape;
+                            let p = to_px(p);
+                            *drawing = Some(Mark::Shape(Shape { kind: tools.shape_kind, color, width: width * k, from: p, to: p }));
+                        }
+                    }
+                    if let (Some(Mark::Shape(s)), Some(p)) = (drawing.as_mut(), resp.interact_pointer_pos()) {
+                        let p = to_px(p);
+                        s.to = if ctx.input(|i| i.modifiers.shift) { markup::constrain(s.kind, s.from, p) } else { p };
+                    }
+                    if resp.drag_stopped() {
+                        match drawing.take() {
+                            // Shorter than a few points on screen is a slip, not a shape.
+                            Some(Mark::Shape(s)) if s.from.distance(s.to) < 3.0 * k => {}
+                            Some(m) => canvas.commit(doc, m),
+                            None => {}
                         }
                     }
                 }
@@ -859,11 +917,13 @@ struct Live {
     tiles: Tiles,
     /// Points of the stroke already painted into `tiles`.
     done: usize,
+    /// Any other mark, as last painted.
+    last: Option<Mark>,
 }
 
 impl Live {
     fn new(size: [usize; 2]) -> Self {
-        Self { tiles: Tiles::new(size), done: 0 }
+        Self { tiles: Tiles::new(size), done: 0, last: None }
     }
 }
 
@@ -910,19 +970,33 @@ impl CanvasTex {
     }
 
     /// Shows `m`, the mark being drawn. A stroke only grows, so only the tiles its newest segments
-    /// reach are repainted.
+    /// reach are repainted; any other mark is repainted where it is now, and the tiles it has left
+    /// go back to the picture. Nothing is redone while the mark stays the same.
     fn show_live(&mut self, m: &Mark) {
-        let Mark::Stroke(s) = m;
-        if s.points.len() < self.live.done {
-            self.clear_live();
-        }
-        if s.points.len() == self.live.done {
-            return;
-        }
         let mut fresh = Tiles::new(self.shown.size);
-        s.footprint_from(self.live.done, &mut fresh);
-        self.live.done = s.points.len();
-        self.live.tiles.union(&fresh);
+        match m {
+            Mark::Stroke(s) => {
+                if s.points.len() < self.live.done {
+                    self.clear_live();
+                }
+                if s.points.len() == self.live.done {
+                    return;
+                }
+                s.footprint_from(self.live.done, &mut fresh);
+                self.live.done = s.points.len();
+                self.live.tiles.union(&fresh);
+            }
+            _ => {
+                if self.live.last.as_ref() == Some(m) {
+                    return;
+                }
+                m.footprint(&mut fresh);
+                let left = self.live.tiles.minus(&fresh);
+                self.upload(&left, None);
+                self.live.tiles = fresh.clone();
+                self.live.last = Some(m.clone());
+            }
+        }
         self.upload(&fresh, Some(m));
     }
 
@@ -1172,15 +1246,15 @@ mod tests {
         assert_eq!(edit_window_size(vec2(5000.0, 5000.0), wide), wide * 0.85);
     }
 
-    /// Group widths as laid out by `Editor::toolbar`: New button 80, output 133, markup with crop buttons 350.
+    /// Group widths as laid out by `Editor::toolbar`: New button 80, output 133, markup with crop buttons 390.
     const NEW_END: f32 = 12.0 + 80.0;
     const OUT_W: f32 = 133.0;
-    const MARKUP_W: f32 = 350.0;
+    const MARKUP_W: f32 = 390.0;
 
     #[test]
     fn markup_width_matches_the_measured_toolbar() {
         let mut snip = Snip::new(white(4, 4), Tools::default());
-        assert_eq!(snip.markup_width(), 6.0 * BTN.x + 2.0 * DIVIDER_W + 7.0 * GAP);
+        assert_eq!(snip.markup_width(), 7.0 * BTN.x + 2.0 * DIVIDER_W + 8.0 * GAP);
         snip.crop = Some((Pos2::ZERO, pos2(2.0, 2.0)));
         assert_eq!(snip.markup_width(), MARKUP_W);
         const { assert!(NEW_END + GROUP_GAP + MARKUP_W + GROUP_GAP + OUT_W + 12.0 <= MIN_EDIT_W, "MIN_EDIT_W fits all three groups") };
@@ -1390,6 +1464,28 @@ mod tests {
             drag_and_compare(&mut snip, &PATH[1..]);
         }
     }
+    #[test]
+    fn shapes_show_exactly_what_is_saved_while_they_are_dragged() {
+        for (kind, _, _) in SHAPES {
+            let mut snip = Snip::new(gradient(300, 200), Tools { tool: Tool::Shape, shape_kind: kind, ..Tools::default() });
+            drag_and_compare(&mut snip, &PATH);
+            assert!(matches!(&snip.doc.marks[0], Mark::Shape(s) if s.kind == kind && s.to == pos2(600.0 - 640.0 + 150.0, 360.0 - 400.0 + 100.0)), "{kind:?} ends where the drag ended");
+        }
+    }
+
+    #[test]
+    fn a_click_with_the_shape_tool_draws_nothing() {
+        let ctx = egui::Context::default();
+        let mut snip = Snip::new(gradient(300, 200), Tools { tool: Tool::Shape, ..Tools::default() });
+        let mut screen = Screen { image: None };
+        canvas_frame(&ctx, &mut snip, &mut screen, vec![]);
+        canvas_frame(&ctx, &mut snip, &mut screen, vec![Event::PointerMoved(PATH[0]), pointer(PATH[0], true)]);
+        canvas_frame(&ctx, &mut snip, &mut screen, vec![pointer(PATH[0], false)]);
+        canvas_frame(&ctx, &mut snip, &mut screen, vec![]);
+        assert!(snip.doc.marks.is_empty() && snip.drawing.is_none());
+        assert!(screen.pixels() == snip.doc.image.pixels);
+    }
+
 
     #[test]
     fn a_cancelled_stroke_leaves_the_picture_as_it_was() {
@@ -1455,7 +1551,13 @@ mod tests {
         let ctx = egui::Context::default();
         let mut editors = Editors::new(None);
         let (a, _, _) = editors.open_snip(&ctx, white(10, 10), 0, None);
-        let picked = Tools { tool: Tool::Highlighter, pen: (PEN_COLORS[3], 8.0), highlighter: (HIGHLIGHT_COLORS[2], 30.0) };
+        let picked = Tools {
+            tool: Tool::Highlighter,
+            pen: (PEN_COLORS[3], 8.0),
+            highlighter: (HIGHLIGHT_COLORS[2], 30.0),
+            shape_kind: ShapeKind::Ellipse,
+            shape: (PEN_COLORS[4], 12.0),
+        };
         editors.with(a, |e| {
             let Content::Snip(s) = &mut e.content else { panic!("a snip") };
             s.tools = picked;

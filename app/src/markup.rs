@@ -66,10 +66,135 @@ impl Stroke {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ShapeKind {
+    Arrow,
+    Line,
+    Rectangle,
+    Ellipse,
+}
+
+/// A shape dragged out from `from` to `to`: a line or arrow between them, or the outline of the
+/// rectangle or ellipse they span. Drawn opaque in `color`.
+#[derive(Clone, PartialEq, Debug)]
+pub struct Shape {
+    pub kind: ShapeKind,
+    pub color: Color32,
+    /// Line thickness in image pixels.
+    pub width: f32,
+    pub from: Pos2,
+    pub to: Pos2,
+}
+
+impl Shape {
+    fn radius(&self) -> f32 {
+        (self.width * 0.5).max(0.5)
+    }
+
+    /// End of the shaft and the head's corners (tip first). The head grows with the line width and
+    /// shrinks to fit a short arrow; the shaft ends inside the head so its round cap never shows.
+    fn arrow(&self) -> (Pos2, [Pos2; 3]) {
+        let d = self.to - self.from;
+        let len = d.length();
+        if len < 1e-3 {
+            return (self.to, [self.to; 3]);
+        }
+        let dir = d / len;
+        let length = (self.width * 3.0 + 6.0).min(len);
+        let half = length * 0.6;
+        let base = self.to - dir * length;
+        let side = dir.rot90() * half;
+        (base + dir * length * 0.3, [self.to, base + side, base - side])
+    }
+
+    /// The thick centre-line segments of a line, arrow shaft or ellipse.
+    fn segments(&self) -> Vec<(Pos2, Pos2)> {
+        match self.kind {
+            ShapeKind::Line => vec![(self.from, self.to)],
+            ShapeKind::Arrow => vec![(self.from, self.arrow().0)],
+            ShapeKind::Rectangle => {
+                let r = Rect::from_two_pos(self.from, self.to);
+                let c = [r.left_top(), r.right_top(), r.right_bottom(), r.left_bottom()];
+                (0..4).map(|i| (c[i], c[(i + 1) % 4])).collect()
+            }
+            ShapeKind::Ellipse => {
+                let r = Rect::from_two_pos(self.from, self.to);
+                let (a, b) = (r.width() / 2.0, r.height() / 2.0);
+                // Ramanujan's perimeter; chords of about 3 px keep the outline round at any size.
+                let perimeter = std::f32::consts::PI * (3.0 * (a + b) - ((3.0 * a + b) * (a + 3.0 * b)).sqrt());
+                let n = (perimeter / 3.0).clamp(24.0, 4096.0) as usize;
+                let at = |i: usize| {
+                    let t = std::f32::consts::TAU * i as f32 / n as f32;
+                    r.center() + eframe::egui::vec2(a * t.cos(), b * t.sin())
+                };
+                (0..n).map(|i| (at(i), at(i + 1))).collect()
+            }
+        }
+    }
+
+    fn footprint(&self, tiles: &mut Tiles) {
+        let reach = self.radius() + 1.0;
+        for (a, b) in self.segments() {
+            tiles.add_segment(a, b, reach);
+        }
+        if self.kind == ShapeKind::Arrow {
+            tiles.add(Rect::from_points(&self.arrow().1).expand(1.0));
+        }
+    }
+
+    fn paint(&self, patch: &mut ColorImage, at: [usize; 2]) {
+        let r = patch_rect(patch, at);
+        let mut cover = vec![0f32; patch.pixels.len()];
+        match self.kind {
+            ShapeKind::Rectangle => cover_box_outline(&mut cover, r, Rect::from_two_pos(self.from, self.to), self.radius()),
+            _ => cover_segments(&mut cover, r, self.segments().into_iter(), self.radius()),
+        }
+        if self.kind == ShapeKind::Arrow {
+            cover_triangle(&mut cover, r, self.arrow().1);
+        }
+        for (px, &k) in patch.pixels.iter_mut().zip(&cover) {
+            if k > 0.0 {
+                *px = over(*px, self.color, k);
+            }
+        }
+    }
+
+    fn touches(&self, p: Pos2, radius: f32) -> bool {
+        let reach = self.width * 0.5 + radius;
+        self.segments().into_iter().any(|(a, b)| dist_to_segment(p, a, b) <= reach)
+            || (self.kind == ShapeKind::Arrow && triangle_distance(p, self.arrow().1) <= radius)
+    }
+}
+
+/// Where a shape dragged from `from` to `to` ends with Shift held: lines and arrows snap to the
+/// nearest 45°, keeping their length; rectangles and ellipses become squares and circles.
+pub fn constrain(kind: ShapeKind, from: Pos2, to: Pos2) -> Pos2 {
+    let d = to - from;
+    match kind {
+        ShapeKind::Line | ShapeKind::Arrow => {
+            let step = std::f32::consts::FRAC_PI_4;
+            let angle = (d.y.atan2(d.x) / step).round() * step;
+            from + eframe::egui::vec2(angle.cos(), angle.sin()) * d.length()
+        }
+        ShapeKind::Rectangle | ShapeKind::Ellipse => {
+            let side = d.x.abs().max(d.y.abs());
+            let sign = |v: f32| if v < 0.0 { -1.0 } else { 1.0 };
+            from + eframe::egui::vec2(sign(d.x), sign(d.y)) * side
+        }
+    }
+}
+
 /// Anything drawn on the snip. Each mark is burned into the picture on its own, in order.
 #[derive(Clone, PartialEq, Debug)]
 pub enum Mark {
     Stroke(Stroke),
+    Shape(Shape),
+}
+
+impl From<Shape> for Mark {
+    fn from(s: Shape) -> Self {
+        Mark::Shape(s)
+    }
 }
 
 impl From<Stroke> for Mark {
@@ -83,6 +208,7 @@ impl Mark {
     pub fn footprint(&self, tiles: &mut Tiles) {
         match self {
             Mark::Stroke(s) => s.footprint_from(0, tiles),
+            Mark::Shape(s) => s.footprint(tiles),
         }
     }
 
@@ -92,18 +218,24 @@ impl Mark {
     pub fn paint(&self, patch: &mut ColorImage, at: [usize; 2]) {
         match self {
             Mark::Stroke(s) => s.paint(patch, at),
+            Mark::Shape(s) => s.paint(patch, at),
         }
     }
 
     fn touches(&self, p: Pos2, radius: f32) -> bool {
         match self {
             Mark::Stroke(s) => s.touches(p, radius),
+            Mark::Shape(s) => s.touches(p, radius),
         }
     }
 
     fn translate(&mut self, d: eframe::egui::Vec2) {
         match self {
             Mark::Stroke(s) => s.points.iter_mut().for_each(|p| *p += d),
+            Mark::Shape(s) => {
+                s.from += d;
+                s.to += d;
+            }
         }
     }
 }
@@ -216,6 +348,76 @@ fn cover_segments(cover: &mut [f32], r: PxRect, segments: impl Iterator<Item = (
                 if c > *slot {
                     *slot = c;
                 }
+            }
+        }
+    }
+}
+
+/// Raises `cover` to the exact area coverage of a rectangle outline: `rect`'s edges drawn
+/// `2 * half` thick, straddling the edge, with square corners. Only the band is visited, so a huge
+/// rectangle costs its perimeter, not its area.
+fn cover_box_outline(cover: &mut [f32], r: PxRect, rect: Rect, half: f32) {
+    let (outer, inner) = (rect.expand(half), rect.shrink(half));
+    let overlap = |lo: f32, hi: f32, p: f32| (hi.min(p + 1.0) - lo.max(p)).clamp(0.0, 1.0);
+    let area = |b: Rect, x: f32, y: f32| if b.is_positive() { overlap(b.min.x, b.max.x, x) * overlap(b.min.y, b.max.y, y) } else { 0.0 };
+    let bw = r.x1 - r.x0;
+    let clip_x = |v: f32| (v.max(0.0) as usize).clamp(r.x0, r.x1);
+    let (y0, y1) = ((outer.min.y.floor().max(0.0) as usize).max(r.y0), (outer.max.y.ceil().max(0.0) as usize).min(r.y1));
+    let (ox0, ox1) = (clip_x(outer.min.x.floor()), clip_x(outer.max.x.ceil()));
+    for y in y0..y1 {
+        let fy = y as f32;
+        // Rows that cross the hollow middle only need the left and right bands.
+        let hollow = inner.is_positive() && fy >= inner.min.y.ceil() && fy + 1.0 <= inner.max.y.floor();
+        let spans = if hollow {
+            [(ox0, clip_x(inner.min.x.ceil())), (clip_x(inner.max.x.floor()), ox1)]
+        } else {
+            [(ox0, ox1), (0, 0)]
+        };
+        let row = &mut cover[(y - r.y0) * bw..(y - r.y0 + 1) * bw];
+        for (sx0, sx1) in spans {
+            for x in sx0..sx1 {
+                let fx = x as f32;
+                let c = area(outer, fx, fy) - area(inner, fx, fy);
+                let slot = &mut row[x - r.x0];
+                if c > *slot {
+                    *slot = c;
+                }
+            }
+        }
+    }
+}
+
+/// Signed distance from `p` to a triangle (negative inside). Exact inside and along the edges,
+/// slightly short just past a corner, which keeps tips sharp.
+fn triangle_distance(p: Pos2, t: [Pos2; 3]) -> f32 {
+    let centre = (t[0].to_vec2() + t[1].to_vec2() + t[2].to_vec2()) / 3.0;
+    (0..3)
+        .map(|i| {
+            let (a, b) = (t[i], t[(i + 1) % 3]);
+            let mut n = (b - a).rot90().normalized();
+            if n.dot(a.to_vec2() - centre) < 0.0 {
+                n = -n;
+            }
+            n.dot(p - a)
+        })
+        .fold(f32::MIN, f32::max)
+}
+
+/// Raises `cover` to the antialiased coverage of a filled triangle.
+fn cover_triangle(cover: &mut [f32], r: PxRect, t: [Pos2; 3]) {
+    if (t[1] - t[0]).rot90().dot(t[2] - t[0]).abs() < 1e-3 {
+        return;
+    }
+    let b = Rect::from_points(&t).expand(1.0);
+    let bw = r.x1 - r.x0;
+    let (x0, x1) = ((b.min.x.floor().max(0.0) as usize).max(r.x0), (b.max.x.ceil().max(0.0) as usize).min(r.x1));
+    let (y0, y1) = ((b.min.y.floor().max(0.0) as usize).max(r.y0), (b.max.y.ceil().max(0.0) as usize).min(r.y1));
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let c = (0.5 - triangle_distance(Pos2::new(x as f32 + 0.5, y as f32 + 0.5), t)).clamp(0.0, 1.0);
+            let slot = &mut cover[(y - r.y0) * bw + (x - r.x0)];
+            if c > *slot {
+                *slot = c;
             }
         }
     }
@@ -488,7 +690,12 @@ mod tests {
     fn stroke(m: &Mark) -> &Stroke {
         match m {
             Mark::Stroke(s) => s,
+            other => panic!("not a stroke: {other:?}"),
         }
+    }
+
+    fn shape(kind: ShapeKind, width: f32, from: (f32, f32), to: (f32, f32)) -> Mark {
+        Mark::Shape(Shape { kind, color: Color32::RED, width, from: Pos2::new(from.0, from.1), to: Pos2::new(to.0, to.1) })
     }
 
     #[test]
@@ -618,6 +825,13 @@ mod tests {
             Mark::Stroke(zigzag()),
             Mark::Stroke(Stroke { ink: Ink::Pen, color: Color32::RED, width: 30.0, points: vec![Pos2::new(66.0, 2.0)] }),
             Mark::Stroke(Stroke { ink: Ink::Pen, color: Color32::BLUE, width: 3.0, points: vec![Pos2::new(-5.0, 48.0), Pos2::new(75.0, 1.0)] }),
+            shape(ShapeKind::Arrow, 3.0, (5.0, 45.0), (63.5, 4.2)),
+            shape(ShapeKind::Arrow, 12.0, (60.0, 10.0), (10.0, 40.0)),
+            shape(ShapeKind::Line, 7.0, (-20.0, 20.0), (90.0, 33.0)),
+            shape(ShapeKind::Rectangle, 5.0, (3.3, 4.7), (66.2, 44.9)),
+            shape(ShapeKind::Rectangle, 40.0, (20.0, 10.0), (30.0, 30.0)),
+            shape(ShapeKind::Ellipse, 2.0, (2.0, 2.0), (68.0, 48.0)),
+            shape(ShapeKind::Ellipse, 9.0, (30.0, -10.0), (95.0, 20.0)),
         ];
         for m in &marks {
             let mut by_runs = gradient(70, 50);
@@ -626,6 +840,73 @@ mod tests {
             m.paint(&mut whole, [0, 0]);
             assert!(by_runs.pixels == whole.pixels, "{m:?} paints outside its footprint");
         }
+    }
+
+    #[test]
+    fn rectangles_have_crisp_square_corners_and_a_hollow_middle() {
+        let mut img = white(60, 50);
+        burn(&mut img, &shape(ShapeKind::Rectangle, 4.0, (10.0, 10.0), (50.0, 40.0)));
+        let at = |x: usize, y: usize| img.pixels[y * 60 + x];
+        for (x, y) in [(8, 8), (11, 11), (9, 25), (30, 41), (51, 39)] {
+            assert_eq!(at(x, y), Color32::RED, "outline at ({x}, {y})");
+        }
+        for (x, y) in [(7, 7), (12, 12), (30, 25), (52, 25)] {
+            assert_eq!(at(x, y), Color32::WHITE, "clear at ({x}, {y})");
+        }
+    }
+
+    #[test]
+    fn arrows_end_in_a_filled_head_at_the_tip() {
+        let mut img = white(80, 40);
+        burn(&mut img, &shape(ShapeKind::Arrow, 4.0, (5.0, 20.0), (70.0, 20.0)));
+        let at = |x: usize, y: usize| img.pixels[y * 80 + x];
+        assert_eq!(at(20, 20), Color32::RED, "shaft");
+        assert_eq!(at(20, 23), Color32::WHITE, "shaft is the line width");
+        assert_eq!(at(60, 24), Color32::RED, "the head is wider than the shaft");
+        assert_eq!(at(66, 20), Color32::RED, "filled up to the tip");
+        assert_eq!(at(72, 20), Color32::WHITE, "nothing past the tip");
+        // Head scales with the width.
+        let Mark::Shape(thin) = shape(ShapeKind::Arrow, 2.0, (0.0, 0.0), (100.0, 0.0)) else { unreachable!() };
+        let Mark::Shape(thick) = shape(ShapeKind::Arrow, 10.0, (0.0, 0.0), (100.0, 0.0)) else { unreachable!() };
+        assert!(thick.arrow().1[1].y.abs() > 2.0 * thin.arrow().1[1].y.abs());
+    }
+
+    #[test]
+    fn ellipses_are_round_outlines() {
+        let mut img = white(60, 60);
+        burn(&mut img, &shape(ShapeKind::Ellipse, 4.0, (10.0, 10.0), (50.0, 50.0)));
+        let at = |x: usize, y: usize| img.pixels[y * 60 + x];
+        for (x, y) in [(10, 30), (49, 30), (30, 10), (30, 49), (16, 16)] {
+            assert_eq!(at(x, y), Color32::RED, "on the circle at ({x}, {y})");
+        }
+        for (x, y) in [(30, 30), (11, 11), (5, 30)] {
+            assert_eq!(at(x, y), Color32::WHITE, "off the circle at ({x}, {y})");
+        }
+    }
+
+    #[test]
+    fn shift_snaps_lines_to_45_degrees_and_boxes_to_squares() {
+        let from = Pos2::new(10.0, 10.0);
+        let snapped = constrain(ShapeKind::Line, from, Pos2::new(20.0, 11.0));
+        assert!((snapped.y - 10.0).abs() < 1e-4 && (snapped.x - (10.0 + 101f32.sqrt())).abs() < 1e-4, "{snapped:?}");
+        let diag = constrain(ShapeKind::Arrow, from, Pos2::new(0.0, 21.0));
+        assert!(((diag - from).angle() - 3.0 * std::f32::consts::FRAC_PI_4).abs() < 1e-4, "{diag:?}");
+        assert_eq!(constrain(ShapeKind::Rectangle, from, Pos2::new(20.0, 7.0)), Pos2::new(20.0, 0.0));
+        assert_eq!(constrain(ShapeKind::Ellipse, from, Pos2::new(4.0, 30.0)), Pos2::new(-10.0, 30.0));
+    }
+
+    #[test]
+    fn eraser_finds_shapes_by_their_outline() {
+        let mut d = Doc::new(white(100, 100));
+        d.add_mark(shape(ShapeKind::Rectangle, 4.0, (10.0, 10.0), (90.0, 90.0)));
+        d.add_mark(shape(ShapeKind::Arrow, 4.0, (10.0, 50.0), (60.0, 50.0)));
+        assert!(!d.hits(Pos2::new(30.0, 30.0), 3.0), "inside the rectangle is empty");
+        assert!(d.hits(Pos2::new(50.0, 54.0), 1.0), "in the arrow head");
+        assert!(d.erase_at(Pos2::new(90.0, 40.0), 2.0));
+        assert_eq!(d.marks.len(), 1);
+        assert!(matches!(&d.marks[0], Mark::Shape(Shape { kind: ShapeKind::Arrow, .. })));
+        d.crop(Rect::from_min_max(Pos2::new(5.0, 5.0), Pos2::new(95.0, 95.0)));
+        assert!(matches!(&d.marks[0], Mark::Shape(s) if s.from == Pos2::new(5.0, 45.0)), "crop moves shapes too");
     }
 
     #[test]
