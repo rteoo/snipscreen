@@ -43,7 +43,120 @@ pub enum Tool {
     Highlighter,
     Shape,
     Eraser,
-    Crop,
+}
+
+/// The part of the crop frame a drag holds: a side, a corner, or the whole frame.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Grip {
+    Move,
+    N,
+    S,
+    E,
+    W,
+    NE,
+    NW,
+    SE,
+    SW,
+}
+
+impl Grip {
+    fn cursor(self) -> CursorIcon {
+        match self {
+            Grip::Move => CursorIcon::Move,
+            Grip::N | Grip::S => CursorIcon::ResizeVertical,
+            Grip::E | Grip::W => CursorIcon::ResizeHorizontal,
+            Grip::NW | Grip::SE => CursorIcon::ResizeNwSe,
+            Grip::NE | Grip::SW => CursorIcon::ResizeNeSw,
+        }
+    }
+}
+
+/// How close to an edge, in points, the pointer takes hold of it.
+const GRIP_REACH: f32 = 10.0;
+/// Smallest crop frame, in points on screen.
+const MIN_CROP_PT: f32 = 16.0;
+
+/// The grip under `p` for a frame shown at `frame` (both in points): a corner or side within
+/// `reach`, else the inside to move it, else nothing.
+fn grip_at(frame: Rect, p: Pos2, reach: f32) -> Option<Grip> {
+    if !frame.expand(reach).contains(p) {
+        return None;
+    }
+    // On a frame narrower than two reaches both sides are in range; the nearer one wins.
+    let side = |lo: f32, hi: f32, v: f32| {
+        let (dl, dh) = ((v - lo).abs(), (v - hi).abs());
+        if dl.min(dh) > reach {
+            0
+        } else if dl <= dh {
+            -1
+        } else {
+            1
+        }
+    };
+    match (side(frame.left(), frame.right(), p.x), side(frame.top(), frame.bottom(), p.y)) {
+        (-1, -1) => Some(Grip::NW),
+        (1, -1) => Some(Grip::NE),
+        (-1, 1) => Some(Grip::SW),
+        (1, 1) => Some(Grip::SE),
+        (-1, 0) => Some(Grip::W),
+        (1, 0) => Some(Grip::E),
+        (0, -1) => Some(Grip::N),
+        (0, 1) => Some(Grip::S),
+        _ => frame.contains(p).then_some(Grip::Move),
+    }
+}
+
+/// The frame after dragging `grip` by `delta` from `start` (image pixels): it stays inside
+/// `bounds`, and sides never come closer than `min`.
+fn drag_frame(start: Rect, grip: Grip, delta: Vec2, bounds: Rect, min: f32) -> Rect {
+    if grip == Grip::Move {
+        let dx = delta.x.min(bounds.max.x - start.max.x).max(bounds.min.x - start.min.x);
+        let dy = delta.y.min(bounds.max.y - start.max.y).max(bounds.min.y - start.min.y);
+        return start.translate(vec2(dx, dy));
+    }
+    let min = vec2(min.min(bounds.width()), min.min(bounds.height()));
+    let mut r = start;
+    if matches!(grip, Grip::W | Grip::NW | Grip::SW) {
+        r.min.x = (start.min.x + delta.x).min(r.max.x - min.x).max(bounds.min.x);
+    }
+    if matches!(grip, Grip::E | Grip::NE | Grip::SE) {
+        r.max.x = (start.max.x + delta.x).max(r.min.x + min.x).min(bounds.max.x);
+    }
+    if matches!(grip, Grip::N | Grip::NW | Grip::NE) {
+        r.min.y = (start.min.y + delta.y).min(r.max.y - min.y).max(bounds.min.y);
+    }
+    if matches!(grip, Grip::S | Grip::SW | Grip::SE) {
+        r.max.y = (start.max.y + delta.y).max(r.min.y + min.y).min(bounds.max.y);
+    }
+    r
+}
+
+/// The crop frame: dimmed outside, a thin border, and bars on the corners and sides to grab.
+fn paint_crop_frame(painter: &egui::Painter, img_rect: Rect, frame: Rect, px: Vec2) {
+    dim_outside(painter, img_rect, frame);
+    painter.rect_stroke(frame, 0.0, (1.0, Color32::from_white_alpha(220)), StrokeKind::Middle);
+    let (len, thick) = (20.0_f32.min(frame.width() / 2.0).min(frame.height() / 2.0), 4.0);
+    let mut bars = Vec::new();
+    for (corner, dx, dy) in [(frame.left_top(), 1.0, 1.0), (frame.right_top(), -1.0, 1.0), (frame.left_bottom(), 1.0, -1.0), (frame.right_bottom(), -1.0, -1.0)] {
+        // Each arm starts half a bar outside the corner so the two meet in a square corner, not a notch.
+        bars.push([corner - vec2(dx * thick / 2.0, 0.0), corner + vec2(dx * len, 0.0)]);
+        bars.push([corner - vec2(0.0, dy * thick / 2.0), corner + vec2(0.0, dy * len)]);
+    }
+    let half = len * 0.6;
+    for (mid, along) in [(frame.center_top(), vec2(1.0, 0.0)), (frame.center_bottom(), vec2(1.0, 0.0)), (frame.left_center(), vec2(0.0, 1.0)), (frame.right_center(), vec2(0.0, 1.0))] {
+        bars.push([mid - along * half, mid + along * half]);
+    }
+    // A dark halo under each white bar keeps the handles visible on light and dark pictures alike.
+    for [a, b] in &bars {
+        painter.line_segment([*a, *b], (thick + 2.0, Color32::from_black_alpha(90)));
+    }
+    for [a, b] in &bars {
+        painter.line_segment([*a, *b], (thick, Color32::WHITE));
+    }
+    let galley = painter.layout_no_wrap(format!("{:.0} × {:.0}", px.x, px.y), FontId::proportional(12.0), Color32::WHITE);
+    let at = frame.left_top() + vec2(8.0, 10.0);
+    painter.rect_filled(Rect::from_min_size(at, galley.size() + vec2(10.0, 4.0)), 4.0, Color32::from_black_alpha(170));
+    painter.galley(at + vec2(5.0, 2.0), galley, Color32::WHITE);
 }
 
 const SHAPES: [(ShapeKind, Icon, &str); 4] = [
@@ -112,7 +225,10 @@ pub struct Snip {
     /// The mark being drawn, in image pixels.
     drawing: Option<Mark>,
     erase_marked: bool,
-    crop: Option<(Pos2, Pos2)>,
+    /// The crop frame while cropping, in image pixels.
+    crop: Option<Rect>,
+    /// The frame's grip being dragged, the frame as it was when the drag began, and where it began (points).
+    crop_drag: Option<(Grip, Rect, Pos2)>,
     /// `None` fits the snip to the window; otherwise 1.0 is one screen pixel per pixel.
     zoom: Option<f32>,
     /// Zoom factor requested from the keyboard this frame; `canvas` applies it.
@@ -152,7 +268,7 @@ pub struct Editor {
 
 impl Snip {
     pub fn new(image: ColorImage, tools: Tools) -> Self {
-        Self { doc: Doc::new(image), tools, texture: None, drawing: None, erase_marked: false, crop: None, zoom: None, key_zoom: 1.0 }
+        Self { doc: Doc::new(image), tools, texture: None, drawing: None, erase_marked: false, crop: None, crop_drag: None, zoom: None, key_zoom: 1.0 }
     }
 
     /// The picture with its ink, as it would be copied or saved. The canvas texture already holds
@@ -165,14 +281,32 @@ impl Snip {
     }
 
     fn apply_crop(&mut self) {
-        if let Some((a, b)) = self.crop.take() {
-            self.doc.crop(Rect::from_two_pos(a, b));
+        if let Some(r) = self.crop.take() {
+            self.doc.crop(r);
             self.zoom = None;
         }
+        self.crop_drag = None;
+    }
+
+    /// Starts cropping with the frame around the whole snip, or cancels the crop under way.
+    fn toggle_crop(&mut self) {
+        let [w, h] = self.doc.size();
+        self.crop = match self.crop {
+            Some(_) => None,
+            None => Some(Rect::from_min_size(Pos2::ZERO, vec2(w as f32, h as f32))),
+        };
+        self.crop_drag = None;
+        self.drawing = None;
+    }
+
+    fn cancel_crop(&mut self) {
+        self.crop = None;
+        self.crop_drag = None;
     }
 
     fn step(&mut self, redo: bool) {
         step_history(&mut self.doc, &mut self.crop, &mut self.drawing, redo);
+        self.crop_drag = None;
     }
 
     fn markup_width(&self) -> f32 {
@@ -198,7 +332,7 @@ impl Snip {
             let again = resp.clicked() && self.tools.tool == tool;
             if resp.clicked() {
                 self.tools.tool = tool;
-                self.crop = None;
+                self.cancel_crop();
                 self.drawing = None;
             }
             if ink.is_some() {
@@ -209,15 +343,15 @@ impl Snip {
             }
         }
         divider(ui);
-        if icon_button(ui, Icon::Crop, None, self.tools.tool == Tool::Crop, true, "Crop: drag a box, then Enter").clicked() {
-            self.tools.tool = Tool::Crop;
+        if icon_button(ui, Icon::Crop, None, self.crop.is_some(), true, "Crop: drag the frame's corners and sides, then Enter").clicked() {
+            self.toggle_crop();
         }
         if self.crop.is_some() {
             if icon_button(ui, Icon::Check, None, false, true, "Apply crop (Enter)").clicked() {
                 self.apply_crop();
             }
             if icon_button(ui, Icon::Close, None, false, true, "Cancel crop (Esc)").clicked() {
-                self.crop = None;
+                self.cancel_crop();
             }
         }
         divider(ui);
@@ -268,7 +402,7 @@ impl Snip {
 
     fn canvas(&mut self, ui: &mut egui::Ui, guard: &PopupClickGuard) {
         let ctx = ui.ctx().clone();
-        let Snip { doc, tools, texture, drawing, erase_marked, crop, zoom: zoom_choice, key_zoom } = self;
+        let Snip { doc, tools, texture, drawing, erase_marked, crop, crop_drag, zoom: zoom_choice, key_zoom } = self;
         let rev = (doc.image_rev, doc.ink_rev);
         if texture.as_ref().is_none_or(|c| c.rev != rev) {
             // ceiling: erase/undo re-flatten the whole snip (~150 ms for 20 long strokes on 4K); burn per-stroke tiles if erasing feels sticky.
@@ -327,6 +461,28 @@ impl Snip {
             let swallowed = guard.swallows(&ctx, resp.clicked());
             match tools.tool {
                 _ if swallowed => {}
+                // The crop frame takes the pointer from whichever tool is chosen until it is applied or cancelled.
+                _ if crop.is_some() => {
+                    let frame = crop.unwrap_or(Rect::NOTHING);
+                    let frame_pt = Rect::from_min_max(to_pt(frame.min), to_pt(frame.max));
+                    if resp.drag_started() {
+                        *crop_drag = origin.and_then(|o| grip_at(frame_pt, o, GRIP_REACH).map(|g| (g, frame, o)));
+                    }
+                    if let (Some((grip, start, o)), Some(p)) = (*crop_drag, resp.interact_pointer_pos()) {
+                        let bounds = Rect::from_min_size(Pos2::ZERO, px_size);
+                        *crop = Some(drag_frame(start, grip, (p - o) * k, bounds, MIN_CROP_PT * k));
+                    }
+                    if resp.drag_stopped() {
+                        *crop_drag = None;
+                    }
+                    let held = crop_drag.map(|(g, _, _)| g).or_else(
+|| resp.hover_pos().and_then(|p| grip_at(frame_pt, p, GRIP_REACH)));
+                    if let Some(g) = held {
+                        ctx.set_cursor_icon(g.cursor());
+                    }
+                    let frame = crop.unwrap_or(frame);
+                    paint_crop_frame(painter, img_rect, Rect::from_min_max(to_pt(frame.min), to_pt(frame.max)), frame.size());
+                }
                 Tool::Pen | Tool::Highlighter => {
                     let (ink, (color, width)) = if tools.tool == Tool::Pen { (Ink::Pen, tools.pen) } else { (Ink::Highlighter, tools.highlighter) };
                     if resp.hovered() {
@@ -395,35 +551,6 @@ impl Snip {
                                 doc.erase_at(p, r);
                             }
                         }
-                    }
-                }
-                Tool::Crop => {
-                    if resp.hovered() {
-                        ctx.set_cursor_icon(CursorIcon::Crosshair);
-                    }
-                    let clamp = |p: Pos2| p.clamp(Pos2::ZERO, px_size.to_pos2());
-                    if resp.drag_started() {
-                        if let Some(p) = origin {
-                            *crop = Some((clamp(to_px(p)), clamp(to_px(p))));
-                        }
-                    }
-                    if resp.dragged() {
-                        if let (Some((_, b)), Some(p)) = (crop.as_mut(), pointer) {
-                            *b = clamp(to_px(p));
-                        }
-                    }
-                    if let Some((a, b)) = *crop {
-                        let sel = Rect::from_two_pos(to_pt(a), to_pt(b));
-                        dim_outside(painter, img_rect, sel);
-                        painter.rect_stroke(sel, 0.0, (1.5, Color32::WHITE), StrokeKind::Outside);
-                        let r = Rect::from_two_pos(a, b);
-                        painter.text(
-                            sel.left_top() + vec2(0.0, -6.0),
-                            Align2::LEFT_BOTTOM,
-                            format!("{:.0} × {:.0}  ·  Enter to crop", r.width(), r.height()),
-                            FontId::proportional(12.0),
-                            Color32::WHITE,
-                        );
                     }
                 }
             }
@@ -553,7 +680,7 @@ impl Editor {
             snip.apply_crop();
         }
         if esc {
-            snip.crop = None;
+            snip.cancel_crop();
         }
         if zoom_fit {
             snip.zoom = None;
@@ -1047,7 +1174,7 @@ fn zoom_badge(painter: &egui::Painter, view: Rect, zoom: f32) {
 /// Undoes or redoes one step. The pending crop box is in pixels of the image it was drawn on,
 /// and the restored image can be a different size, so the box is dropped rather than applied to it.
 /// A mark still being drawn is in the old image's coordinates, so it is dropped as well.
-fn step_history(doc: &mut Doc, crop: &mut Option<(Pos2, Pos2)>, drawing: &mut Option<Mark>, redo: bool) {
+fn step_history(doc: &mut Doc, crop: &mut Option<Rect>, drawing: &mut Option<Mark>, redo: bool) {
     if redo {
         doc.redo();
     } else {
@@ -1128,14 +1255,14 @@ mod tests {
         let mut doc = Doc::new(white(100, 80));
         doc.crop(Rect::from_min_max(pos2(10.0, 10.0), pos2(60.0, 50.0)));
         assert_eq!(doc.size(), [50, 40]);
-        let box_on_cropped = Some((pos2(5.0, 5.0), pos2(45.0, 35.0)));
+        let box_on_cropped = Some(Rect::from_min_max(pos2(5.0, 5.0), pos2(45.0, 35.0)));
 
         let mut crop = box_on_cropped;
         step_history(&mut doc, &mut crop, &mut None, false);
         assert_eq!(doc.size(), [100, 80], "undo restores the larger image");
         assert_eq!(crop, None, "the 50x40 box must not carry over to the 100x80 image");
 
-        let mut crop = Some((pos2(80.0, 60.0), pos2(99.0, 79.0)));
+        let mut crop = Some(Rect::from_min_max(pos2(80.0, 60.0), pos2(99.0, 79.0)));
         step_history(&mut doc, &mut crop, &mut None, true);
         assert_eq!(doc.size(), [50, 40], "redo re-crops");
         assert_eq!(crop, None, "a box drawn on the large image would fall outside the small one");
@@ -1255,7 +1382,7 @@ mod tests {
     fn markup_width_matches_the_measured_toolbar() {
         let mut snip = Snip::new(white(4, 4), Tools::default());
         assert_eq!(snip.markup_width(), 7.0 * BTN.x + 2.0 * DIVIDER_W + 8.0 * GAP);
-        snip.crop = Some((Pos2::ZERO, pos2(2.0, 2.0)));
+        snip.crop = Some(Rect::from_min_max(Pos2::ZERO, pos2(2.0, 2.0)));
         assert_eq!(snip.markup_width(), MARKUP_W);
         const { assert!(NEW_END + GROUP_GAP + MARKUP_W + GROUP_GAP + OUT_W + 12.0 <= MIN_EDIT_W, "MIN_EDIT_W fits all three groups") };
     }
@@ -1471,6 +1598,76 @@ mod tests {
             drag_and_compare(&mut snip, &PATH);
             assert!(matches!(&snip.doc.marks[0], Mark::Shape(s) if s.kind == kind && s.to == pos2(600.0 - 640.0 + 150.0, 360.0 - 400.0 + 100.0)), "{kind:?} ends where the drag ended");
         }
+    }
+
+    #[test]
+    fn grips_are_the_corners_then_the_sides_then_the_inside() {
+        let f = Rect::from_min_max(pos2(100.0, 100.0), pos2(300.0, 200.0));
+        assert_eq!(grip_at(f, pos2(95.0, 105.0), 10.0), Some(Grip::NW));
+        assert_eq!(grip_at(f, pos2(305.0, 195.0), 10.0), Some(Grip::SE));
+        assert_eq!(grip_at(f, pos2(298.0, 102.0), 10.0), Some(Grip::NE));
+        assert_eq!(grip_at(f, pos2(200.0, 208.0), 10.0), Some(Grip::S));
+        assert_eq!(grip_at(f, pos2(92.0, 150.0), 10.0), Some(Grip::W));
+        assert_eq!(grip_at(f, pos2(200.0, 150.0), 10.0), Some(Grip::Move));
+        assert_eq!(grip_at(f, pos2(200.0, 230.0), 10.0), None, "beyond reach");
+        // A frame thinner than two reaches: the nearer side wins.
+        let thin = Rect::from_min_max(pos2(100.0, 100.0), pos2(112.0, 200.0));
+        assert_eq!(grip_at(thin, pos2(103.0, 150.0), 10.0), Some(Grip::W));
+        assert_eq!(grip_at(thin, pos2(110.0, 150.0), 10.0), Some(Grip::E));
+    }
+
+    #[test]
+    fn dragging_the_frame_stays_inside_the_snip_and_above_the_minimum() {
+        let bounds = Rect::from_min_max(Pos2::ZERO, pos2(400.0, 300.0));
+        let start = Rect::from_min_max(pos2(50.0, 50.0), pos2(250.0, 200.0));
+        assert_eq!(drag_frame(start, Grip::SE, vec2(30.0, 20.0), bounds, 16.0), Rect::from_min_max(pos2(50.0, 50.0), pos2(280.0, 220.0)));
+        assert_eq!(drag_frame(start, Grip::NW, vec2(-80.0, -80.0), bounds, 16.0), Rect::from_min_max(pos2(0.0, 0.0), pos2(250.0, 200.0)), "clamped to the snip");
+        assert_eq!(drag_frame(start, Grip::E, vec2(-500.0, 99.0), bounds, 16.0), Rect::from_min_max(pos2(50.0, 50.0), pos2(66.0, 200.0)), "never thinner than the minimum");
+        assert_eq!(drag_frame(start, Grip::N, vec2(9.0, 500.0), bounds, 16.0), Rect::from_min_max(pos2(50.0, 184.0), pos2(250.0, 200.0)));
+        assert_eq!(drag_frame(start, Grip::Move, vec2(500.0, -20.0), bounds, 16.0), Rect::from_min_max(pos2(200.0, 30.0), pos2(400.0, 180.0)), "moves whole, stopping at the edge");
+        let tiny = Rect::from_min_max(Pos2::ZERO, pos2(10.0, 8.0));
+        assert_eq!(drag_frame(tiny, Grip::SE, vec2(-50.0, -50.0), tiny, 16.0), tiny, "a snip smaller than the minimum keeps its size");
+    }
+
+    #[test]
+    fn crop_starts_on_the_whole_snip_and_its_handles_shape_the_result() {
+        let ctx = egui::Context::default();
+        let mut snip = Snip::new(gradient(300, 200), Tools::default());
+        let mut screen = Screen { image: None };
+        canvas_frame(&ctx, &mut snip, &mut screen, vec![]);
+        snip.toggle_crop();
+        assert_eq!(snip.crop, Some(Rect::from_min_max(Pos2::ZERO, pos2(300.0, 200.0))), "the frame starts around the whole snip");
+        // The snip is shown at 100% from (490, 300): drag its bottom-right handle, then the inside.
+        let drag = |snip: &mut Snip, screen: &mut Screen, from: Pos2, to: Pos2| {
+            canvas_frame(&ctx, snip, screen, vec![Event::PointerMoved(from), pointer(from, true)]);
+            canvas_frame(&ctx, snip, screen, vec![Event::PointerMoved(to)]);
+            canvas_frame(&ctx, snip, screen, vec![pointer(to, false)]);
+        };
+        drag(&mut snip, &mut screen, pos2(791.0, 501.0), pos2(700.0, 450.0));
+        assert_eq!(snip.crop, Some(Rect::from_min_max(Pos2::ZERO, pos2(209.0, 149.0))));
+        drag(&mut snip, &mut screen, pos2(600.0, 400.0), pos2(620.0, 410.0));
+        assert_eq!(snip.crop, Some(Rect::from_min_max(pos2(20.0, 10.0), pos2(229.0, 159.0))));
+        assert!(snip.doc.marks.is_empty(), "the pen under the frame drew nothing");
+        snip.apply_crop();
+        assert_eq!(snip.doc.size(), [209, 149]);
+        assert_eq!(snip.crop, None);
+        snip.step(false);
+        assert_eq!(snip.doc.size(), [300, 200], "undo brings the whole snip back");
+    }
+
+    #[test]
+    fn esc_cancels_the_crop_frame_and_leaves_the_snip_alone() {
+        let ctx = egui::Context::default();
+        let mut editors = Editors::new(None);
+        let (a, _, _) = editors.open_snip(&ctx, white(40, 30), 0, None);
+        frame(&ctx, &editors, vec![]);
+        editors.with(a, |e| {
+            let Content::Snip(s) = &mut e.content else { panic!("a snip") };
+            s.toggle_crop();
+        });
+        let esc = Event::Key { key: Key::Escape, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE };
+        frame(&ctx, &editors, vec![esc]);
+        assert_eq!(editors.with(a, |e| e.snip().map(|s| (s.crop, s.doc.size(), s.doc.can_undo()))).unwrap(), Some((None, [40, 30], false)));
     }
 
     #[test]
