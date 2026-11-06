@@ -194,8 +194,6 @@ struct App {
     auto_copy: bool,
     auto_save: bool,
     screenshot: Option<ScreenshotJob>,
-    /// Open straight into picking, like the original does.
-    pick_on_launch: bool,
 
     record_system: bool,
     record_mic: bool,
@@ -233,7 +231,6 @@ impl App {
                 Err(e) => hotkey_note = Some(e),
             }
         }
-        let pick_on_launch = shot.is_none();
         let mut app = Self {
             hwnd,
             mode: Mode::Photo,
@@ -255,7 +252,6 @@ impl App {
             auto_copy: true,
             auto_save: true,
             screenshot: None,
-            pick_on_launch,
             record_system: true,
             record_mic: false,
             mic_choice: None,
@@ -541,9 +537,6 @@ impl eframe::App for App {
     }
 
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if std::mem::take(&mut self.pick_on_launch) {
-            self.start_snip(ctx);
-        }
         self.on_home_close(ctx);
         while let Ok(event) = self.rec_rx.try_recv() {
             self.on_record_event(ctx, event);

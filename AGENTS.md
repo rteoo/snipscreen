@@ -32,11 +32,11 @@ Run from `app/`.
 | Build (dev, opt-level 2) | `cargo build` |
 | Release build | `cargo build --release` → `target/release/snipscreen.exe` |
 | Windows installer (from the repo root, after the release build) | `build_installer.bat` → `installer/Output/SnipscreenSetup-<version>.exe` (Inno Setup 6, per-user; set `SNIPSCREEN_BUILD_NONINTERACTIVE=1` to skip the pauses). Keep `MyAppVersion` in `installer/snipscreen.iss` equal to the `Cargo.toml` version. |
-| Run | `cargo run` |
+| Run | `cargo run` (opens the home window) |
 | Tests | `cargo test` |
 | Device-dependent tests (sound hardware) | `cargo test -- --ignored` |
 | Lint | `cargo clippy --all-targets` |
-| Headless UI screenshot | `cargo run -- --screenshot out.png` (renders the home window for 120 frames, writes PNG, exits; skips the global hotkey and launch-into-picking) |
+| Headless UI screenshot | `cargo run -- --screenshot out.png` (renders the home window for 120 frames, writes PNG, exits; skips the global hotkey) |
 | Headless editor screenshot | `cargo run -- --screenshot-editor out.png` (opens one editor window on a built-in sample snip with a pen and a highlighter stroke, writes that window's PNG, exits) |
 
 Toolchain verified: Rust 1.99.1 stable, MSVC target. No `rust-toolchain` file. The build also needs the Windows SDK's `rc.exe` (installed with the MSVC build tools) to embed the `.exe` icon.
