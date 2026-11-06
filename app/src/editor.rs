@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use eframe::egui::{
@@ -279,6 +280,17 @@ pub struct Editor {
     new_requested: bool,
     /// The window's close button was pressed; the shell drops this editor.
     closed: bool,
+    /// A Save is under way (its dialog is open or its file is being written).
+    saving: Arc<AtomicBool>,
+}
+
+/// Clears its flag when dropped, however the worker holding it ends.
+struct Busy(Arc<AtomicBool>);
+
+impl Drop for Busy {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 impl Snip {
@@ -668,6 +680,7 @@ impl Editor {
             shared_tip,
             new_requested: false,
             closed: false,
+            saving: Arc::default(),
         }
     }
 
@@ -899,34 +912,44 @@ impl Editor {
         });
     }
 
-    /// Asks where to save, then writes the file on a worker thread: a big PNG takes a moment to
-    /// encode, and a long recording a moment to copy.
+    /// Asks where to save, then writes the file, all on a worker thread: the dialog is modal to this
+    /// window alone, so the other windows (the recording bar among them) keep running, and a big PNG
+    /// takes a moment to encode, a long recording a moment to copy. A second Save while one is under
+    /// way is ignored.
     fn save_as(&mut self, ctx: &egui::Context) {
+        if self.saving.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let busy = Busy(self.saving.clone());
         if let Content::Snip(snip) = &mut self.content {
             snip.finish_text();
         }
-        let owner = self.owner();
-
-        let report = self.notifier(ctx);
-        match &self.content {
+        // Window handles are plain numbers to Windows; this one is only used to own the dialog.
+        let (owner, report) = (self.owner() as isize, self.notifier(ctx));
+        let job: Box<dyn FnOnce() + Send> = match &self.content {
             Content::Snip(snip) => {
-                let start = win::pictures_dir().map(|d| d.join("Screenshots"));
-                let Some(path) = win::ask_save_path(owner, start.as_deref(), &format!("Snip {}", win::timestamp()), ("PNG image", "png")) else {
-                    return;
-                };
-                let image = snip.flattened();
-                std::thread::spawn(move || report.send(saved_note(&path, win::save_png(&path, &image))));
+                let (start, name, image) = (win::pictures_dir().map(|d| d.join("Screenshots")), format!("Snip {}", win::timestamp()), snip.flattened());
+                Box::new(move || {
+                    let _busy = busy;
+                    let Some(path) = win::ask_save_path(owner as HWND, start.as_deref(), &name, ("PNG image", "png")) else { return };
+                    let png = win::encode_png(&image);
+                    // Let go of the picture once it is encoded, so the editor's next mark needn't copy it.
+                    drop(image);
+                    report.send(saved_note(&path, png.and_then(|bytes| std::fs::write(&path, bytes).map_err(|e| format!("{}: {e}", path.display())))));
+                })
             }
             Content::Video(v) => {
                 let start = win::videos_dir().map(|d| d.join("Screen Recordings"));
                 let name = v.path.file_stem().map_or_else(|| "Screen Recording".into(), |n| n.to_string_lossy().into_owned());
-                let Some(path) = win::ask_save_path(owner, start.as_deref(), &name, ("MP4 video", "mp4")) else {
-                    return;
-                };
                 let from = v.path.clone();
-                std::thread::spawn(move || report.send(saved_note(&path, std::fs::copy(&from, &path).map(|_| ()).map_err(|e| e.to_string()))));
+                Box::new(move || {
+                    let _busy = busy;
+                    let Some(path) = win::ask_save_path(owner as HWND, start.as_deref(), &name, ("MP4 video", "mp4")) else { return };
+                    report.send(saved_note(&path, std::fs::copy(&from, &path).map(|_| ()).map_err(|e| e.to_string())));
+                })
             }
-        }
+        };
+        std::thread::spawn(job);
     }
 
     fn video_view(&mut self, ui: &mut egui::Ui) {
@@ -2269,6 +2292,25 @@ Arc::ptr_eq(&snip.flattened(), &shown), "a current canvas is reused, not re-burn
         let msg = |id| editors.with(id, |e| e.note.as_ref().map(|n| n.msg.clone())).unwrap();
         assert_eq!(msg(a).as_deref(), Some("Copied to clipboard"));
         assert_eq!(msg(b), None);
+    }
+
+    #[test]
+    fn a_second_save_while_one_is_under_way_is_ignored() {
+        let ctx = egui::Context::default();
+        let fresh = Snip::new(white(10, 10), Tools::default());
+        let mut ed = Editor::new(Content::Snip(Box::new(fresh)), "t".into(), ViewportId::ROOT, 0, None, Default::default(), MIN_EDIT_W);
+        // As if a Save dialog were open: another Save must return at once and open nothing.
+        ed.saving.store(true, Ordering::Release);
+        ed.save_as(&ctx);
+        assert!(ed.saving.load(Ordering::Acquire), "the first save still owns the flag");
+        // The worker frees it however it ends, a panic included.
+        let busy = Busy(ed.saving.clone());
+        let _ = std::thread::spawn(move || {
+            let _busy = busy;
+            panic!("a failed save");
+        })
+        .join();
+        assert!(!ed.saving.load(Ordering::Acquire), "a new Save can start");
     }
 
     #[test]

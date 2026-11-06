@@ -31,7 +31,7 @@ use windows_sys::Win32::UI::Controls::Dialogs::{
 
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{TrackMouseEvent, TME_LEAVE, TME_NONCLIENT, TRACKMOUSEEVENT};
 use windows_sys::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass, FOLDERID_LocalAppData, FOLDERID_Pictures, FOLDERID_RoamingAppData, FOLDERID_Videos, SHGetKnownFolderPath};
-use windows_sys::Win32::System::Com::CoTaskMemFree;
+use windows_sys::Win32::System::Com::{CoInitializeEx, CoTaskMemFree, CoUninitialize, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     EnumWindows, FindWindowExW, GetClientRect, GetWindowThreadProcessId, IsZoomed, PostMessageW, GWL_STYLE, HTCAPTION, HTCLIENT, HTMAXBUTTON, HTTOP, HTTOPLEFT, HTTOPRIGHT,
     MINMAXINFO, SC_MAXIMIZE, SC_RESTORE, SWP_FRAMECHANGED, SWP_NOMOVE, SWP_NOOWNERZORDER, WM_DPICHANGED, WM_GETMINMAXINFO, WM_MOUSEMOVE, WM_NCCALCSIZE,
@@ -447,8 +447,10 @@ pub fn timestamp() -> String {
     )
 }
 
-/// Native "Save as" dialog. `None` when the person cancels.
-/// `kind` is (description, extension), e.g. ("PNG image", "png").
+/// Native "Save as" dialog, modal to `owner`. `None` when the person cancels.
+/// `kind` is (description, extension), e.g. ("PNG image", "png"). Runs on any thread: the dialog's
+/// shell views need a single-threaded COM apartment, which a worker thread gets here for the call.
+/// `owner` may belong to another thread; it is disabled while the dialog is up.
 pub fn ask_save_path(
     owner: HWND,
     start_dir: Option<&std::path::Path>,
@@ -471,7 +473,14 @@ pub fn ask_save_path(
     ofn.lpstrDefExt = ext.as_ptr();
     ofn.lpstrInitialDir = dir.as_ref().map_or(null(), |d| d.as_ptr());
     ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
-    if unsafe { GetSaveFileNameW(&mut ofn) } == 0 {
+    // S_OK or S_FALSE: this call joined (or re-entered) an apartment and must leave it; a thread already
+    // in another kind of apartment (RPC_E_CHANGED_MODE) is left as it was.
+    let com = unsafe { CoInitializeEx(null(), (COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) as u32) } >= 0;
+    let chosen = unsafe { GetSaveFileNameW(&mut ofn) } != 0;
+    if com {
+        unsafe { CoUninitialize() };
+    }
+    if !chosen {
         return None;
     }
     let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
