@@ -161,7 +161,8 @@ struct App {
     /// `settings` as last handed to `saver`; any difference is saved at the end of the pass.
     saved: Settings,
     saver: settings::Saver,
-    /// Messages from background work that has no window of its own (the settings saver).
+    /// Messages from background work that has no window of its own (settings saver, startup entry).
+    bg: Notifier,
     bg_rx: Receiver<String>,
     stage: Stage,
     grab_tx: Sender<Result<win::Grab, String>>,
@@ -210,11 +211,9 @@ impl App {
         let shot_run = shot.is_some();
         // A screenshot run renders the defaults and never writes the person's file.
         let save_to = if shot_run { None } else { loaded.path.clone() };
-        let (tx, c) = (bg_tx, cc.egui_ctx.clone());
-        let saver = settings::Saver::new(save_to, move |e| {
-            let _ = tx.send(e);
-            c.request_repaint();
-        });
+        let bg = Notifier::new(bg_tx, cc.egui_ctx.clone(), ViewportId::ROOT);
+        let report = bg.clone();
+        let saver = settings::Saver::new(save_to, move |e| report.send(e));
         let settings = if shot_run { Settings::default() } else { loaded.settings };
         if !loaded.existed {
             saver.save(&settings);
@@ -242,6 +241,7 @@ impl App {
             settings,
             saved,
             saver,
+            bg,
             bg_rx,
             stage: Stage::Idle,
             grab_tx,
@@ -270,6 +270,10 @@ impl App {
             app.say(&cc.egui_ctx, format!("Some settings couldn't be read and were reset: {}", loaded.problems.join(", ")));
         }
         app.resident = app.agent.is_some();
+        if !shot_run {
+            // Every start: the exe may have moved since the entry was written.
+            app.sync_startup();
+        }
         if let Some(intent) = intent {
             app.on_intent(&cc.egui_ctx, intent);
         }
@@ -548,9 +552,22 @@ impl App {
         ctx.send_viewport_cmd(ViewportCommand::Close);
     }
 
+    /// Brings the sign-in entry in line with "Start SnipScreen with Windows", off the UI thread.
+    fn sync_startup(&self) {
+        let (on, report) = (self.settings.start_with_windows, self.bg.clone());
+        std::thread::spawn(move || {
+            if let Err(e) = tray::sync_run_at_startup(on) {
+                report.send(format!("Couldn't update starting with Windows: {e}"));
+            }
+        });
+    }
+
     /// Hands changed settings to the saver; a few field compares per pass when nothing changed.
     fn persist(&mut self) {
         if self.settings != self.saved {
+            if self.settings.start_with_windows != self.saved.start_with_windows {
+                self.sync_startup();
+            }
             self.saved = self.settings.clone();
             self.saver.save(&self.settings);
         }

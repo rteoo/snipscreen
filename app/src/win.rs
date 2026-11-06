@@ -7,7 +7,8 @@ use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
 
 use eframe::egui::{Color32, ColorImage};
-use windows_sys::Win32::Foundation::{GlobalFree, HWND, LPARAM, POINT, RECT, SYSTEMTIME};
+use windows_sys::Win32::Foundation::{GlobalFree, ERROR_FILE_NOT_FOUND, HWND, LPARAM, POINT, RECT, SYSTEMTIME};
+use windows_sys::Win32::System::Registry::{RegDeleteKeyValueW, RegGetValueW, RegSetKeyValueW, HKEY_CURRENT_USER, REG_SZ, RRF_RT_REG_SZ};
 use windows_sys::Win32::Graphics::Dwm::{
     DwmGetWindowAttribute, DwmSetWindowAttribute, DWMWA_CLOAK, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS,
 };
@@ -480,6 +481,41 @@ pub fn cloak(hwnd: HWND, on: bool) {
     unsafe { DwmSetWindowAttribute(hwnd, DWMWA_CLOAK as _, &value as *const i32 as *const c_void, size_of::<i32>() as u32) };
 }
 
+/// A string value under `HKEY_CURRENT_USER\subkey`; `None` when it (or the key) doesn't exist.
+/// `name` "" is the key's default value.
+pub fn reg_get(subkey: &str, name: &str) -> Option<String> {
+    let (key, value) = (wide(subkey), wide(name));
+    let mut buf = [0u16; 2048];
+    let mut bytes = (buf.len() * 2) as u32;
+    let err = unsafe { RegGetValueW(HKEY_CURRENT_USER, key.as_ptr(), value.as_ptr(), RRF_RT_REG_SZ, null_mut(), buf.as_mut_ptr() as *mut c_void, &mut bytes) };
+    if err != 0 {
+        return None;
+    }
+    let len = (bytes as usize / 2).min(buf.len());
+    Some(String::from_utf16_lossy(&buf[..len]).trim_end_matches('\0').to_string())
+}
+
+/// Writes a string value under `HKEY_CURRENT_USER\subkey`, creating the key if needed.
+pub fn reg_set(subkey: &str, name: &str, data: &str) -> Result<(), String> {
+    let (key, value, data) = (wide(subkey), wide(name), wide(data));
+    let err = unsafe { RegSetKeyValueW(HKEY_CURRENT_USER, key.as_ptr(), value.as_ptr(), REG_SZ, data.as_ptr() as *const c_void, (data.len() * 2) as u32) };
+    if err == 0 { Ok(()) } else { Err(format!("couldn't write HKCU\\{subkey}\\{name} (error {err})")) }
+}
+
+/// Removes a value under `HKEY_CURRENT_USER\subkey`; one that is already gone is fine.
+pub fn reg_delete_value(subkey: &str, name: &str) -> Result<(), String> {
+    let (key, value) = (wide(subkey), wide(name));
+    match unsafe { RegDeleteKeyValueW(HKEY_CURRENT_USER, key.as_ptr(), value.as_ptr()) } {
+        0 | ERROR_FILE_NOT_FOUND => Ok(()),
+        err => Err(format!("couldn't remove HKCU\\{subkey}\\{name} (error {err})")),
+    }
+}
+
+/// The running executable's full path.
+pub fn exe_path() -> Result<PathBuf, String> {
+    std::env::current_exe().map_err(|e| format!("couldn't find SnipScreen's own file: {e}"))
+}
+
 /// A message box for the one failure that has no window to show it in: a second launch that
 /// couldn't reach the running copy.
 pub fn error_box(msg: &str) {
@@ -575,6 +611,23 @@ mod tests {
         assert_eq!(name(second), Ok("Snip 2026-11-05 141530 (2).png".into()));
         assert_eq!(name(third), Ok("Snip 2026-11-05 141530 (3).png".into()));
         assert!(sizes.iter().all(|s| s.is_some_and(|s| s > 0)), "both PNGs keep their bytes: {sizes:?}");
+    }
+
+    #[test]
+    fn registry_values_round_trip_and_delete() {
+        let key = format!("Software\\SnipScreen.Tests\\{}", std::process::id());
+        let missing = reg_get(&key, "v");
+        let set = reg_set(&key, "v", "\"C:\\Program Files\\x.exe\" --tray");
+        let read = reg_get(&key, "v");
+        let deleted = reg_delete_value(&key, "v");
+        let gone = reg_get(&key, "v");
+        let again = reg_delete_value(&key, "v");
+        let parent = wide("Software\\SnipScreen.Tests");
+        unsafe { windows_sys::Win32::System::Registry::RegDeleteTreeW(HKEY_CURRENT_USER, parent.as_ptr()) };
+        assert_eq!(missing, None);
+        assert_eq!(set, Ok(()));
+        assert_eq!(read.as_deref(), Some("\"C:\\Program Files\\x.exe\" --tray"));
+        assert_eq!((deleted, gone, again), (Ok(()), None, Ok(())), "deleting twice is fine");
     }
 
     #[test]

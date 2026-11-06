@@ -156,6 +156,27 @@ pub fn forward(intent: &Intent) -> Result<(), String> {
     Err("SnipScreen is already starting but its window never appeared".into())
 }
 
+const RUN_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+const RUN_VALUE: &str = "SnipScreen";
+
+/// The command Windows runs at sign-in: this exe, quoted, starting in the tray.
+pub fn startup_command(exe: &std::path::Path) -> String {
+    format!("\"{}\" --tray", exe.display())
+}
+
+/// Makes the `Run` entry match `enabled`: written when missing or pointing at another copy (the exe
+/// moved, or another install wrote it), removed when the setting is off.
+pub fn sync_run_at_startup(enabled: bool) -> Result<(), String> {
+    if !enabled {
+        return crate::win::reg_delete_value(RUN_KEY, RUN_VALUE);
+    }
+    let want = startup_command(&crate::win::exe_path()?);
+    if crate::win::reg_get(RUN_KEY, RUN_VALUE).as_deref() == Some(want.as_str()) {
+        return Ok(());
+    }
+    crate::win::reg_set(RUN_KEY, RUN_VALUE, &want)
+}
+
 /// Handle to the agent thread. Dropping it unregisters the shortcuts and ends the thread.
 pub struct Agent {
     /// The hidden window; `HWND` itself is not `Send`.
@@ -449,6 +470,13 @@ mod tests {
         assert_eq!(Intent::from_args(&["SnipScreen:open?id=4"]), Intent::Open("SnipScreen:open?id=4".into()));
         assert_eq!(Intent::from_args(&["snipscreen:"]), Intent::Show, "a bare scheme opens nothing");
         assert_eq!(Intent::from_args(&["--unknown", "--tray"]), Intent::Tray);
+    }
+
+    #[test]
+    fn startup_command_quotes_the_path_and_starts_in_the_tray() {
+        let cmd = startup_command(std::path::Path::new(r"C:\Users\A B\AppData\Local\Programs\SnipScreen\snipscreen.exe"));
+        assert_eq!(cmd, r#""C:\Users\A B\AppData\Local\Programs\SnipScreen\snipscreen.exe" --tray"#);
+        assert_eq!(Intent::from_args(&cmd.rsplit(' ').take(1).collect::<Vec<_>>()), Intent::Tray);
     }
 
     #[test]
