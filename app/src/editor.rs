@@ -648,6 +648,9 @@ impl Snip {
             }
             // An erase above changed the doc after the first sync: show it in this same frame.
             canvas.sync(doc);
+            if drawing.is_some() {
+                canvas.own_picture();
+            }
             match drawing {
                 Some(Mark::Text(t)) if !draft.preedit.is_empty() => canvas.show_live(&Mark::Text(with_preedit(t, &draft.preedit))),
                 Some(m) => canvas.show_live(m),
@@ -1185,6 +1188,8 @@ struct CanvasTex {
     /// The marks burned into `shown`, to tell which ones an erase or undo took away or brought back.
     burned: Vec<Arc<Mark>>,
     live: Live,
+    /// A private copy of `shown` being made on a worker while a mark is drawn, and the picture it copies.
+    copying: Option<(Arc<ColorImage>, Receiver<ColorImage>)>,
 }
 
 /// The texture tiles that show a mark still being drawn instead of `shown`.
@@ -1213,7 +1218,41 @@ impl CanvasTex {
         let shown = if doc.marks.is_empty() { doc.image.clone() } else { Arc::new(doc.flatten()) };
         let tex = ctx.load_texture("snip", shown.clone(), TextureOptions::LINEAR);
         let live = Live::new(shown.size);
-        Self { tex, shown, rev: (doc.image_rev, doc.ink_rev), burned: doc.marks.clone(), live }
+        Self { tex, shown, rev: (doc.image_rev, doc.ink_rev), burned: doc.marks.clone(), live, copying: None }
+    }
+
+    /// Makes sure `shown` will be this canvas's own when the mark being drawn is burned into it. Until
+    /// the first mark it is the doc's bare picture (which undo needs untouched), and a copy or save
+    /// worker may still hold it; copying 33 MB of 4K picture then would stall the mouse-up, so the copy
+    /// is made on a worker while the mark is drawn and adopted once it is ready.
+    fn own_picture(&mut self) {
+        if self.copying.is_some() {
+            self.adopt_copy();
+        } else if Arc::strong_count(&self.shown) > 1 {
+            let (tx, rx) = channel();
+            let from = self.shown.clone();
+            let source = from.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send((*source).clone());
+            });
+            self.copying = Some((from, rx));
+        }
+    }
+
+    /// Takes the copy `own_picture` started, if it is ready and still of the picture shown.
+    fn adopt_copy(&mut self) {
+        if let Some((from, rx)) = &self.copying {
+            match rx.try_recv() {
+                Ok(copy) => {
+                    if Arc::ptr_eq(from, &self.shown) {
+                        self.shown = Arc::new(copy);
+                    }
+                    self.copying = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => self.copying = None,
+            }
+        }
     }
 
     /// Brings the picture and texture up to date with `doc`. When only marks changed (an erase, an
@@ -1294,6 +1333,9 @@ impl CanvasTex {
         if current {
             let mut tiles = Tiles::new(size);
             m.footprint(&mut tiles);
+            // Takes the copy made while the mark was drawn if it is ready; otherwise `make_mut` copies here.
+            self.adopt_copy();
+            self.copying = None;
             let shown = Arc::make_mut(&mut self.shown);
             let cols = size[0].div_ceil(markup::TILE);
             let mut reused = tiles.intersect(&as_shown);
@@ -2292,6 +2334,29 @@ Arc::ptr_eq(&snip.flattened(), &shown), "a current canvas is reused, not re-burn
         let msg = |id| editors.with(id, |e| e.note.as_ref().map(|n| n.msg.clone())).unwrap();
         assert_eq!(msg(a).as_deref(), Some("Copied to clipboard"));
         assert_eq!(msg(b), None);
+    }
+
+    #[test]
+    fn the_canvas_copies_the_shared_picture_while_a_mark_is_drawn_not_on_mouse_up() {
+        let ctx = egui::Context::default();
+        let mut snip = Snip::new(gradient(300, 200), Tools::default());
+        let mut screen = Screen { image: None };
+        canvas_frame(&ctx, &mut snip, &mut screen, vec![]);
+        let shared = |s: &Snip| Arc::ptr_eq(&s.texture.as_ref().unwrap().shown, &s.doc.image);
+        assert!(shared(&snip), "before any mark the canvas shows the doc's own picture");
+        canvas_frame(&ctx, &mut snip, &mut screen, vec![Event::PointerMoved(PATH[0]), pointer(PATH[0], true)]);
+        canvas_frame(&ctx, &mut snip, &mut screen, vec![Event::PointerMoved(PATH[1])]);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while shared(&snip) {
+            assert!(std::time::Instant::now() < deadline, "the copy should arrive while drawing");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            canvas_frame(&ctx, &mut snip, &mut screen, vec![Event::PointerMoved(PATH[1])]);
+        }
+        let own = snip.texture.as_ref().map(|c| Arc::as_ptr(&c.shown)).unwrap();
+        canvas_frame(&ctx, &mut snip, &mut screen, vec![pointer(PATH[1], false)]);
+        assert_eq!(snip.texture.as_ref().map(|c| Arc::as_ptr(&c.shown)).unwrap(), own, "the mark went into the copy made while drawing");
+        assert!(screen.pixels() == snip.doc.flatten().pixels);
+        assert_eq!(*snip.doc.image, gradient(300, 200), "the doc's picture is untouched");
     }
 
     #[test]
