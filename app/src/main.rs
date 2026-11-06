@@ -1802,18 +1802,35 @@ fn main() -> eframe::Result {
             }
         }
     }
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("Snipscreen")
-            .with_inner_size([620.0, 330.0])
-            .with_min_inner_size([MIN_WINDOW_W, MIN_WINDOW_H]),
-        ..Default::default()
-    };
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title("Snipscreen")
+        .with_inner_size([620.0, 330.0])
+        .with_min_inner_size([MIN_WINDOW_W, MIN_WINDOW_H]);
+    // The icon is built into the binary and checked by `app_icon_decodes`, so a failure here
+    // means a broken build; the app still runs with the default icon rather than refusing to start.
+    match app_icon() {
+        Ok(icon) => viewport = viewport.with_icon(Arc::new(icon)),
+        Err(e) => eprintln!("couldn't load the app icon: {e}"),
+    }
+    let options = eframe::NativeOptions { viewport, ..Default::default() };
     eframe::run_native(
         "Snipscreen",
         options,
         Box::new(move |cc| Ok(Box::new(App::new(cc, screenshot)))),
     )
+}
+
+/// The window and taskbar icon: the 256 px render of `assets/snipscreen-icon.svg`, built into the binary.
+fn app_icon() -> Result<egui::IconData, String> {
+    let bytes: &[u8] = include_bytes!("../assets/snipscreen-icon-256.png");
+    let mut reader = png::Decoder::new(std::io::Cursor::new(bytes)).read_info().map_err(|e| e.to_string())?;
+    let mut rgba = vec![0; reader.output_buffer_size().ok_or("the icon is too large to decode")?];
+    let info = reader.next_frame(&mut rgba).map_err(|e| e.to_string())?;
+    if info.color_type != png::ColorType::Rgba || info.bit_depth != png::BitDepth::Eight {
+        return Err(format!("the icon is {:?} at {:?}, not 8-bit RGBA", info.color_type, info.bit_depth));
+    }
+    rgba.truncate(info.buffer_size());
+    Ok(egui::IconData { rgba, width: info.width, height: info.height })
 }
 
 /// Toast for a new snip's automatic copy and save; `None` when each job that ran succeeded and
@@ -2601,6 +2618,16 @@ mod tests {
     fn ctrl_z_undoes_and_ctrl_y_redoes() {
         assert_eq!(press(Key::Z, Modifiers::COMMAND), Keys { undo: true, ..Default::default() });
         assert_eq!(press(Key::Y, Modifiers::COMMAND), Keys { redo: true, ..Default::default() });
+    }
+
+    #[test]
+    fn app_icon_decodes() {
+        let icon = app_icon().expect("the built-in icon decodes");
+        assert_eq!((icon.width, icon.height), (256, 256));
+        assert_eq!(icon.rgba.len(), 256 * 256 * 4);
+        // Transparent outside the rounded tile, opaque at its centre.
+        assert_eq!(icon.rgba[3], 0, "top-left corner is outside the tile");
+        assert_eq!(icon.rgba[(128 * 256 + 128) * 4 + 3], 255, "the tile's centre is opaque");
     }
 
     const WORK: [i32; 4] = [0, 0, 1920, 1080];

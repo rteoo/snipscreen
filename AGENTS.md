@@ -14,6 +14,7 @@ Windows Snipping Tool. Windows-only: it talks to Win32, DXGI, WASAPI and Media F
 | `app/src/recorder.rs` | Screen recording to MP4 (H.264 + AAC) via DXGI duplication + Media Foundation sink writer, 30 fps, max side 4096. |
 | `app/src/audio.rs` | WASAPI capture: system loopback and microphone, 48 kHz stereo f32, plus mixing. |
 | `app/src/icons.rs` | Toolbar icons drawn as vector strokes (no image assets). |
+| `app/assets/` | App icon: `snipscreen-icon.svg` (full) and `snipscreen-icon-small.svg` (16–24 px) are the sources, matching the SnipVoice/SnipType tile and palette; the `.png` renders and `snipscreen.ico` are generated from them. `main.rs` embeds `snipscreen-icon-256.png` as the window/taskbar icon. |
 | `app/shots/` | Hand-taken UI screenshots and a self-test log from development. Reference only. |
 | `craft.json`, `feed.json`, `usage.json`, `checks/`, `capture/`, `investigation.cany/`, `pinned/` | State from the builder tool that generated v1 (request, check rounds, open design questions, cost log). Not app code. Don't edit by hand. |
 
