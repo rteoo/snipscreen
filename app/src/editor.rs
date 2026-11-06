@@ -241,6 +241,8 @@ pub struct Snip {
     zoom: Option<f32>,
     /// Zoom factor requested from the keyboard this frame; `canvas` applies it.
     key_zoom: f32,
+    /// The rest of the text being typed, while `drawing` is text.
+    draft: Draft,
 }
 
 pub enum Content {
@@ -279,7 +281,7 @@ pub struct Editor {
 
 impl Snip {
     pub fn new(image: ColorImage, tools: Tools) -> Self {
-        Self { doc: Doc::new(image), tools, texture: None, drawing: None, erase_marked: false, crop: None, crop_drag: None, zoom: None, key_zoom: 1.0 }
+        Self { doc: Doc::new(image), tools, texture: None, drawing: None, erase_marked: false, crop: None, crop_drag: None, zoom: None, key_zoom: 1.0, draft: Draft::default() }
     }
 
     /// The picture with its ink, as it would be copied or saved. The canvas texture already holds
@@ -327,7 +329,17 @@ impl Snip {
         self.crop_drag = None;
     }
 
+    /// Undoes or redoes a step: of the text being typed while there is some (undoing past its start
+    /// drops it; redo never does), of the snip otherwise.
     fn step(&mut self, redo: bool) {
+        if let Some(Mark::Text(t)) = self.drawing.as_mut() {
+            if redo {
+                self.draft.redo(&mut t.text);
+            } else if !self.draft.undo(&mut t.text) {
+                self.drawing = None;
+            }
+            return;
+        }
         step_history(&mut self.doc, &mut self.crop, &mut self.drawing, redo);
         self.crop_drag = None;
     }
@@ -355,7 +367,8 @@ impl Snip {
             };
             let resp = icon_button(ui, icon, ink, self.tools.tool == tool, true, tip);
             let again = resp.clicked() && self.tools.tool == tool;
-            if resp.clicked() {
+            // A click on the tool already chosen opens its options and leaves the text being typed alone.
+            if resp.clicked() && !again {
                 self.tools.tool = tool;
                 self.cancel_crop();
                 self.finish_text();
@@ -431,7 +444,7 @@ impl Snip {
 
     fn canvas(&mut self, ui: &mut egui::Ui, guard: &PopupClickGuard) {
         let ctx = ui.ctx().clone();
-        let Snip { doc, tools, texture, drawing, erase_marked, crop, crop_drag, zoom: zoom_choice, key_zoom } = self;
+        let Snip { doc, tools, texture, drawing, erase_marked, crop, crop_drag, zoom: zoom_choice, key_zoom, draft } = self;
         let canvas = texture.get_or_insert_with(|| CanvasTex::new(&ctx, doc));
         canvas.sync(doc);
 
@@ -559,22 +572,39 @@ impl Snip {
                             let mut t = Text { text: String::new(), color: tools.text.0, size: tools.text.1 * k, outline: tools.text_outline, pos: to_px(p) };
                             t.pos.y -= t.line_height() / 2.0;
                             *drawing = Some(Mark::Text(t));
+                            *draft = Draft::new(tools.text.1);
                         }
                     }
                     if let Some(Mark::Text(t)) = drawing.as_mut() {
-                        // Colour, size and outline follow the options while typing; size is in screen points like the pen's.
-                        (t.color, t.size, t.outline) = (tools.text.0, tools.text.1 * k, tools.text_outline);
-                        if type_into(&ctx, &mut t.text) {
+                        // Colour and outline follow the options while typing. The size, chosen in screen points like the
+                        // pen's, is turned into pixels at the click and again only when the option changes, so zooming
+                        // or resizing the window leaves the text as it is.
+                        (t.color, t.outline) = (tools.text.0, tools.text_outline);
+                        if tools.text.1 != draft.size_pt {
+                            (t.size, draft.size_pt) = (tools.text.1 * k, tools.text.1);
+                        }
+                        if type_into(&ctx, &mut t.text, draft) {
                             if let Some(m) = placeable(drawing.take()) {
                                 canvas.commit(doc, m);
                             }
                         }
                     }
                     if let Some(Mark::Text(t)) = drawing.as_ref() {
-                        let top = to_pt(t.caret());
-                        let caret = [top, top + vec2(0.0, t.line_height() / k)];
+                        let line = t.line_height() / k;
+                        let typed = to_pt(t.caret());
+                        // An input method's composition shows after the text, underlined, until it is committed.
+                        let end = if draft.preedit.is_empty() { typed } else { to_pt(with_preedit(t, &draft.preedit).caret()) };
+                        if end != typed {
+                            let under = vec2(0.0, line * 0.92);
+                            painter.line_segment([typed + under, end + under], (1.5, t.color));
+                        }
+                        let caret = [end, end + vec2(0.0, line)];
                         painter.line_segment(caret, (3.0, t.halo_color()));
                         painter.line_segment(caret, (1.5, t.color));
+                        // Turns the window's input method on and tells it where the text is.
+                        let rect = Rect::from_min_max(to_pt(t.pos), end + vec2(1.0, line));
+                        let cursor_rect = Rect::from_min_size(end, vec2(1.0, line));
+                        ctx.output_mut(|o| o.ime = Some(egui::output::IMEOutput { purpose: egui::IMEPurpose::Normal, rect, cursor_rect, should_interrupt_composition: false }));
                     }
                 }
                 Tool::Eraser => {
@@ -603,6 +633,7 @@ impl Snip {
             // An erase above changed the doc after the first sync: show it in this same frame.
             canvas.sync(doc);
             match drawing {
+                Some(Mark::Text(t)) if !draft.preedit.is_empty() => canvas.show_live(&Mark::Text(with_preedit(t, &draft.preedit))),
                 Some(m) => canvas.show_live(m),
                 None => canvas.clear_live(),
             }
@@ -737,16 +768,16 @@ impl Editor {
             self.copy(ctx);
         }
         let Content::Snip(snip) = &mut self.content else { return };
-        if undo || esc {
-            if snip.typing() {
-                // The first Ctrl+Z or Esc throws away the text being typed, and nothing else.
-                snip.drawing = None;
-            } else if undo {
+        if esc && snip.typing() {
+            // Esc throws away the text being typed, and nothing else.
+            snip.drawing = None;
+        } else {
+            if undo {
                 snip.step(false);
             }
-        }
-        if redo {
-            snip.step(true);
+            if redo {
+                snip.step(true);
+            }
         }
         if enter {
             snip.apply_crop();
@@ -1336,19 +1367,112 @@ fn placeable(m: Option<Mark>) -> Option<Mark> {
     }
 }
 
-/// Applies this frame's typing to `text`, taking those events so nothing else reacts to them.
-/// True when Enter (without Shift) asks to place the text.
-fn type_into(ctx: &egui::Context, text: &mut String) -> bool {
+/// `t` with an input method's uncommitted `preedit` after it, as it shows while composing.
+fn with_preedit(t: &Text, preedit: &str) -> Text {
+    Text { text: format!("{}{preedit}", t.text), ..t.clone() }
+}
+
+/// What a change to the draft is, for grouping changes into undo steps.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+enum Edit {
+    #[default]
+    None,
+    Typing,
+    Deleting,
+}
+
+/// Text being typed, beyond its letters (which live in the `Text` mark being drawn): the font size
+/// it was last set from, the input method's composition, and its own undo history.
+#[derive(Debug, Default)]
+struct Draft {
+    /// The size option, in points, that the text's size in pixels was last worked out from.
+    size_pt: f32,
+    /// What the input method is composing: shown after the text, not part of it until committed.
+    preedit: String,
+    undo: Vec<String>,
+    redo: Vec<String>,
+    /// The kind of the last change, so a run of typing (a word) or of deleting is one undo step.
+    run: Edit,
+}
+
+impl Draft {
+    fn new(size_pt: f32) -> Self {
+        Self { size_pt, ..Self::default() }
+    }
+
+    /// Call before changing `text`: starts a new undo step unless the change continues the last
+    /// run. Typing starts one at each new word; anything other than typing or deleting is a step of
+    /// its own.
+    fn begin(&mut self, kind: Edit, text: &str, new_word: bool) {
+        if kind == Edit::None || kind != self.run || new_word {
+            self.undo.push(text.to_string());
+            self.redo.clear();
+        }
+        self.run = kind;
+    }
+
+    /// Takes back the last step. False when there is nothing to take back.
+    fn undo(&mut self, text: &mut String) -> bool {
+        let Some(before) = self.undo.pop() else { return false };
+        self.redo.push(std::mem::replace(text, before));
+        self.run = Edit::None;
+        true
+    }
+
+    fn redo(&mut self, text: &mut String) {
+        if let Some(after) = self.redo.pop() {
+            self.undo.push(std::mem::replace(text, after));
+            self.run = Edit::None;
+        }
+    }
+
+    fn insert(&mut self, text: &mut String, s: &str, kind: Edit) {
+        let s = clean(s);
+        if s.is_empty() {
+            return;
+        }
+        let new_word = kind == Edit::Typing && !s.starts_with(char::is_whitespace) && text.ends_with(|c: char| c.is_whitespace());
+        self.begin(kind, text, new_word);
+        text.push_str(&s);
+    }
+}
+
+/// `s` as text can hold it: tabs become four spaces, and returns and other control characters go.
+fn clean(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\t' => out.push_str("    "),
+            '\n' => out.push('\n'),
+            c if c.is_control() => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Applies this frame's typing to `text`, taking those events so nothing else reacts to them. An
+/// input method's composition goes to `draft.preedit` until it is committed. True when Enter
+/// (without Shift) asks to place the text.
+fn type_into(ctx: &egui::Context, text: &mut String, draft: &mut Draft) -> bool {
     let mut place = false;
     ctx.input_mut(|i| {
         i.events.retain(|e| {
             match e {
-                Event::Text(s) => text.push_str(s),
-                Event::Paste(s) => text.push_str(&s.replace("\r\n", "\n")),
-                Event::Key { key: Key::Backspace, pressed: true, .. } => {
-                    text.pop();
+                Event::Text(s) => draft.insert(text, s, Edit::Typing),
+                Event::Paste(s) => draft.insert(text, s, Edit::None),
+                Event::Ime(egui::ImeEvent::Preedit { text: s, .. }) => draft.preedit = clean(s).replace('\n', " "),
+                Event::Ime(egui::ImeEvent::Commit(s)) => {
+                    draft.preedit.clear();
+                    draft.insert(text, s, Edit::None);
                 }
-                Event::Key { key: Key::Enter, pressed: true, modifiers, .. } if modifiers.shift => text.push('\n'),
+                Event::Key { key: Key::Backspace, pressed: true, .. } => {
+                    if !text.is_empty() {
+                        draft.begin(Edit::Deleting, text, false);
+                        text.pop();
+                    }
+                }
+                Event::Key { key: Key::Enter, pressed: true, modifiers, .. } if modifiers.shift => draft.insert(text, "\n", Edit::None),
                 Event::Key { key: Key::Enter, pressed: true, .. } => place = true,
                 _ => return true,
             }
@@ -1357,6 +1481,7 @@ fn type_into(ctx: &egui::Context, text: &mut String) -> bool {
     });
     place
 }
+
 /// Where the canvas's scroll area is scrolled to, as of its last frame. Call from the `Ui` that holds it.
 fn scroll_offset(ui: &egui::Ui) -> Vec2 {
     let id = ui.make_persistent_id(egui::IdSalt::new(SCROLL_ID));
@@ -2131,6 +2256,164 @@ Arc::ptr_eq(&snip.flattened(), &shown), "a current canvas is reused, not re-burn
         for id in [a, b] {
             assert_eq!(editors.with(id, |e| e.new_tip.clone()).unwrap(), "New recording (Ctrl+N)");
         }
+    }
+
+    /// A snip editor with the text tool, typing `typed` into a draft started by a click on the middle of its 300x200 snip.
+    fn typing(typed: &str) -> (egui::Context, Editor, Screen) {
+        let ctx = egui::Context::default();
+        let fresh = Snip::new(gradient(300, 200), Tools { tool: Tool::Text, ..Tools::default() });
+        let mut ed = Editor::new(Content::Snip(Box::new(fresh)), "t".into(), ViewportId::ROOT, 0, None, String::new(), MIN_EDIT_W);
+        let mut screen = Screen { image: None };
+        let at = pos2(640.0, 400.0);
+        for events in [vec![], vec![Event::PointerMoved(at), pointer(at, true)], vec![pointer(at, false)]] {
+            canvas_frame(&ctx, snip_of(&mut ed), &mut screen, events);
+        }
+        for ch in typed.chars() {
+            canvas_frame(&ctx, snip_of(&mut ed), &mut screen, vec![Event::Text(ch.to_string())]);
+        }
+        (ctx, ed, screen)
+    }
+
+    fn snip_of(ed: &mut Editor) -> &mut Snip {
+        match &mut ed.content {
+            Content::Snip(s) => s,
+            Content::Video(_) => panic!("a snip"),
+        }
+    }
+
+    fn draft_text(ed: &mut Editor) -> Option<String> {
+        match &snip_of(ed).drawing {
+            Some(Mark::Text(t)) => Some(t.text.clone()),
+            _ => None,
+        }
+    }
+
+    /// Presses `k` with `mods` through the editor's own shortcut handling.
+    fn shortcut(ctx: &egui::Context, ed: &mut Editor, k: Key, mods: Modifiers) {
+        let input = egui::RawInput { events: vec![key(k, mods)], ..Default::default() };
+        let mut out = ctx.run_ui(input, |ui| ed.shortcuts(ui.ctx()));
+        out.textures_delta.clear();
+    }
+
+    #[test]
+    fn ctrl_z_while_typing_takes_back_a_word_at_a_time_and_ctrl_y_never_discards() {
+        let (ctx, mut ed, _) = typing("hello big world");
+        shortcut(&ctx, &mut ed, Key::Y, Modifiers::COMMAND);
+        assert_eq!(draft_text(&mut ed).as_deref(), Some("hello big world"), "nothing to redo leaves the draft alone");
+        shortcut(&ctx, &mut ed, Key::Z, Modifiers::COMMAND);
+        assert_eq!(draft_text(&mut ed).as_deref(), Some("hello big "));
+        shortcut(&ctx, &mut ed, Key::Z, Modifiers::COMMAND);
+        assert_eq!(draft_text(&mut ed).as_deref(), Some("hello "));
+        shortcut(&ctx, &mut ed, Key::Y, Modifiers::COMMAND);
+        assert_eq!(draft_text(&mut ed).as_deref(), Some("hello big "));
+        shortcut(&ctx, &mut ed, Key::Z, Modifiers::COMMAND);
+        shortcut(&ctx, &mut ed, Key::Z, Modifiers::COMMAND);
+        assert_eq!(draft_text(&mut ed).as_deref(), Some(""), "back to the empty draft");
+        shortcut(&ctx, &mut ed, Key::Z, Modifiers::COMMAND);
+        assert_eq!(draft_text(&mut ed), None, "Ctrl+Z on the empty draft cancels it");
+        assert!(snip_of(&mut ed).doc.marks.is_empty(), "and never touched the snip's own history");
+    }
+
+    #[test]
+    fn deleting_is_its_own_undo_step() {
+        let (ctx, mut ed, mut screen) = typing("abc");
+        let back = || vec![key(Key::Backspace, Modifiers::NONE)];
+        canvas_frame(&ctx, snip_of(&mut ed), &mut screen, back());
+        canvas_frame(&ctx, snip_of(&mut ed), &mut screen, back());
+        assert_eq!(draft_text(&mut ed).as_deref(), Some("a"));
+        shortcut(&ctx, &mut ed, Key::Z, Modifiers::COMMAND);
+        assert_eq!(draft_text(&mut ed).as_deref(), Some("abc"), "both deletions come back at once");
+    }
+
+    #[test]
+    fn pasted_text_loses_returns_and_control_characters_and_tabs_become_spaces() {
+        let (ctx, mut ed, mut screen) = typing("");
+        canvas_frame(&ctx, snip_of(&mut ed), &mut screen, vec![Event::Paste("a\tb\r\nc\u{7}d\u{1F600}".into())]);
+        assert_eq!(draft_text(&mut ed).as_deref(), Some("a    b\ncd\u{1F600}"));
+        // Accented letters from dead keys arrive as ordinary text and stay.
+        for s in ["á", "ç", "ã"] {
+            canvas_frame(&ctx, snip_of(&mut ed), &mut screen, vec![Event::Text(s.into())]);
+        }
+        assert_eq!(draft_text(&mut ed).as_deref(), Some("a    b\ncd\u{1F600}áçã"));
+        let mut want = snip_of(&mut ed).doc.flatten();
+        markup::burn(&mut want, snip_of(&mut ed).drawing.as_ref().unwrap());
+        assert!(screen.pixels() == want.pixels, "the emoji draws nothing, the rest shows as saved");
+    }
+
+    #[test]
+    fn an_input_method_composes_inline_and_commits_into_the_text() {
+        let (ctx, mut ed, mut screen) = typing("Hi ");
+        // Runs one canvas frame and returns the input method request it made.
+        let frame = |ed: &mut Editor, screen: &mut Screen, events: Vec<Event>| {
+            let input = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1280.0, 800.0))), events, ..Default::default() };
+            let guard = PopupClickGuard::default();
+            let snip = snip_of(ed);
+            let mut out = ctx.run_ui(input, |ui| {
+                egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| snip.canvas(ui, &guard));
+            });
+            screen.apply(&out.textures_delta, snip.texture.as_ref().map(|c| c.tex.id()));
+            out.textures_delta.clear();
+            out.platform_output.ime
+        };
+        let ime = frame(&mut ed, &mut screen, vec![Event::Ime(egui::ImeEvent::Preedit { text: "にほ".into(), active_range_chars: None })]);
+        let ime = ime.expect("typing turns the input method on");
+        assert!(ime.cursor_rect.height() > 10.0 && ime.rect.contains(ime.cursor_rect.center()), "{ime:?}");
+        assert_eq!(draft_text(&mut ed).as_deref(), Some("Hi "), "the composition is not part of the text yet");
+        let Some(Mark::Text(t)) = snip_of(&mut ed).drawing.clone() else { panic!("typing") };
+        let mut want = snip_of(&mut ed).doc.flatten();
+        markup::burn(&mut want, &Mark::Text(Text { text: "Hi にほ".into(), ..t }));
+        assert!(screen.pixels() == want.pixels, "but it shows inline");
+        frame(&mut ed, &mut screen, vec![Event::Ime(egui::ImeEvent::Preedit { text: String::new(), active_range_chars: None }), Event::Ime(egui::ImeEvent::Commit("日本".into()))]);
+        assert_eq!(draft_text(&mut ed).as_deref(), Some("Hi 日本"));
+        let ime = frame(&mut ed, &mut screen, vec![key(Key::Enter, Modifiers::NONE)]);
+        assert!(ime.is_none(), "placing the text turns the input method off");
+        assert!(matches!(&*snip_of(&mut ed).doc.marks[0], Mark::Text(t) if t.text == "Hi 日本"));
+    }
+
+    #[test]
+    fn zooming_while_typing_keeps_the_text_size_and_the_size_option_still_sets_it() {
+        let (ctx, mut ed, mut screen) = typing("Hey");
+        let size = |ed: &mut Editor| match &snip_of(ed).drawing {
+            Some(Mark::Text(t)) => t.size,
+            _ => panic!("typing"),
+        };
+        let first = size(&mut ed);
+        snip_of(&mut ed).zoom = Some(0.5);
+        canvas_frame(&ctx, snip_of(&mut ed), &mut screen, vec![]);
+        assert_eq!(size(&mut ed), first, "zooming out leaves the text alone");
+        snip_of(&mut ed).tools.text.1 = 40.0;
+        canvas_frame(&ctx, snip_of(&mut ed), &mut screen, vec![]);
+        assert_eq!(size(&mut ed), 80.0, "40 pt at 50% zoom is 80 px");
+    }
+
+    #[test]
+    fn clicking_the_chosen_text_tool_opens_its_options_without_placing_the_draft() {
+        let (ctx, mut ed, _) = typing("draft");
+        // The markup buttons laid out from the window's corner: Text is the fourth.
+        let button = |n: f32| pos2(n * (BTN.x + GAP) + BTN.x / 2.0, BTN.y / 2.0);
+        let click = |ed: &mut Editor, at: Pos2| {
+            // egui hit-tests against the last frame's layout, so the buttons are laid out once first.
+            for events in [vec![Event::PointerMoved(at)], vec![pointer(at, true)], vec![pointer(at, false)], vec![]] {
+                let input = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1280.0, 800.0))), events, ..Default::default() };
+                let snip = snip_of(ed);
+                let mut out = ctx.run_ui(input, |ui| {
+                    egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing = vec2(GAP, 0.0);
+                            snip.markup_controls(ui);
+                        });
+                    });
+                });
+                out.textures_delta.clear();
+            }
+        };
+        click(&mut ed, button(3.0));
+        assert_eq!(draft_text(&mut ed).as_deref(), Some("draft"), "the draft is still being typed");
+        assert!(egui::Popup::is_any_open(&ctx), "the text options opened");
+        click(&mut ed, button(0.0));
+        click(&mut ed, button(0.0));
+        assert_eq!(draft_text(&mut ed), None, "switching tools places it");
+        assert_eq!(snip_of(&mut ed).doc.marks.len(), 1);
     }
 
     /// One headless frame of the snip's canvas without mirroring its uploads, for timing.
