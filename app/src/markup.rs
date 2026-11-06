@@ -4,17 +4,18 @@
 //! mark being drawn by painting the same runs over the picture it will be burned into, so what is
 //! on screen is exactly what gets copied or saved, blend modes included.
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex, PoisonError, Weak};
 
 use eframe::egui::{Color32, ColorImage, Pos2, Rect};
 use skrifa::MetadataProvider as _;
-use vello_cpu::kurbo::{self, Shape as _};
+use vello_cpu::kurbo;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Ink {
     Pen,
-    /// Multiplies with the picture like a real highlighter: white turns the ink's colour and dark
-    /// text stays dark, instead of a see-through coat laid on top.
+    /// Blends into the picture like a real highlighter instead of a see-through coat laid on top: on
+    /// light content it multiplies (white turns the ink's colour, dark text stays dark), on dark
+    /// content it screens (black turns the ink's colour, light text stays light). See `Stroke::on_dark`.
     Highlighter,
 }
 
@@ -26,6 +27,10 @@ pub struct Stroke {
     pub width: f32,
     /// Points in image pixels.
     pub points: Vec<Pos2>,
+    /// Highlighter only: the stroke began on dark content (`is_dark_under`), so it screens rather
+    /// than multiplies. Chosen once for the whole stroke, so it never tints dark text on a light page
+    /// and the result is the same wherever it is painted.
+    pub on_dark: bool,
 }
 
 impl Stroke {
@@ -51,9 +56,10 @@ impl Stroke {
     fn paint(&self, patch: &mut ColorImage, at: [usize; 2]) {
         let mut cover = vec![0f32; patch.pixels.len()];
         cover_segments(&mut cover, patch_rect(patch, at), self.segments_from(0), self.radius());
-        let blend = match self.ink {
-            Ink::Pen => over,
-            Ink::Highlighter => multiply,
+        let blend = match (self.ink, self.on_dark) {
+            (Ink::Pen, _) => over,
+            (Ink::Highlighter, false) => multiply,
+            (Ink::Highlighter, true) => screen,
         };
         for (px, &k) in patch.pixels.iter_mut().zip(&cover) {
             if k > 0.0 {
@@ -242,8 +248,9 @@ impl Text {
         }
     }
 
-    /// Lays the text out: calls `glyph(id, x, baseline)` for every character, then returns the end
-    /// of the last line (the caret's spot, on the top of that line).
+    /// Lays the text out: calls `glyph(id, x, baseline)` for every character the font has, then
+    /// returns the end of the last line (the caret's spot, on the top of that line). A character
+    /// the font lacks (an emoji, CJK) is skipped and takes no room, so nothing draws a box for it.
     fn lay_out(&self, font: &skrifa::FontRef, mut glyph: impl FnMut(skrifa::GlyphId, f32, f32)) -> Pos2 {
         let lm = self.line_metrics(font);
         let charmap = font.charmap();
@@ -252,8 +259,7 @@ impl Text {
         for (i, line) in self.text.split('\n').enumerate() {
             let top = self.pos.y + i as f32 * lm.height;
             let mut x = self.pos.x;
-            for ch in line.chars() {
-                let id = charmap.map(ch).unwrap_or(skrifa::GlyphId::NOTDEF);
+            for id in line.chars().filter_map(|ch| charmap.map(ch)) {
                 glyph(id, x, top + lm.ascent);
                 x += advances.advance_width(id).unwrap_or(0.0);
             }
@@ -267,137 +273,396 @@ impl Text {
         Self::font().map_or(self.pos, |f| self.lay_out(&f, |_, _, _| {}))
     }
 
-    /// The letters' outlines in image pixels.
-    fn path(&self) -> kurbo::BezPath {
-        let mut path = kurbo::BezPath::new();
-        let Some(font) = Self::font() else { return path };
-        let outlines = font.outline_glyphs();
-        let settings = || skrifa::outline::DrawSettings::unhinted(skrifa::instance::Size::new(self.size), skrifa::instance::LocationRef::default());
+    /// Every glyph that draws something, flattened and placed, in reading order.
+    fn placed(&self) -> Vec<Placed> {
+        let mut out = Vec::new();
+        let Some(font) = Self::font() else { return out };
+        let halo = self.halo();
+        let mut cache = GLYPHS.lock().unwrap_or_else(PoisonError::into_inner);
         self.lay_out(&font, |id, x, baseline| {
-            if let Some(g) = outlines.get(id) {
-                // A glyph that fails to draw is left out rather than failing the whole text.
-                let _ = g.draw(settings(), &mut GlyphPen { path: &mut path, x: x as f64, y: baseline as f64 });
+            let edges = cache.get(&font, id, self.size, halo);
+            if edges.bbox[0] <= edges.bbox[2] {
+                out.push(Placed { edges, at: [fixed(x), fixed(baseline)] });
             }
         });
-        path
+        out
     }
 
     /// Image pixels the text can touch, its halo included.
     fn bounds(&self) -> Rect {
-        path_bounds(&self.path(), self.halo())
-    }
-
-    /// Every glyph and where it sits: `(glyph, x, baseline)`, in image pixels.
-    fn glyphs(&self) -> Vec<(skrifa::GlyphId, f32, f32)> {
-        let mut out = Vec::new();
-        if let Some(font) = Self::font() {
-            self.lay_out(&font, |id, x, baseline| out.push((id, x, baseline)));
-        }
-        out
-    }
-
-    /// Image pixels one glyph at `x` on `baseline` can touch, halo included.
-    fn glyph_bounds(&self, font: &skrifa::FontRef, id: skrifa::GlyphId, x: f32, baseline: f32) -> Rect {
-        let mut path = kurbo::BezPath::new();
-        if let Some(g) = font.outline_glyphs().get(id) {
-            let settings = skrifa::outline::DrawSettings::unhinted(skrifa::instance::Size::new(self.size), skrifa::instance::LocationRef::default());
-            let _ = g.draw(settings, &mut GlyphPen { path: &mut path, x: x as f64, y: baseline as f64 });
-        }
-        path_bounds(&path, self.halo())
-    }
-
-    /// The letters and halo as 8-bit coverage over the pixels they reach in an image of `size`.
-    /// Always rendered whole, from the corner of the text's own extent: vello's antialiasing shifts
-    /// by a hair with the render's origin, and a fixed origin keeps every render of the same text,
-    /// live or saved, identical to the last bit.
-    fn masks(&self, size: [usize; 2]) -> Option<TextMasks> {
-        let path = self.path();
-        let image = Rect::from_min_size(Pos2::ZERO, eframe::egui::vec2(size[0] as f32, size[1] as f32));
-        let b = path_bounds(&path, self.halo()).intersect(image);
-        if !b.is_positive() {
-            return None;
-        }
-        let area = PxRect {
-            x0: b.min.x.floor() as usize,
-            y0: b.min.y.floor() as usize,
-            x1: (b.max.x.ceil() as usize).min(size[0]),
-            y1: (b.max.y.ceil() as usize).min(size[1]),
-        };
-        let (w, h) = (u16::try_from(area.x1 - area.x0).ok()?, u16::try_from(area.y1 - area.y0).ok()?);
-        let render = |stroke: Option<f32>| -> Vec<u8> {
-            let mut ctx = vello_cpu::RenderContext::new(w, h);
-            ctx.set_transform(kurbo::Affine::translate((-(area.x0 as f64), -(area.y0 as f64))));
-            ctx.set_paint(vello_cpu::color::OpaqueColor::<vello_cpu::color::Srgb>::WHITE);
-            match stroke {
-                Some(width) => {
-                    ctx.set_stroke(kurbo::Stroke::new(width as f64).with_join(kurbo::Join::Round));
-                    ctx.stroke_path(&path);
-                }
-                None => ctx.fill_path(&path),
-            }
-            let mut pixmap = vello_cpu::Pixmap::new(w, h);
-            ctx.render(&mut pixmap, &mut vello_cpu::Resources::new());
-            // White paint, premultiplied: alpha is the coverage.
-            pixmap.data().iter().map(|px| px.a).collect()
-        };
-        let halo = if self.outline { render(Some(self.halo())) } else { Vec::new() };
-        Some(TextMasks { area, fill: render(None), halo })
+        placed_bounds(&self.placed())
     }
 }
 
-/// A text's coverage over the image pixels `area`, one byte per pixel: the letters and their halo.
-struct TextMasks {
-    area: PxRect,
+/// Precision of glyph edges: 1/256 of a pixel, as FreeType keeps them.
+const SUB: i32 = 256;
+/// How far a flattened curve may stray from the true one, in pixels (vello's tolerance, which drew text before).
+const FLATNESS: f64 = 0.25;
+
+fn fixed(v: f32) -> i32 {
+    (v * SUB as f32).round() as i32
+}
+
+/// A straight piece of a closed outline, `[x0, y0, x1, y1]` in 1/256 px.
+type Edge = [i32; 4];
+
+/// One glyph at one size, flattened: its outline and its halo's, as edges in 1/256 px from the
+/// glyph's origin on the baseline (y down).
+struct GlyphEdges {
+    fill: Vec<Edge>,
+    halo: Vec<Edge>,
+    /// Extent of every edge, `[x0, y0, x1, y1]`; `x0 > x1` for a glyph that draws nothing.
+    bbox: [i32; 4],
+}
+
+impl GlyphEdges {
+    fn new(font: &skrifa::FontRef, id: skrifa::GlyphId, size: f32, halo: f32) -> Self {
+        let mut path = kurbo::BezPath::new();
+        if let Some(g) = font.outline_glyphs().get(id) {
+            let settings = skrifa::outline::DrawSettings::unhinted(skrifa::instance::Size::new(size), skrifa::instance::LocationRef::default());
+            // A glyph that fails to draw is left out rather than failing the whole text.
+            let _ = g.draw(settings, &mut GlyphPen { path: &mut path, x: 0.0, y: 0.0 });
+        }
+        let fill = edges_of(&path);
+        let halo = if halo > 0.0 && !fill.is_empty() {
+            let style = kurbo::Stroke::new(halo as f64).with_join(kurbo::Join::Round);
+            edges_of(&kurbo::stroke(path.iter(), &style, &kurbo::StrokeOpts::default(), FLATNESS))
+        } else {
+            Vec::new()
+        };
+        let mut bbox = [i32::MAX, i32::MAX, i32::MIN, i32::MIN];
+        for e in fill.iter().chain(&halo) {
+            bbox = [bbox[0].min(e[0]).min(e[2]), bbox[1].min(e[1]).min(e[3]), bbox[2].max(e[0]).max(e[2]), bbox[3].max(e[1]).max(e[3])];
+        }
+        Self { fill, halo, bbox }
+    }
+
+    fn len(&self) -> usize {
+        self.fill.len() + self.halo.len()
+    }
+}
+
+/// `path` flattened into closed loops of edges in 1/256 px; an open subpath is closed, as a fill closes it.
+fn edges_of(path: &kurbo::BezPath) -> Vec<Edge> {
+    let mut els = Vec::new();
+    kurbo::flatten(path.iter(), FLATNESS, |el| els.push(el));
+    let q = |p: kurbo::Point| [(p.x * SUB as f64).round() as i32, (p.y * SUB as f64).round() as i32];
+    let mut out = Vec::new();
+    let (mut start, mut last) = ([0, 0], [0, 0]);
+    fn line(out: &mut Vec<Edge>, a: [i32; 2], b: [i32; 2]) {
+        if a != b {
+            out.push([a[0], a[1], b[0], b[1]]);
+        }
+    }
+    for el in els {
+        match el {
+            kurbo::PathEl::MoveTo(p) => {
+                line(&mut out, last, start);
+                (start, last) = (q(p), q(p));
+            }
+            kurbo::PathEl::LineTo(p) => {
+                line(&mut out, last, q(p));
+                last = q(p);
+            }
+            kurbo::PathEl::ClosePath => {
+                line(&mut out, last, start);
+                last = start;
+            }
+            // `flatten` hands out lines only.
+            _ => {}
+        }
+    }
+    line(&mut out, last, start);
+    out
+}
+
+/// Flattened glyphs by (glyph, size, halo width), shared by every text.
+struct GlyphCache {
+    map: std::collections::HashMap<(u32, u32, u32), Arc<GlyphEdges>>,
+    edges: usize,
+}
+
+/// Edges kept before the glyph cache starts over (16 bytes each).
+// ceiling: the whole cache is dropped past this (dragging the size slider fills it with sizes used
+// once); keep an LRU instead if re-flattening after a reset ever shows up in a profile.
+const GLYPH_CACHE_EDGES: usize = 1 << 20;
+
+static GLYPHS: LazyLock<Mutex<GlyphCache>> = LazyLock::new(|| Mutex::new(GlyphCache { map: Default::default(), edges: 0 }));
+
+impl GlyphCache {
+    fn get(&mut self, font: &skrifa::FontRef, id: skrifa::GlyphId, size: f32, halo: f32) -> Arc<GlyphEdges> {
+        let key = (id.to_u32(), size.to_bits(), halo.to_bits());
+        if let Some(g) = self.map.get(&key) {
+            return g.clone();
+        }
+        let g = Arc::new(GlyphEdges::new(font, id, size, halo));
+        if self.edges + g.len() > GLYPH_CACHE_EDGES {
+            self.map.clear();
+            self.edges = 0;
+        }
+        self.edges += g.len();
+        self.map.insert(key, g.clone());
+        g
+    }
+}
+
+/// A glyph placed in the text: its edges move by `at` (1/256 px).
+#[derive(Clone)]
+struct Placed {
+    edges: Arc<GlyphEdges>,
+    at: [i32; 2],
+}
+
+impl Placed {
+    fn bbox(&self) -> [i32; 4] {
+        let [x0, y0, x1, y1] = self.edges.bbox;
+        [x0 + self.at[0], y0 + self.at[1], x1 + self.at[0], y1 + self.at[1]]
+    }
+
+    /// The image pixels the glyph's edges reach.
+    fn rect(&self) -> Rect {
+        let [x0, y0, x1, y1] = self.bbox();
+        let (floor, ceil) = (|v: i32| v.div_euclid(SUB) as f32, |v: i32| -(-v).div_euclid(SUB) as f32);
+        Rect::from_min_max(Pos2::new(floor(x0), floor(y0)), Pos2::new(ceil(x1), ceil(y1)))
+    }
+
+    fn same(&self, o: &Placed) -> bool {
+        Arc::ptr_eq(&self.edges, &o.edges) && self.at == o.at
+    }
+}
+
+fn placed_bounds(glyphs: &[Placed]) -> Rect {
+    glyphs.iter().fold(Rect::NOTHING, |b, g| b.union(g.rect()))
+}
+
+/// Exact antialiased coverage of closed outlines (nonzero winding) over the pixels of `r`. Each
+/// edge adds whole-number cover and area to the pixel cells it crosses, worked out from its own
+/// end points alone; so a pixel's value never depends on which rectangle is being filled or in
+/// what order edges arrive, and any tile can be rendered on its own, bit for bit as in a whole render.
+struct Coverage {
+    r: PxRect,
+    /// `[cover, area]` per pixel of `r`, FreeType style.
+    cells: Vec<[i32; 2]>,
+    /// Cover of the cells left of `r`, per row.
+    carry: Vec<i32>,
+}
+
+impl Coverage {
+    fn new(r: PxRect) -> Self {
+        let (w, h) = (r.x1 - r.x0, r.y1 - r.y0);
+        Self { r, cells: vec![[0, 0]; w * h], carry: vec![0; h] }
+    }
+
+    /// Adds the edge `[x0, y0, x1, y1]` moved by `at`.
+    fn add(&mut self, e: &Edge, at: [i32; 2]) {
+        let (x0, y0, x1, y1) = (e[0] + at[0], e[1] + at[1], e[2] + at[0], e[3] + at[1]);
+        if y0 == y1 {
+            return;
+        }
+        let (dir, xa, ya, xb, yb) = if y0 < y1 { (1, x0, y0, x1, y1) } else { (-1, x1, y1, x0, y0) };
+        let (ys, ye) = (ya.max(self.r.y0 as i32 * SUB), yb.min(self.r.y1 as i32 * SUB));
+        let x_at = |y: i32| xa + ((y - ya) as i64 * (xb - xa) as i64).div_euclid((yb - ya) as i64) as i32;
+        let mut y = ys;
+        while y < ye {
+            let next = ((y.div_euclid(SUB) + 1) * SUB).min(ye);
+            self.row_piece(dir, x_at(y), y, x_at(next), next);
+            y = next;
+        }
+    }
+
+    /// One edge's piece inside a single pixel row, from `(xs, ys)` down to `(xe, ye)`.
+    fn row_piece(&mut self, dir: i32, xs: i32, ys: i32, xe: i32, ye: i32) {
+        let py = ys.div_euclid(SUB);
+        let row = py as usize - self.r.y0;
+        let (cs, ce) = (xs.div_euclid(SUB), xe.div_euclid(SUB));
+        if cs == ce {
+            self.cell(row, cs, dir * (ye - ys), dir * (ye - ys) * (xs + xe - 2 * cs * SUB));
+            return;
+        }
+        let (dx, dy) = (xe - xs, ye - ys);
+        let step = if dx > 0 { 1 } else { -1 };
+        let (mut cx, mut px, mut pyy) = (cs, xs, ys);
+        while cx != ce {
+            let bx = if step > 0 { (cx + 1) * SUB } else { cx * SUB };
+            let by = ys + ((bx - xs) as i64 * dy as i64).div_euclid(dx as i64) as i32;
+            self.cell(row, cx, dir * (by - pyy), dir * (by - pyy) * (px + bx - 2 * cx * SUB));
+            (px, pyy, cx) = (bx, by, cx + step);
+        }
+        self.cell(row, ce, dir * (ye - pyy), dir * (ye - pyy) * (px + xe - 2 * ce * SUB));
+    }
+
+    fn cell(&mut self, row: usize, cx: i32, cover: i32, area: i32) {
+        let (x0, x1) = (self.r.x0 as i32, self.r.x1 as i32);
+        if cx < x0 {
+            self.carry[row] += cover;
+        } else if cx < x1 {
+            let c = &mut self.cells[row * (self.r.x1 - self.r.x0) + (cx - x0) as usize];
+            c[0] += cover;
+            c[1] += area;
+        }
+    }
+
+    /// The coverage as one byte per pixel of `r`.
+    fn alphas(&self) -> Vec<u8> {
+        let w = (self.r.x1 - self.r.x0).max(1);
+        // Full coverage is `SUB * SUB * 2`: cover in 1/256 px rows, times twice the x in 1/256 px.
+        const FULL: i32 = SUB * SUB * 2;
+        let mut out = vec![0u8; self.cells.len()];
+        for ((cells, out), &carry) in self.cells.chunks(w).zip(out.chunks_mut(w)).zip(&self.carry) {
+            let mut acc = carry;
+            for (&[c, a], o) in cells.iter().zip(out) {
+                let n = (acc + c) * (2 * SUB) - a;
+                acc += c;
+                *o = ((n.unsigned_abs().min(FULL as u32) * 255 + FULL as u32 / 2) / FULL as u32) as u8;
+            }
+        }
+        out
+    }
+}
+
+/// One tile of a text: its letters' and halo's coverage, one byte per pixel of `r`.
+struct TextTile {
+    r: PxRect,
     fill: Vec<u8>,
     halo: Vec<u8>,
 }
 
-impl TextMasks {
-    /// Composites `t` onto `patch` (top-left image pixel `at`): the halo first, the letters over it.
-    fn paint(&self, t: &Text, patch: &mut ColorImage, at: [usize; 2]) {
-        let r = patch_rect(patch, at);
-        let (x0, x1) = (r.x0.max(self.area.x0), r.x1.min(self.area.x1));
-        let (y0, y1) = (r.y0.max(self.area.y0), r.y1.min(self.area.y1));
-        let (mw, pw) = (self.area.x1 - self.area.x0, patch.size[0]);
-        let halo = t.halo_color();
-        for y in y0..y1 {
-            for x in x0..x1 {
-                let m = (y - self.area.y0) * mw + (x - self.area.x0);
-                let px = &mut patch.pixels[(y - r.y0) * pw + (x - r.x0)];
-                if let Some(&k) = self.halo.get(m).filter(|&&k| k > 0) {
-                    *px = over(*px, halo, k as f32 / 255.0);
+/// A text ready to paint: its glyphs placed, and their coverage worked out tile by tile as the tiles
+/// are first painted. `Coverage` gives a pixel the same value whatever rectangle it is rendered in,
+/// so a tile looks the same whichever paint asked for it first, live or saved, and editing the text
+/// redoes only the tiles its changed letters reach.
+pub struct TextRaster {
+    text: Text,
+    glyphs: Vec<Placed>,
+    bounds: Rect,
+    size: [usize; 2],
+    /// Rendered tiles by index (`None`: nothing of the text there).
+    tiles: std::collections::HashMap<usize, Option<TextTile>>,
+}
+
+impl TextRaster {
+    pub fn new(t: &Text, size: [usize; 2]) -> Self {
+        let glyphs = t.placed();
+        Self { text: t.clone(), bounds: placed_bounds(&glyphs), glyphs, size, tiles: Default::default() }
+    }
+
+    pub fn text(&self) -> &Text {
+        &self.text
+    }
+
+    /// Image pixels the text can touch.
+    pub fn bounds(&self) -> Rect {
+        self.bounds
+    }
+
+    /// Renders tiles `tx0..tx1` of tile row `ty` in one pass (every glyph's edges are walked once
+    /// for the whole span, not once per tile) and stores each of them.
+    fn render_span(&mut self, ty: usize, tx0: usize, tx1: usize) {
+        let r = PxRect { x0: tx0 * TILE, y0: ty * TILE, x1: (tx1 * TILE).min(self.size[0]), y1: ((ty + 1) * TILE).min(self.size[1]) };
+        let (x0, y0, x1, y1) = (r.x0 as i32 * SUB, r.y0 as i32 * SUB, r.x1 as i32 * SUB, r.y1 as i32 * SUB);
+        let mut fill = Coverage::new(r);
+        let mut halo = self.text.outline.then(|| Coverage::new(r));
+        for g in &self.glyphs {
+            let b = g.bbox();
+            // A glyph wholly left of the span adds no cover to it (its loops are closed), nor does one
+            // wholly above, below or right of it.
+            if b[2] <= x0 || b[0] >= x1 || b[3] <= y0 || b[1] >= y1 {
+                continue;
+            }
+            for e in &g.edges.fill {
+                fill.add(e, g.at);
+            }
+            if let Some(h) = halo.as_mut() {
+                for e in &g.edges.halo {
+                    h.add(e, g.at);
                 }
-                if self.fill[m] > 0 {
-                    *px = over(*px, t.color, self.fill[m] as f32 / 255.0);
+            }
+        }
+        let (fill, halo) = (fill.alphas(), halo.map_or_else(Vec::new, |h| h.alphas()));
+        let cols = self.size[0].div_ceil(TILE);
+        let w = r.x1 - r.x0;
+        for tx in tx0..tx1 {
+            let t = PxRect { x0: tx * TILE, x1: ((tx + 1) * TILE).min(self.size[0]), ..r };
+            let cut = |v: &[u8]| -> Vec<u8> {
+                let mut out = Vec::with_capacity((t.x1 - t.x0) * (t.y1 - t.y0));
+                for row in v.chunks(w) {
+                    out.extend_from_slice(&row[t.x0 - r.x0..t.x1 - r.x0]);
+                }
+                out
+            };
+            let tile_fill = cut(&fill);
+            let tile_halo = if halo.is_empty() { Vec::new() } else { cut(&halo) };
+            let blank = tile_fill.iter().chain(&tile_halo).all(|&k| k == 0);
+            self.tiles.insert(ty * cols + tx, (!blank).then_some(TextTile { r: t, fill: tile_fill, halo: tile_halo }));
+        }
+    }
+
+    /// Composites the text onto `patch` (top-left image pixel `at`): the halo first, the letters over it.
+    pub fn paint(&mut self, patch: &mut ColorImage, at: [usize; 2]) {
+        let r = patch_rect(patch, at);
+        let reach = self.bounds.intersect(r.rect());
+        let cols = self.size[0].div_ceil(TILE);
+        // Tiles not rendered yet, rendered a row at a time.
+        let mut missing: Vec<usize> = tiles_in(reach, self.size).filter(|i| !self.tiles.contains_key(i)).collect();
+        missing.sort_unstable();
+        for row in missing.chunk_by(|a, b| a / cols == b / cols) {
+            let (first, last) = (row[0], row[row.len() - 1]);
+            self.render_span(first / cols, first % cols, last % cols + 1);
+        }
+        let (color, halo) = (self.text.color, self.text.halo_color());
+        let pw = patch.size[0];
+        for idx in tiles_in(reach, self.size) {
+            let Some(Some(t)) = self.tiles.get(&idx) else { continue };
+            let (x0, x1) = (r.x0.max(t.r.x0), r.x1.min(t.r.x1));
+            let (y0, y1) = (r.y0.max(t.r.y0), r.y1.min(t.r.y1));
+            let tw = t.r.x1 - t.r.x0;
+            for y in y0..y1 {
+                let m = (y - t.r.y0) * tw;
+                let (mx0, mx1) = (m + x0 - t.r.x0, m + x1 - t.r.x0);
+                let row = &mut patch.pixels[(y - r.y0) * pw + x0 - r.x0..(y - r.y0) * pw + x1 - r.x0];
+                if let Some(ks) = t.halo.get(mx0..mx1) {
+                    for (px, &k) in row.iter_mut().zip(ks) {
+                        *px = over8(*px, halo, k);
+                    }
+                }
+                for (px, &k) in row.iter_mut().zip(&t.fill[mx0..mx1]) {
+                    *px = over8(*px, color, k);
                 }
             }
         }
     }
-}
 
-/// Tiles where `new` differs from `old`, text being typed: only the glyphs that changed when the
-/// style and place are the same (typing adds or takes letters at the end), everything otherwise.
-pub fn text_changes(old: &Text, new: &Text, tiles: &mut Tiles) {
-    let same_style = (old.color, old.size, old.outline, old.pos) == (new.color, new.size, new.outline, new.pos);
-    let Some(font) = Text::font().filter(|_| same_style) else {
-        tiles.add(old.bounds());
-        tiles.add(new.bounds());
-        return;
-    };
-    let (a, b) = (old.glyphs(), new.glyphs());
-    let same = a.iter().zip(&b).take_while(|(x, y)| x == y).count();
-    for &(id, x, baseline) in a[same..].iter().chain(&b[same..]) {
-        tiles.add(old.glyph_bounds(&font, id, x, baseline));
+    /// Turns this into the raster of `new`, adding to `dirty` the tiles whose pixels can differ. While
+    /// only letters at the end change (typing), only the tiles those letters reach are redone.
+    pub fn retext(&mut self, new: &Text, dirty: &mut Tiles) {
+        // ceiling: a new size redoes the whole text (~45 ms per size-slider frame for a 12-line 160 px
+        // block on 4K, release); render the visible tiles first if the slider drags on big text.
+        if (self.text.size, self.text.outline, self.text.pos) != (new.size, new.outline, new.pos) {
+            dirty.add(self.bounds);
+            *self = TextRaster::new(new, self.size);
+            dirty.add(self.bounds);
+            return;
+        }
+        if self.text.color != new.color {
+            dirty.add(self.bounds);
+        }
+        let glyphs = new.placed();
+        let same = self.glyphs.iter().zip(&glyphs).take_while(|(a, b)| a.same(b)).count();
+        let mut changed = Tiles::new(self.size);
+        for g in self.glyphs[same..].iter().chain(&glyphs[same..]) {
+            changed.add(g.rect());
+        }
+        self.tiles.retain(|&idx, _| !changed.on[idx]);
+        dirty.union(&changed);
+        self.bounds = placed_bounds(&glyphs);
+        self.glyphs = glyphs;
+        self.text = new.clone();
     }
-}
 
-/// `path`'s extent widened by half a `halo` and a pixel of antialiasing; nothing for an empty path.
-fn path_bounds(path: &kurbo::BezPath, halo: f32) -> Rect {
-    if path.elements().is_empty() {
-        return Rect::NOTHING;
+    /// Whether `p` is within `radius` of one of the letters (their halo included).
+    fn touches(&self, p: Pos2, radius: f32) -> bool {
+        self.bounds.expand(radius).contains(p) && self.glyphs.iter().any(|g| g.rect().expand(radius).contains(p))
     }
-    let b = path.bounding_box();
-    Rect::from_min_max(Pos2::new(b.x0 as f32, b.y0 as f32), Pos2::new(b.x1 as f32, b.y1 as f32)).expand(halo / 2.0 + 1.0)
 }
 
 /// Collects a glyph outline from `skrifa` (y up, origin on the baseline) into image pixels.
@@ -475,8 +740,8 @@ impl Mark {
         }
     }
 
-    /// The mark ready to paint many patches of an image of `size`: its geometry (a text's letters
-    /// too) is worked out once, not per tile run.
+    /// The mark ready to paint many patches of an image of `size`: its geometry is worked out once,
+    /// not per tile run (a text's letters as each tile is first painted).
     pub fn raster(&self, size: [usize; 2]) -> Raster<'_> {
         let mut r = Raster { mark: self, segments: Vec::new(), head: None, text: None };
         match self {
@@ -487,7 +752,7 @@ impl Mark {
                 }
                 r.head = (s.kind == ShapeKind::Arrow).then(|| s.arrow().1);
             }
-            Mark::Text(t) => r.text = t.masks(size),
+            Mark::Text(t) => r.text = Some(TextRaster::new(t, size)),
         }
         r
     }
@@ -508,7 +773,7 @@ impl Mark {
         match self {
             Mark::Stroke(s) => s.touches(p, radius),
             Mark::Shape(s) => s.touches(p, radius),
-            Mark::Text(t) => t.bounds().expand(radius).contains(p),
+            Mark::Text(t) => t.placed().iter().any(|g| g.rect().expand(radius).contains(p)),
         }
     }
 
@@ -529,26 +794,36 @@ pub struct Raster<'a> {
     mark: &'a Mark,
     segments: Vec<(Pos2, Pos2)>,
     head: Option<[Pos2; 3]>,
-    text: Option<TextMasks>,
+    text: Option<TextRaster>,
 }
 
-impl Raster<'_> {
+impl<'a> Raster<'a> {
+    /// The raster of `mark`, a text, from its text raster.
+    pub fn of_text(mark: &'a Mark, text: TextRaster) -> Self {
+        Raster { mark, segments: Vec::new(), head: None, text: Some(text) }
+    }
+
+    /// The text raster inside, for a text mark.
+    pub fn into_text(self) -> Option<TextRaster> {
+        self.text
+    }
+
     /// Composites the mark onto `patch`, a piece of the picture whose top-left pixel is `at`. The
     /// result for a pixel depends only on that pixel and the mark, never on where the patch ends,
     /// so painting tile runs one at a time gives the same pixels as painting the whole picture.
-    pub fn paint(&self, patch: &mut ColorImage, at: [usize; 2]) {
+    pub fn paint(&mut self, patch: &mut ColorImage, at: [usize; 2]) {
         match self.mark {
             Mark::Stroke(s) => s.paint(patch, at),
             Mark::Shape(s) => s.paint(&self.segments, self.head, patch, at),
-            Mark::Text(t) => {
-                if let Some(masks) = &self.text {
-                    masks.paint(t, patch, at);
+            Mark::Text(_) => {
+                if let Some(text) = self.text.as_mut() {
+                    text.paint(patch, at);
                 }
-
             }
         }
     }
 }
+
 /// Side of the square tiles marks are rasterised and uploaded in, in image pixels.
 pub const TILE: usize = 32;
 
@@ -595,6 +870,18 @@ impl Tiles {
         }
     }
 
+    /// Indices of the tiles in the set, row by row (`y * columns + x`).
+    pub fn indices(&self) -> impl Iterator<Item = usize> + '_ {
+        self.on.iter().enumerate().filter_map(|(i, &on)| on.then_some(i))
+    }
+
+    /// Keeps only the tiles whose index passes `keep`.
+    pub fn retain(&mut self, mut keep: impl FnMut(usize) -> bool) {
+        for (i, on) in self.on.iter_mut().enumerate() {
+            *on = *on && keep(i);
+        }
+    }
+
     pub fn union(&mut self, o: &Tiles) {
         for (a, &b) in self.on.iter_mut().zip(&o.on) {
             *a |= b;
@@ -637,6 +924,21 @@ impl Tiles {
         }
         out
     }
+}
+
+/// Indices of the tiles of an image of `size` that `r` (image pixels) overlaps, row by row.
+fn tiles_in(r: Rect, size: [usize; 2]) -> impl Iterator<Item = usize> {
+    let cols = size[0].div_ceil(TILE);
+    let span = |lo: f32, hi: f32, lim: usize| {
+        // Written so a NaN or empty rectangle gives nothing.
+        if hi > lo && hi > 0.0 && lo < lim as f32 {
+            (lo.max(0.0) as usize / TILE, (hi.ceil().min(lim as f32) as usize).div_ceil(TILE))
+        } else {
+            (0, 0)
+        }
+    };
+    let ((tx0, tx1), (ty0, ty1)) = (span(r.min.x, r.max.x, size[0]), span(r.min.y, r.max.y, size[1]));
+    (ty0..ty1).flat_map(move |ty| (tx0..tx1).map(move |tx| ty * cols + tx))
 }
 
 /// The image pixels a patch with top-left pixel `at` covers.
@@ -694,7 +996,6 @@ fn cover_segments(cover: &mut [f32], r: PxRect, segments: impl Iterator<Item = (
                     *slot = c;
                 }
             }
-
         }
     }
 }
@@ -778,6 +1079,20 @@ fn over(px: Color32, ink: Color32, k: f32) -> Color32 {
     Color32::from_rgba_premultiplied(mix(r0, cr), mix(g0, cg), mix(b0, cb), a)
 }
 
+/// Opaque `ink` over the premultiplied pixel `px` at 8-bit coverage `k`, rounded exactly.
+fn over8(px: Color32, ink: Color32, k: u8) -> Color32 {
+    match k {
+        0 => px,
+        255 => Color32::from_rgba_premultiplied(ink.r(), ink.g(), ink.b(), 255),
+        _ => {
+            let (k, j) = (k as u32, 255 - k as u32);
+            let mix = |base: u8, ink: u8| ((base as u32 * j + ink as u32 * k + 127) / 255) as u8;
+            let [r0, g0, b0, a0] = px.to_array();
+            Color32::from_rgba_premultiplied(mix(r0, ink.r()), mix(g0, ink.g()), mix(b0, ink.b()), mix(a0, 255))
+        }
+    }
+}
+
 /// Opaque `ink` multiplied into the premultiplied pixel `px` at coverage `k` (the W3C multiply
 /// blend, source-over). On an opaque pixel this is `lerp(base, base * ink, k)`; where the picture is
 /// see-through (outside a freeform snip) the ink shows as itself.
@@ -791,6 +1106,47 @@ fn multiply(px: Color32, ink: Color32, k: f32) -> Color32 {
     };
     let a = (a0 as f32 + (255.0 - a0 as f32) * k).round() as u8;
     Color32::from_rgba_premultiplied(mix(r0, cr), mix(g0, cg), mix(b0, cb), a)
+}
+
+/// How much of its colour a highlighter screens onto dark content. At full strength light text ends up
+/// near-white on bright yellow (about 1.2:1); at half, the page turns a muted shade of the ink and the
+/// text keeps about 3.4:1 against it.
+const SCREEN_STRENGTH: f32 = 0.5;
+
+/// `ink` at `SCREEN_STRENGTH` screened onto the premultiplied pixel `px` at coverage `k` (the W3C
+/// screen blend, source-over): `1 - (1 - base)(1 - ink)`, which lightens. On premultiplied colour that
+/// is `base + ink - base * ink` whatever the pixel's alpha, so see-through pixels show the ink itself.
+fn screen(px: Color32, ink: Color32, k: f32) -> Color32 {
+    let [r0, g0, b0, a0] = px.to_array();
+    let [cr, cg, cb, _] = ink.to_array();
+    let mix = |base: u8, ink: u8| {
+        let (b, i) = (base as f32, ink as f32 * SCREEN_STRENGTH);
+        (b + k * (i - b * i / 255.0)).round() as u8
+    };
+    let a = (a0 as f32 + (255.0 - a0 as f32) * k).round() as u8;
+    Color32::from_rgba_premultiplied(mix(r0, cr), mix(g0, cg), mix(b0, cb), a)
+}
+
+/// Content under a dab of `radius` at `p` reads as dark: its mean luminance is under half. See-through
+/// pixels (outside a freeform snip) don't count; with none opaque it is not dark.
+pub fn is_dark_under(img: &ColorImage, p: Pos2, radius: f32) -> bool {
+    let r = radius.max(4.0);
+    let [w, h] = img.size;
+    let span = |c: f32, lim: usize| ((c - r).floor().max(0.0) as usize, ((c + r).ceil().max(0.0) as usize).min(lim));
+    let ((x0, x1), (y0, y1)) = (span(p.x, w), span(p.y, h));
+    let (mut sum, mut weight) = (0.0f64, 0.0f64);
+    for y in y0..y1 {
+        for x in x0..x1 {
+            if (Pos2::new(x as f32 + 0.5, y as f32 + 0.5) - p).length_sq() > r * r {
+                continue;
+            }
+            let [cr, cg, cb, a] = img.pixels[y * w + x].to_srgba_unmultiplied();
+            let lum = 0.2126 * cr as f64 + 0.7152 * cg as f64 + 0.0722 * cb as f64;
+            sum += lum * a as f64;
+            weight += 255.0 * a as f64;
+        }
+    }
+    weight > 0.0 && sum / weight < 0.5
 }
 
 #[derive(Clone)]
@@ -810,6 +1166,10 @@ pub struct Doc {
     pub image_rev: u64,
     /// Bumped whenever `marks` change, for the same reason.
     pub ink_rev: u64,
+    /// Rendered text marks by identity, for the picture size `texts_size`. Each entry keeps its mark's
+    /// allocation alive (`Weak`), so no other mark can take its address while the entry exists.
+    texts: std::collections::HashMap<usize, (Weak<Mark>, TextRaster)>,
+    texts_size: [usize; 2],
 }
 
 const HISTORY: usize = 50;
@@ -823,6 +1183,8 @@ impl Doc {
             redo: Vec::new(),
             image_rev: 0,
             ink_rev: 0,
+            texts: Default::default(),
+            texts_size: [0, 0],
         }
     }
 
@@ -881,22 +1243,55 @@ impl Doc {
         self.ink_rev += 1;
     }
 
+    /// Adds finished text whose raster is already worked out (the one that showed it while it was
+    /// typed), so its tiles are never rendered twice.
+    pub fn add_text(&mut self, raster: TextRaster) {
+        self.add_mark(raster.text().clone());
+        self.sync_text_cache();
+        if let Some(m) = self.marks.last() {
+            self.texts.insert(Arc::as_ptr(m) as usize, (Arc::downgrade(m), raster));
+        }
+    }
+
+    /// Drops cached text rasters of marks no version of the list holds any more, and all of them when
+    /// the picture changed size (a raster's tiles are cut to the picture).
+    fn sync_text_cache(&mut self) {
+        if self.texts_size != self.size() {
+            self.texts.clear();
+            self.texts_size = self.size();
+        }
+        self.texts.retain(|_, (m, _)| m.strong_count() > 0);
+    }
+
+    fn cached_text(&self, m: &Arc<Mark>) -> Option<&TextRaster> {
+        self.texts.get(&(Arc::as_ptr(m) as usize)).filter(|_| self.texts_size == self.size()).map(|(_, r)| r)
+    }
+
+    fn touches(&self, m: &Arc<Mark>, p: Pos2, radius: f32) -> bool {
+        match self.cached_text(m) {
+            Some(r) => r.touches(p, radius),
+            None => m.touches(p, radius),
+        }
+    }
+
     pub fn hits(&self, p: Pos2, radius: f32) -> bool {
-        self.marks.iter().any(|m| m.touches(p, radius))
+        self.marks.iter().any(|m| self.touches(m, p, radius))
     }
 
     /// Removes every mark within `radius` of `p`. Returns whether any went.
     pub fn erase_at(&mut self, p: Pos2, radius: f32) -> bool {
-        let before = self.marks.len();
-        self.marks.retain(|m| !m.touches(p, radius));
-        let gone = self.marks.len() != before;
-        if gone {
-            self.ink_rev += 1;
+        let keep: Vec<bool> = self.marks.iter().map(|m| !self.touches(m, p, radius)).collect();
+        if keep.iter().all(|&k| k) {
+            return false;
         }
-        gone
+        let mut keep = keep.into_iter();
+        self.marks.retain(|_| keep.next().unwrap_or(true));
+        self.ink_rev += 1;
+        true
     }
 
-    /// Crops to `r` (image pixels); marks move with the picture.
+    /// Crops to `r` (image pixels); marks move with the picture, and those it leaves wholly outside go
+    /// (undo brings them back with the picture).
     pub fn crop(&mut self, r: Rect) {
         let [w, h] = self.size();
         let x0 = (r.min.x.round().max(0.0) as usize).min(w);
@@ -914,6 +1309,8 @@ impl Doc {
         for m in &mut self.marks {
             Arc::make_mut(m).translate(-shift);
         }
+        let picture = Rect::from_min_size(Pos2::ZERO, eframe::egui::vec2((x1 - x0) as f32, (y1 - y0) as f32));
+        self.marks.retain(|m| m.bounds().intersects(picture));
     }
 
     /// Tiles whose pixels differ between the picture burned with `before` and with the current
@@ -926,27 +1323,64 @@ impl Doc {
         let gone = before.iter().filter(|m| !now.contains(&Arc::as_ptr(m)));
         let added = self.marks.iter().filter(|m| !was.contains(&Arc::as_ptr(m)));
         for m in gone.chain(added) {
-            m.footprint(&mut tiles);
+            match self.cached_text(m) {
+                Some(r) => tiles.add(r.bounds()),
+                None => m.footprint(&mut tiles),
+            }
         }
         tiles
     }
 
     /// The flattened picture over each run of `tiles`, built from the bare picture and only the
-    /// marks that reach that run: the same pixels `flatten` gives there.
+    /// marks that reach that run: the same pixels `flatten` gives there. Texts keep their rendered
+    /// tiles between calls, so an erase or undo beside them costs nothing for them.
     // ceiling: re-burns every mark that reaches a damaged run (an undo under 20 thick highlighter
     // strokes stacked on one path takes ~90 ms on 4K); keep per-mark layers if piled-up marks feel sticky.
-    pub fn render_runs(&self, tiles: &Tiles) -> Vec<(PxRect, ColorImage)> {
-
-        let marks: Vec<(Rect, Raster)> = self.marks.iter().map(|m| (m.bounds(), m.raster(self.size()))).collect();
-        tiles
-            .runs()
-            .into_iter()
+    pub fn render_runs(&mut self, tiles: &Tiles) -> Vec<(PxRect, ColorImage)> {
+        let runs = tiles.runs();
+        if runs.is_empty() {
+            return Vec::new();
+        }
+        self.sync_text_cache();
+        let size = self.size();
+        let reach = runs.iter().fold(Rect::NOTHING, |b, r| b.union(r.rect()));
+        let hit = |b: Rect| b.intersects(reach) && runs.iter().any(|r| b.intersects(r.rect()));
+        enum Layer<'a> {
+            Plain(Box<Raster<'a>>),
+            Text(usize),
+        }
+        let Doc { image, marks, texts, .. } = self;
+        let mut layers = Vec::new();
+        for m in marks.iter() {
+            match &**m {
+                Mark::Text(t) => {
+                    let key = Arc::as_ptr(m) as usize;
+                    let (_, raster) = texts.entry(key).or_insert_with(|| (Arc::downgrade(m), TextRaster::new(t, size)));
+                    if hit(raster.bounds()) {
+                        layers.push((raster.bounds(), Layer::Text(key)));
+                    }
+                }
+                other => {
+                    let b = other.bounds();
+                    if hit(b) {
+                        layers.push((b, Layer::Plain(Box::new(other.raster(size)))));
+                    }
+                }
+            }
+        }
+        runs.into_iter()
             .map(|r| {
-                let mut patch = sub_image(&self.image, r.x0, r.y0, r.x1 - r.x0, r.y1 - r.y0);
-                let area = Rect::from_min_max(Pos2::new(r.x0 as f32, r.y0 as f32), Pos2::new(r.x1 as f32, r.y1 as f32));
-                for (b, raster) in &marks {
-                    if b.intersects(area) {
-                        raster.paint(&mut patch, r.pos());
+                let mut patch = sub_image(image, r.x0, r.y0, r.x1 - r.x0, r.y1 - r.y0);
+                for (b, layer) in &mut layers {
+                    if b.intersects(r.rect()) {
+                        match layer {
+                            Layer::Plain(raster) => raster.paint(&mut patch, r.pos()),
+                            Layer::Text(key) => {
+                                if let Some((_, raster)) = texts.get_mut(key) {
+                                    raster.paint(&mut patch, r.pos());
+                                }
+                            }
+                        }
                     }
                 }
                 (r, patch)
@@ -976,6 +1410,10 @@ pub struct PxRect {
 impl PxRect {
     pub fn pos(self) -> [usize; 2] {
         [self.x0, self.y0]
+    }
+
+    pub fn rect(self) -> Rect {
+        Rect::from_min_max(Pos2::new(self.x0 as f32, self.y0 as f32), Pos2::new(self.x1 as f32, self.y1 as f32))
     }
 }
 
@@ -1049,7 +1487,7 @@ fn dist_to_segment(p: Pos2, a: Pos2, b: Pos2) -> f32 {
 pub fn burn(img: &mut ColorImage, m: &Mark) {
     let mut tiles = Tiles::new(img.size);
     m.footprint(&mut tiles);
-    let raster = m.raster(img.size);
+    let mut raster = m.raster(img.size);
     for r in tiles.runs() {
         let mut patch = sub_image(img, r.x0, r.y0, r.x1 - r.x0, r.y1 - r.y0);
         raster.paint(&mut patch, r.pos());
@@ -1090,6 +1528,7 @@ mod tests {
         let mut d = Doc::new(white(100, 80));
         d.checkpoint();
         d.marks.push(Arc::new(Mark::Stroke(Stroke {
+            on_dark: false,
             ink: Ink::Pen,
             color: Color32::RED,
             width: 4.0,
@@ -1108,9 +1547,23 @@ mod tests {
     }
 
     #[test]
+    fn crop_drops_the_marks_it_leaves_outside_and_undo_brings_them_back() {
+        let mut d = Doc::new(white(200, 100));
+        d.add_mark(shape(ShapeKind::Line, 4.0, (150.0, 80.0), (190.0, 90.0)));
+        d.add_mark(Text { text: "far".into(), color: Color32::RED, size: 20.0, outline: true, pos: Pos2::new(150.0, 10.0) });
+        d.add_mark(shape(ShapeKind::Line, 4.0, (10.0, 10.0), (60.0, 20.0)));
+        d.crop(Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(100.0, 100.0)));
+        assert_eq!(d.marks.len(), 1, "only the mark inside stays");
+        assert!(!d.hits(Pos2::new(170.0, 85.0), 30.0), "nothing invisible is left to hit");
+        d.undo();
+        assert_eq!(d.marks.len(), 3, "undo restores them");
+    }
+
+    #[test]
     fn flatten_burns_pen_ink() {
         let mut d = Doc::new(white(20, 20));
         d.marks.push(Arc::new(Mark::Stroke(Stroke {
+            on_dark: false,
             ink: Ink::Pen,
             color: Color32::BLACK,
             width: 6.0,
@@ -1125,6 +1578,7 @@ mod tests {
     fn zigzag() -> Stroke {
         // Crosses itself at (20, 20) and turns sharp corners at (35, 35) and (35, 5).
         Stroke {
+            on_dark: false,
             ink: Ink::Highlighter,
             color: Color32::from_rgb(255, 220, 0),
             width: 8.0,
@@ -1157,7 +1611,7 @@ mod tests {
             }
         }
         let mut d = Doc::new(img);
-        d.add_mark(Stroke { ink: Ink::Highlighter, color: ink, width: 10.0, points: vec![Pos2::new(2.0, 10.0), Pos2::new(38.0, 10.0)] });
+        d.add_mark(Stroke { on_dark: false, ink: Ink::Highlighter, color: ink, width: 10.0, points: vec![Pos2::new(2.0, 10.0), Pos2::new(38.0, 10.0)] });
         let out = d.flatten();
         assert_eq!(out.pixels[10 * 40 + 8], ink, "white becomes the highlight colour");
         let dark = out.pixels[10 * 40 + 30];
@@ -1178,18 +1632,68 @@ mod tests {
         assert_eq!(at(35, 36), s.color, "corner is filled round, not notched");
     }
 
+    /// A dark page (30, 30, 30) with a light "text" column (220, 220, 220) in its right half.
+    fn dark_page() -> ColorImage {
+        let mut img = ColorImage::new([40, 20], vec![Color32::from_rgb(30, 30, 30); 800]);
+        for y in 0..20 {
+            for x in 26..32 {
+                img.pixels[y * 40 + x] = Color32::from_gray(220);
+            }
+        }
+        img
+    }
+
+    #[test]
+    fn on_dark_content_the_highlighter_lights_the_page_and_keeps_light_text_light() {
+        let ink = Color32::from_rgb(255, 230, 0);
+        let line = vec![Pos2::new(2.0, 10.0), Pos2::new(38.0, 10.0)];
+        let page = dark_page();
+        assert!(is_dark_under(&page, line[0], 5.0), "a dark page reads as dark");
+        let mut d = Doc::new(page.clone());
+        d.add_mark(Stroke { ink: Ink::Highlighter, color: ink, width: 10.0, points: line.clone(), on_dark: true });
+        let out = d.flatten();
+        assert_eq!(out.pixels[10 * 40 + 8], Color32::from_rgb(143, 131, 30), "the dark page takes a muted shade of the colour");
+        let text = out.pixels[10 * 40 + 28];
+        assert!(text.r() >= 220 && text.g() >= 220 && text.b() >= 220, "light text stays light, got {text:?}");
+        assert_eq!(out.pixels[2 * 40 + 8], Color32::from_rgb(30, 30, 30), "outside the stroke untouched");
+        // Multiplied instead, the same stroke all but vanishes on the dark page.
+        let mut d = Doc::new(page);
+        d.add_mark(Stroke { ink: Ink::Highlighter, color: ink, width: 10.0, points: line, on_dark: false });
+        assert_eq!(d.flatten().pixels[10 * 40 + 8], Color32::from_rgb(30, 27, 0));
+    }
+
+    #[test]
+    fn the_blend_is_read_from_what_the_stroke_starts_on() {
+        let mut light = white(40, 20);
+        for x in 10..14 {
+            light.pixels[10 * 40 + x] = Color32::BLACK;
+        }
+        assert!(!is_dark_under(&light, Pos2::new(12.0, 10.0), 6.0), "dark text on a light page is light content");
+        assert!(is_dark_under(&dark_page(), Pos2::new(28.0, 10.0), 10.0), "light text on a dark page is dark content");
+        assert!(!is_dark_under(&ColorImage::new([20, 20], vec![Color32::TRANSPARENT; 400]), Pos2::new(10.0, 10.0), 6.0), "nothing opaque is not dark");
+        assert!(!is_dark_under(&light, Pos2::new(-50.0, -50.0), 6.0), "off the picture is not dark");
+    }
+
+    #[test]
+    fn a_screened_highlighter_on_see_through_pixels_shows_its_colour_at_screen_strength() {
+        let ink = Color32::from_rgb(255, 220, 0);
+        let mut img = ColorImage::new([20, 20], vec![Color32::TRANSPARENT; 400]);
+        burn(&mut img, &Mark::Stroke(Stroke { ink: Ink::Highlighter, color: ink, width: 8.0, points: vec![Pos2::new(10.0, 10.0)], on_dark: true }));
+        assert_eq!(img.pixels[10 * 20 + 10], Color32::from_rgb(128, 110, 0));
+    }
+
     #[test]
     fn highlighter_on_see_through_pixels_shows_its_own_colour() {
         let ink = Color32::from_rgb(255, 220, 0);
         let mut img = ColorImage::new([20, 20], vec![Color32::TRANSPARENT; 400]);
-        burn(&mut img, &Mark::Stroke(Stroke { ink: Ink::Highlighter, color: ink, width: 8.0, points: vec![Pos2::new(10.0, 10.0)] }));
+        burn(&mut img, &Mark::Stroke(Stroke { on_dark: false, ink: Ink::Highlighter, color: ink, width: 8.0, points: vec![Pos2::new(10.0, 10.0)] }));
         assert_eq!(img.pixels[10 * 20 + 10], ink);
     }
 
     #[test]
     fn live_tiles_built_point_by_point_match_the_saved_snip() {
-        for ink in [Ink::Pen, Ink::Highlighter] {
-            let full = Stroke { ink, ..zigzag() };
+        for (ink, on_dark) in [(Ink::Pen, false), (Ink::Highlighter, false), (Ink::Highlighter, true)] {
+            let full = Stroke { ink, on_dark, ..zigzag() };
             let pristine = gradient(70, 50);
             let mut shown = pristine.clone();
             let mut done = 0;
@@ -1202,7 +1706,7 @@ mod tests {
             }
             let mut d = Doc::new(pristine);
             d.add_mark(full);
-            assert!(shown.pixels == d.flatten().pixels, "{ink:?}: screen and saved snip differ");
+            assert!(shown.pixels == d.flatten().pixels, "{ink:?} (on dark: {on_dark}): screen and saved snip differ");
         }
     }
 
@@ -1210,8 +1714,8 @@ mod tests {
     fn footprint_never_misses_a_pixel() {
         let marks = [
             Mark::Stroke(zigzag()),
-            Mark::Stroke(Stroke { ink: Ink::Pen, color: Color32::RED, width: 30.0, points: vec![Pos2::new(66.0, 2.0)] }),
-            Mark::Stroke(Stroke { ink: Ink::Pen, color: Color32::BLUE, width: 3.0, points: vec![Pos2::new(-5.0, 48.0), Pos2::new(75.0, 1.0)] }),
+            Mark::Stroke(Stroke { on_dark: false, ink: Ink::Pen, color: Color32::RED, width: 30.0, points: vec![Pos2::new(66.0, 2.0)] }),
+            Mark::Stroke(Stroke { on_dark: false, ink: Ink::Pen, color: Color32::BLUE, width: 3.0, points: vec![Pos2::new(-5.0, 48.0), Pos2::new(75.0, 1.0)] }),
             shape(ShapeKind::Arrow, 3.0, (5.0, 45.0), (63.5, 4.2)),
             shape(ShapeKind::Arrow, 12.0, (60.0, 10.0), (10.0, 40.0)),
             shape(ShapeKind::Line, 7.0, (-20.0, 20.0), (90.0, 33.0)),
@@ -1305,15 +1809,16 @@ mod tests {
         // Overlapping marks of every kind, so a redrawn tile must re-burn its neighbours in order.
         d.add_mark(Stroke { ink: Ink::Highlighter, ..zigzag() });
         d.add_mark(shape(ShapeKind::Rectangle, 6.0, (10.0, 10.0), (100.0, 70.0)));
-        d.add_mark(Stroke { ink: Ink::Pen, color: Color32::BLUE, width: 5.0, points: vec![Pos2::new(0.0, 80.0), Pos2::new(119.0, 5.0)] });
+        d.add_mark(Stroke { on_dark: false, ink: Ink::Pen, color: Color32::BLUE, width: 5.0, points: vec![Pos2::new(0.0, 80.0), Pos2::new(119.0, 5.0)] });
         d.add_mark(shape(ShapeKind::Ellipse, 3.0, (30.0, 20.0), (110.0, 85.0)));
-        d.add_mark(Stroke { ink: Ink::Highlighter, color: Color32::from_rgb(92, 214, 255), width: 14.0, points: vec![Pos2::new(5.0, 40.0), Pos2::new(115.0, 45.0)] });
+        d.add_mark(Stroke { on_dark: false, ink: Ink::Highlighter, color: Color32::from_rgb(92, 214, 255), width: 14.0, points: vec![Pos2::new(5.0, 40.0), Pos2::new(115.0, 45.0)] });
         d.add_mark(Text { text: "Ok".into(), color: Color32::BLACK, size: 40.0, outline: true, pos: Pos2::new(40.0, 30.0) });
 
         let mut shown = d.flatten();
         let mut burned = d.marks.clone();
-        let mut check = |d: &Doc, what: &str| {
-            for (r, patch) in d.render_runs(&d.changed_tiles(&burned)) {
+        let mut check = |d: &mut Doc, what: &str| {
+            let tiles = d.changed_tiles(&burned);
+            for (r, patch) in d.render_runs(&tiles) {
                 paste(&mut shown, &patch, r.pos());
             }
             burned = d.marks.clone();
@@ -1321,19 +1826,19 @@ mod tests {
         };
         d.checkpoint();
         assert!(d.erase_at(Pos2::new(100.0, 40.0), 2.0));
-        check(&d, "erasing the rectangle");
+        check(&mut d, "erasing the rectangle");
         d.checkpoint();
         assert!(d.erase_at(Pos2::new(60.0, 43.0), 1.0));
-        check(&d, "erasing through a pile of marks");
+        check(&mut d, "erasing through a pile of marks");
         d.undo();
-        check(&d, "undo");
+        check(&mut d, "undo");
         d.undo();
-        check(&d, "a second undo");
+        check(&mut d, "a second undo");
         d.redo();
-        check(&d, "redo");
+        check(&mut d, "redo");
         d.undo();
         d.undo();
-        check(&d, "undoing an add");
+        check(&mut d, "undoing an add");
         assert_eq!(d.changed_tiles(&d.marks.clone()), Tiles::new(d.size()), "nothing changed, nothing to redraw");
     }
 
@@ -1433,6 +1938,7 @@ mod tests {
         let mut d = Doc::new(white(50, 50));
         for y in [10.0, 40.0] {
             d.marks.push(Arc::new(Mark::Stroke(Stroke {
+                on_dark: false,
                 ink: Ink::Highlighter,
                 color: Color32::YELLOW,
                 width: 4.0,
@@ -1458,5 +1964,108 @@ mod tests {
     fn freeform_rejects_a_straight_line() {
         let line: Vec<Pos2> = (0..20).map(|i| Pos2::new(i as f32 * 2.0, i as f32)).collect();
         assert!(cut_freeform(&white(40, 40), &line).is_none());
+    }
+
+    fn tiles_of(size: [usize; 2], r: Rect) -> Tiles {
+        let mut t = Tiles::new(size);
+        t.add(r);
+        t
+    }
+
+    /// Paints `t` over `base` in patches of `w` x `h` pixels, last patch first when `reverse`.
+    fn paint_in_patches(t: &Text, base: &ColorImage, w: usize, h: usize, reverse: bool) -> ColorImage {
+        let mut out = base.clone();
+        let mut raster = TextRaster::new(t, base.size);
+        let mut spots: Vec<[usize; 2]> = (0..base.size[1]).step_by(h).flat_map(|y| (0..base.size[0]).step_by(w).map(move |x| [x, y])).collect();
+        if reverse {
+            spots.reverse();
+        }
+        for [x, y] in spots {
+            let mut patch = sub_image(base, x, y, w.min(base.size[0] - x), h.min(base.size[1] - y));
+            raster.paint(&mut patch, [x, y]);
+            paste(&mut out, &patch, [x, y]);
+        }
+        out
+    }
+
+    #[test]
+    fn text_coverage_is_the_same_whatever_patch_it_is_rendered_in() {
+        let t = Text { text: "Wavy gj\n0@%".into(), color: Color32::from_rgb(0x00, 0x78, 0xd4), size: 47.3, outline: true, pos: Pos2::new(3.7, -9.2) };
+        let base = gradient(200, 130);
+        let whole = paint_in_patches(&t, &base, 200, 130, false);
+        assert!(whole.pixels != base.pixels, "the text shows");
+        for (w, h, reverse) in [(32, 32, false), (7, 13, true), (64, 5, false), (1, 130, true)] {
+            assert!(paint_in_patches(&t, &base, w, h, reverse).pixels == whole.pixels, "{w}x{h} patches differ from one whole render");
+        }
+    }
+
+    #[test]
+    fn retyped_text_redraws_only_its_changed_tiles_and_matches_a_fresh_render() {
+        let base = gradient(260, 160);
+        let at = |s: &str, color| Text { text: s.into(), color, size: 38.0, outline: true, pos: Pos2::new(6.0, 4.0) };
+        let mut shown = base.clone();
+        let mut live = TextRaster::new(&at("", Color32::RED), base.size);
+        for (s, color) in [("H", Color32::RED), ("Hello", Color32::RED), ("Hello\nwo", Color32::RED), ("Hello\nw", Color32::RED), ("Hello\nw", Color32::BLUE), ("Hel", Color32::BLUE)] {
+            let new = at(s, color);
+            let mut dirty = Tiles::new(base.size);
+            live.retext(&new, &mut dirty);
+            for r in dirty.runs() {
+                let mut patch = sub_image(&base, r.x0, r.y0, r.x1 - r.x0, r.y1 - r.y0);
+                live.paint(&mut patch, r.pos());
+                paste(&mut shown, &patch, r.pos());
+            }
+            let mut want = base.clone();
+            burn(&mut want, &Mark::Text(new));
+            assert!(shown.pixels == want.pixels, "after typing to {s:?}");
+        }
+        // Typing one letter at the end redoes the tiles that letter reaches, not the whole text.
+        let mut dirty = Tiles::new(base.size);
+        live.retext(&at("Hell", Color32::BLUE), &mut dirty);
+        let all = tiles_of(base.size, live.bounds());
+        assert!(dirty.indices().count() < all.indices().count() / 2, "{} of {} tiles", dirty.indices().count(), all.indices().count());
+    }
+
+    #[test]
+    fn characters_the_font_lacks_are_skipped_not_boxed() {
+        let with = Text { text: "a\u{1F600}b\u{4E2D}".into(), color: Color32::BLACK, size: 30.0, outline: false, pos: Pos2::new(5.0, 5.0) };
+        let without = Text { text: "ab".into(), ..with.clone() };
+        assert_eq!(with.caret(), without.caret(), "a missing glyph takes no room");
+        let (mut a, mut b) = (white(120, 50), white(120, 50));
+        burn(&mut a, &Mark::Text(with));
+        burn(&mut b, &Mark::Text(without));
+        assert!(a.pixels == b.pixels, "and draws nothing");
+    }
+
+    #[test]
+    fn the_eraser_finds_text_by_its_letters_not_its_box() {
+        let mut d = Doc::new(white(400, 120));
+        d.add_mark(Text { text: "l          l".into(), color: Color32::BLACK, size: 60.0, outline: false, pos: Pos2::new(10.0, 10.0) });
+        let b = d.marks[0].bounds();
+        assert!(!d.hits(Pos2::new(b.center().x, b.center().y), 2.0), "the gap between the letters is not text");
+        assert!(d.hits(Pos2::new(b.min.x + 4.0, b.center().y), 2.0), "a letter is");
+        // Once rendered, hit tests use the cached letters.
+        d.render_runs(&tiles_of(d.size(), b));
+        assert!(!d.hits(Pos2::new(b.center().x, b.center().y), 2.0));
+        assert!(d.erase_at(Pos2::new(b.max.x - 4.0, b.center().y), 2.0));
+    }
+
+    #[test]
+    fn an_erase_beside_text_renders_none_of_the_text() {
+        let mut d = Doc::new(white(600, 300));
+        d.add_mark(text("Far away", Color32::RED, true));
+        let dot = shape(ShapeKind::Line, 4.0, (560.0, 280.0), (570.0, 280.0));
+        d.add_mark(dot);
+        let before = d.marks.clone();
+        d.checkpoint();
+        assert!(d.erase_at(Pos2::new(565.0, 280.0), 3.0));
+        let tiles = d.changed_tiles(&before);
+        let runs = d.render_runs(&tiles);
+        assert!(!runs.is_empty());
+        let rendered: usize = d.texts.values().map(|(_, r)| r.tiles.len()).sum();
+        assert_eq!(rendered, 0, "no tile of the far text was rendered");
+        d.undo();
+        let tiles = d.changed_tiles(&d.marks[..1]);
+        d.render_runs(&tiles);
+        assert_eq!(d.texts.values().map(|(_, r)| r.tiles.len()).sum::<usize>(), 0, "nor on undo");
     }
 }

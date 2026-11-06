@@ -5,8 +5,10 @@
 //! editors, and idle editors cost nothing. The shell owns the `Editors` list; an editor reports
 //! back through two flags (`new_requested`, `closed`) that the shell collects in `Editors::poll`.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use eframe::egui::{
@@ -16,7 +18,7 @@ use eframe::egui::{
 use windows_sys::Win32::Foundation::HWND;
 
 use crate::icons::{self, Icon};
-use crate::markup::{self, Doc, Ink, Mark, Shape, ShapeKind, Stroke, Text, Tiles};
+use crate::markup::{self, Doc, Ink, Mark, PxRect, Shape, ShapeKind, Stroke, Text, TextRaster, Tiles};
 use crate::widgets::{
     self, dim_outside, divider, escape_for_app, icon_button, Note, Notifier, PopupClickGuard, ACCENT, BTN, BUTTON_HOVER, DIVIDER_W, GAP, GROUP_GAP, ICON,
     ICON_OFF, MIN_WINDOW_H, MIN_WINDOW_W, TOOLBAR_BG,
@@ -240,6 +242,8 @@ pub struct Snip {
     zoom: Option<f32>,
     /// Zoom factor requested from the keyboard this frame; `canvas` applies it.
     key_zoom: f32,
+    /// The rest of the text being typed, while `drawing` is text.
+    draft: Draft,
 }
 
 pub enum Content {
@@ -268,17 +272,30 @@ pub struct Editor {
     note: Option<Note>,
     note_tx: Sender<String>,
     note_rx: Receiver<String>,
-    /// The New button's tooltip, kept current by the shell (it knows the capture mode and hotkey).
+    /// The New button's tooltip, copied each frame from `shared_tip`, which the shell keeps current (it
+    /// knows the capture mode and hotkey).
     new_tip: String,
+    shared_tip: Arc<Mutex<String>>,
     /// New button or Ctrl+N pressed; the shell starts the capture.
     new_requested: bool,
     /// The window's close button was pressed; the shell drops this editor.
     closed: bool,
+    /// A Save is under way (its dialog is open or its file is being written).
+    saving: Arc<AtomicBool>,
+}
+
+/// Clears its flag when dropped, however the worker holding it ends.
+struct Busy(Arc<AtomicBool>);
+
+impl Drop for Busy {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 impl Snip {
     pub fn new(image: ColorImage, tools: Tools) -> Self {
-        Self { doc: Doc::new(image), tools, texture: None, drawing: None, erase_marked: false, crop: None, crop_drag: None, zoom: None, key_zoom: 1.0 }
+        Self { doc: Doc::new(image), tools, texture: None, drawing: None, erase_marked: false, crop: None, crop_drag: None, zoom: None, key_zoom: 1.0, draft: Draft::default() }
     }
 
     /// The picture with its ink, as it would be copied or saved. The canvas texture already holds
@@ -326,7 +343,17 @@ impl Snip {
         self.crop_drag = None;
     }
 
+    /// Undoes or redoes a step: of the text being typed while there is some (undoing past its start
+    /// drops it; redo never does), of the snip otherwise.
     fn step(&mut self, redo: bool) {
+        if let Some(Mark::Text(t)) = self.drawing.as_mut() {
+            if redo {
+                self.draft.redo(&mut t.text);
+            } else if !self.draft.undo(&mut t.text) {
+                self.drawing = None;
+            }
+            return;
+        }
         step_history(&mut self.doc, &mut self.crop, &mut self.drawing, redo);
         self.crop_drag = None;
     }
@@ -354,7 +381,8 @@ impl Snip {
             };
             let resp = icon_button(ui, icon, ink, self.tools.tool == tool, true, tip);
             let again = resp.clicked() && self.tools.tool == tool;
-            if resp.clicked() {
+            // A click on the tool already chosen opens its options and leaves the text being typed alone.
+            if resp.clicked() && !again {
                 self.tools.tool = tool;
                 self.cancel_crop();
                 self.finish_text();
@@ -430,7 +458,7 @@ impl Snip {
 
     fn canvas(&mut self, ui: &mut egui::Ui, guard: &PopupClickGuard) {
         let ctx = ui.ctx().clone();
-        let Snip { doc, tools, texture, drawing, erase_marked, crop, crop_drag, zoom: zoom_choice, key_zoom } = self;
+        let Snip { doc, tools, texture, drawing, erase_marked, crop, crop_drag, zoom: zoom_choice, key_zoom, draft } = self;
         let canvas = texture.get_or_insert_with(|| CanvasTex::new(&ctx, doc));
         canvas.sync(doc);
 
@@ -467,7 +495,7 @@ impl Snip {
 
             let painter = ui.painter();
             // Committed ink is already burned into the texture, exactly as it will be saved.
-            painter.image(canvas.tex.id(), img_rect, Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)), Color32::WHITE);
+            canvas.tex.paint(painter, img_rect, doc.size());
 
             let pointer = resp.interact_pointer_pos().or(resp.hover_pos());
             // Drags are noticed a few pixels after the button goes down; start where it went down.
@@ -489,8 +517,7 @@ impl Snip {
                     if resp.drag_stopped() {
                         *crop_drag = None;
                     }
-                    let held = crop_drag.map(|(g, _, _)| g).or_else(
-|| resp.hover_pos().and_then(|p| grip_at(frame_pt, p, GRIP_REACH)));
+                    let held = crop_drag.map(|(g, _, _)| g).or_else(|| resp.hover_pos().and_then(|p| grip_at(frame_pt, p, GRIP_REACH)));
                     if let Some(g) = held {
                         ctx.set_cursor_icon(g.cursor());
                     }
@@ -506,7 +533,9 @@ impl Snip {
                     let width_px = width * k;
                     if resp.drag_started() || resp.clicked() {
                         if let Some(p) = origin {
-                            *drawing = Some(Mark::Stroke(Stroke { ink, color, width: width_px, points: vec![to_px(p)] }));
+                            // The highlighter picks how it blends from what it starts on, as shown, and keeps it for the stroke.
+                            let on_dark = ink == Ink::Highlighter && markup::is_dark_under(&canvas.shown, to_px(p), width_px / 2.0);
+                            *drawing = Some(Mark::Stroke(Stroke { ink, color, width: width_px, points: vec![to_px(p)], on_dark }));
                         }
                     }
                     if let (Some(Mark::Stroke(s)), Some(p)) = (drawing.as_mut(), pointer) {
@@ -558,22 +587,39 @@ impl Snip {
                             let mut t = Text { text: String::new(), color: tools.text.0, size: tools.text.1 * k, outline: tools.text_outline, pos: to_px(p) };
                             t.pos.y -= t.line_height() / 2.0;
                             *drawing = Some(Mark::Text(t));
+                            *draft = Draft::new(tools.text.1);
                         }
                     }
                     if let Some(Mark::Text(t)) = drawing.as_mut() {
-                        // Colour, size and outline follow the options while typing; size is in screen points like the pen's.
-                        (t.color, t.size, t.outline) = (tools.text.0, tools.text.1 * k, tools.text_outline);
-                        if type_into(&ctx, &mut t.text) {
+                        // Colour and outline follow the options while typing. The size, chosen in screen points like the
+                        // pen's, is turned into pixels at the click and again only when the option changes, so zooming
+                        // or resizing the window leaves the text as it is.
+                        (t.color, t.outline) = (tools.text.0, tools.text_outline);
+                        if tools.text.1 != draft.size_pt {
+                            (t.size, draft.size_pt) = (tools.text.1 * k, tools.text.1);
+                        }
+                        if type_into(&ctx, &mut t.text, draft) {
                             if let Some(m) = placeable(drawing.take()) {
                                 canvas.commit(doc, m);
                             }
                         }
                     }
                     if let Some(Mark::Text(t)) = drawing.as_ref() {
-                        let top = to_pt(t.caret());
-                        let caret = [top, top + vec2(0.0, t.line_height() / k)];
+                        let line = t.line_height() / k;
+                        let typed = to_pt(t.caret());
+                        // An input method's composition shows after the text, underlined, until it is committed.
+                        let end = if draft.preedit.is_empty() { typed } else { to_pt(with_preedit(t, &draft.preedit).caret()) };
+                        if end != typed {
+                            let under = vec2(0.0, line * 0.92);
+                            painter.line_segment([typed + under, end + under], (1.5, t.color));
+                        }
+                        let caret = [end, end + vec2(0.0, line)];
                         painter.line_segment(caret, (3.0, t.halo_color()));
                         painter.line_segment(caret, (1.5, t.color));
+                        // Turns the window's input method on and tells it where the text is.
+                        let rect = Rect::from_min_max(to_pt(t.pos), end + vec2(1.0, line));
+                        let cursor_rect = Rect::from_min_size(end, vec2(1.0, line));
+                        ctx.output_mut(|o| o.ime = Some(egui::output::IMEOutput { purpose: egui::IMEPurpose::Normal, rect, cursor_rect, should_interrupt_composition: false }));
                     }
                 }
                 Tool::Eraser => {
@@ -601,7 +647,11 @@ impl Snip {
             }
             // An erase above changed the doc after the first sync: show it in this same frame.
             canvas.sync(doc);
+            if drawing.is_some() {
+                canvas.own_picture();
+            }
             match drawing {
+                Some(Mark::Text(t)) if !draft.preedit.is_empty() => canvas.show_live(&Mark::Text(with_preedit(t, &draft.preedit))),
                 Some(m) => canvas.show_live(m),
                 None => canvas.clear_live(),
             }
@@ -611,7 +661,7 @@ impl Snip {
 }
 
 impl Editor {
-    fn new(content: Content, title: String, viewport: ViewportId, root_hwnd: isize, place: Option<[i32; 2]>, new_tip: String, min_width: f32) -> Self {
+    fn new(content: Content, title: String, viewport: ViewportId, root_hwnd: isize, place: Option<[i32; 2]>, shared_tip: Arc<Mutex<String>>, min_width: f32) -> Self {
         let (note_tx, note_rx) = channel();
         Self {
             content,
@@ -628,9 +678,11 @@ impl Editor {
             note: None,
             note_tx,
             note_rx,
-            new_tip,
+            new_tip: String::new(),
+            shared_tip,
             new_requested: false,
             closed: false,
+            saving: Arc::default(),
         }
     }
 
@@ -660,6 +712,12 @@ impl Editor {
         }
         while let Ok(msg) = self.note_rx.try_recv() {
             self.say(msg);
+        }
+        // The shell holds this lock only to replace the string, so a busy one just waits for the next frame.
+        if let Ok(tip) = self.shared_tip.try_lock() {
+            if *tip != self.new_tip {
+                self.new_tip.clone_from(&tip);
+            }
         }
         self.attach_title_bar(&ctx);
         self.settle_window(&ctx);
@@ -736,16 +794,16 @@ impl Editor {
             self.copy(ctx);
         }
         let Content::Snip(snip) = &mut self.content else { return };
-        if undo || esc {
-            if snip.typing() {
-                // The first Ctrl+Z or Esc throws away the text being typed, and nothing else.
-                snip.drawing = None;
-            } else if undo {
+        if esc && snip.typing() {
+            // Esc throws away the text being typed, and nothing else.
+            snip.drawing = None;
+        } else {
+            if undo {
                 snip.step(false);
             }
-        }
-        if redo {
-            snip.step(true);
+            if redo {
+                snip.step(true);
+            }
         }
         if enter {
             snip.apply_crop();
@@ -856,34 +914,44 @@ impl Editor {
         });
     }
 
-    /// Asks where to save, then writes the file on a worker thread: a big PNG takes a moment to
-    /// encode, and a long recording a moment to copy.
+    /// Asks where to save, then writes the file, all on a worker thread: the dialog is modal to this
+    /// window alone, so the other windows (the recording bar among them) keep running, and a big PNG
+    /// takes a moment to encode, a long recording a moment to copy. A second Save while one is under
+    /// way is ignored.
     fn save_as(&mut self, ctx: &egui::Context) {
+        if self.saving.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let busy = Busy(self.saving.clone());
         if let Content::Snip(snip) = &mut self.content {
             snip.finish_text();
         }
-        let owner = self.owner();
-
-        let report = self.notifier(ctx);
-        match &self.content {
+        // Window handles are plain numbers to Windows; this one is only used to own the dialog.
+        let (owner, report) = (self.owner() as isize, self.notifier(ctx));
+        let job: Box<dyn FnOnce() + Send> = match &self.content {
             Content::Snip(snip) => {
-                let start = win::pictures_dir().map(|d| d.join("Screenshots"));
-                let Some(path) = win::ask_save_path(owner, start.as_deref(), &format!("Snip {}", win::timestamp()), ("PNG image", "png")) else {
-                    return;
-                };
-                let image = snip.flattened();
-                std::thread::spawn(move || report.send(saved_note(&path, win::save_png(&path, &image))));
+                let (start, name, image) = (win::pictures_dir().map(|d| d.join("Screenshots")), format!("Snip {}", win::timestamp()), snip.flattened());
+                Box::new(move || {
+                    let _busy = busy;
+                    let Some(path) = win::ask_save_path(owner as HWND, start.as_deref(), &name, ("PNG image", "png")) else { return };
+                    let png = win::encode_png(&image);
+                    // Let go of the picture once it is encoded, so the editor's next mark needn't copy it.
+                    drop(image);
+                    report.send(saved_note(&path, png.and_then(|bytes| std::fs::write(&path, bytes).map_err(|e| format!("{}: {e}", path.display())))));
+                })
             }
             Content::Video(v) => {
                 let start = win::videos_dir().map(|d| d.join("Screen Recordings"));
                 let name = v.path.file_stem().map_or_else(|| "Screen Recording".into(), |n| n.to_string_lossy().into_owned());
-                let Some(path) = win::ask_save_path(owner, start.as_deref(), &name, ("MP4 video", "mp4")) else {
-                    return;
-                };
                 let from = v.path.clone();
-                std::thread::spawn(move || report.send(saved_note(&path, std::fs::copy(&from, &path).map(|_| ()).map_err(|e| e.to_string()))));
+                Box::new(move || {
+                    let _busy = busy;
+                    let Some(path) = win::ask_save_path(owner as HWND, start.as_deref(), &name, ("MP4 video", "mp4")) else { return };
+                    report.send(saved_note(&path, std::fs::copy(&from, &path).map(|_| ()).map_err(|e| e.to_string())));
+                })
             }
-        }
+        };
+        std::thread::spawn(job);
     }
 
     fn video_view(&mut self, ui: &mut egui::Ui) {
@@ -951,6 +1019,8 @@ struct Slot {
     title: String,
     builder: ViewportBuilder,
     editor: Arc<Mutex<Editor>>,
+    /// The editor's toast channel, so the shell can reach it without taking the editor's lock.
+    note_tx: Sender<String>,
 }
 
 /// All open editor windows, oldest first.
@@ -958,7 +1028,8 @@ pub struct Editors {
     slots: Vec<Slot>,
     next: u64,
     icon: Option<Arc<egui::IconData>>,
-    new_tip: String,
+    /// The New buttons' tooltip, shared with every editor.
+    new_tip: Arc<Mutex<String>>,
 }
 
 /// What the editor windows asked of the shell since the last `Editors::poll`.
@@ -970,7 +1041,7 @@ pub struct Requests {
 
 impl Editors {
     pub fn new(icon: Option<Arc<egui::IconData>>) -> Self {
-        Self { slots: Vec::new(), next: 0, icon, new_tip: String::new() }
+        Self { slots: Vec::new(), next: 0, icon, new_tip: Arc::default() }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -982,10 +1053,12 @@ impl Editors {
         self.slots.iter().map(|s| s.id).collect()
     }
 
-    /// Runs `f` on the editor in window `id`, if it is still open.
+    /// Runs `f` on the editor in window `id`, if it is still open and not in the middle of a frame.
+    /// The root never waits on an editor: windows run on this same thread, so a busy lock means a
+    /// re-entry that waiting would deadlock.
     pub fn with<R>(&self, id: ViewportId, f: impl FnOnce(&mut Editor) -> R) -> Option<R> {
         let slot = self.slots.iter().find(|s| s.id == id)?;
-        let mut ed = slot.editor.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut ed = slot.editor.try_lock().ok()?;
         Some(f(&mut ed))
     }
 
@@ -1033,7 +1106,8 @@ impl Editors {
         });
         let editor = Editor::new(content, title.clone(), id, root_hwnd, corner, self.new_tip.clone(), min_w);
         let report = editor.notifier(ctx);
-        self.slots.push(Slot { id, title, builder, editor: Arc::new(Mutex::new(editor)) });
+        let note_tx = editor.note_tx.clone();
+        self.slots.push(Slot { id, title, builder, editor: Arc::new(Mutex::new(editor)), note_tx });
         ctx.request_repaint_of(id);
         (id, report)
     }
@@ -1065,22 +1139,19 @@ impl Editors {
         req
     }
 
-    /// Keeps every New button's tooltip in step with the shell's capture mode and hotkey.
+    /// Keeps every New button's tooltip in step with the shell's capture mode and hotkey. Each editor
+    /// picks the new text up on its next frame.
     pub fn set_new_tip(&mut self, tip: String) {
-        if tip == self.new_tip {
-            return;
+        let mut shared = self.new_tip.lock().unwrap_or_else(PoisonError::into_inner);
+        if *shared != tip {
+            *shared = tip;
         }
-        for slot in &self.slots {
-            slot.editor.lock().unwrap_or_else(PoisonError::into_inner).new_tip = tip.clone();
-        }
-        self.new_tip = tip;
     }
 
     /// The toast of the newest editor window; `None` when none is open.
     pub fn newest_notifier(&self, ctx: &egui::Context) -> Option<Notifier> {
         let slot = self.slots.last()?;
-        let ed = slot.editor.lock().unwrap_or_else(PoisonError::into_inner);
-        Some(ed.notifier(ctx))
+        Some(Notifier::new(slot.note_tx.clone(), ctx.clone(), slot.id))
     }
 }
 
@@ -1104,11 +1175,79 @@ fn unique_title<'a>(want: &str, taken: impl Iterator<Item = &'a str> + Clone) ->
     (2..).map(|n| format!("{want} ({n})")).find(|t| free(t)).unwrap_or_else(|| want.to_string())
 }
 
+/// The canvas texture, cut into pieces no wider or taller than the GPU takes (`max_texture_side`, as
+/// low as 8192 on some integrated GPUs; three 4K monitors side by side are 11520 wide). A picture
+/// that fits is one piece sharing `shown`'s pixels.
+// ceiling: neighbouring pieces are filtered separately, so a faint seam can show where they meet when
+// the snip is scaled; overlap the pieces by a pixel if anyone ever sees it.
+struct Chunks {
+    ctx: egui::Context,
+    /// Each piece and the image pixels it shows.
+    parts: Vec<(PxRect, TextureHandle)>,
+}
+
+impl Chunks {
+    fn new(ctx: &egui::Context, img: &Arc<ColorImage>) -> Self {
+        let mut chunks = Self { ctx: ctx.clone(), parts: Vec::new() };
+        chunks.set(img);
+        chunks
+    }
+
+    /// The pieces' rectangles for a picture of `size`: tile-aligned, so a tile run splits cleanly.
+    fn layout(&self, size: [usize; 2]) -> Vec<PxRect> {
+        let side = (self.ctx.input(|i| i.max_texture_side) / markup::TILE).max(1) * markup::TILE;
+        let mut out = Vec::new();
+        for y0 in (0..size[1].max(1)).step_by(side) {
+            for x0 in (0..size[0].max(1)).step_by(side) {
+                out.push(PxRect { x0, y0, x1: (x0 + side).min(size[0]), y1: (y0 + side).min(size[1]) });
+            }
+        }
+        out
+    }
+
+    /// Replaces the whole picture.
+    fn set(&mut self, img: &Arc<ColorImage>) {
+        let layout = self.layout(img.size);
+        let piece = |r: &PxRect| if layout.len() == 1 { egui::ImageData::Color(img.clone()) } else { markup::sub_image(img, r.x0, r.y0, r.x1 - r.x0, r.y1 - r.y0).into() };
+        if layout.len() == self.parts.len() && layout.iter().zip(&self.parts).all(|(a, (b, _))| a == b) {
+            for (r, tex) in &mut self.parts {
+                tex.set(piece(r), TextureOptions::LINEAR);
+            }
+        } else {
+            self.parts = layout.iter().map(|r| (*r, self.ctx.load_texture("snip", piece(r), TextureOptions::LINEAR))).collect();
+        }
+    }
+
+    /// Replaces the pixels from `at` on with `patch`, in whichever pieces they fall.
+    fn set_partial(&mut self, at: [usize; 2], patch: ColorImage) {
+        let r = PxRect { x0: at[0], y0: at[1], x1: at[0] + patch.size[0], y1: at[1] + patch.size[1] };
+        if let [(_, tex)] = self.parts.as_mut_slice() {
+            tex.set_partial(at, patch, TextureOptions::LINEAR);
+            return;
+        }
+        for (c, tex) in &mut self.parts {
+            let (x0, y0, x1, y1) = (r.x0.max(c.x0), r.y0.max(c.y0), r.x1.min(c.x1), r.y1.min(c.y1));
+            if x0 < x1 && y0 < y1 {
+                let piece = markup::sub_image(&patch, x0 - r.x0, y0 - r.y0, x1 - x0, y1 - y0);
+                tex.set_partial([x0 - c.x0, y0 - c.y0], piece, TextureOptions::LINEAR);
+            }
+        }
+    }
+
+    /// Draws the picture, `size` pixels, into `rect` (points).
+    fn paint(&self, painter: &egui::Painter, rect: Rect, size: [usize; 2]) {
+        let at = |x: usize, y: usize| rect.min + vec2(x as f32 / size[0] as f32 * rect.width(), y as f32 / size[1] as f32 * rect.height());
+        for (c, tex) in &self.parts {
+            painter.image(tex.id(), Rect::from_min_max(at(c.x0, c.y0), at(c.x1, c.y1)), Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)), Color32::WHITE);
+        }
+    }
+}
+
 /// The snip as shown: the picture with committed marks burned in by the same rasteriser that saves
 /// it. A mark still being drawn is painted over `shown` on the CPU, tile run by tile run, straight
 /// into the texture, so the preview is pixel for pixel what the mark will burn (multiply included).
 struct CanvasTex {
-    tex: TextureHandle,
+    tex: Chunks,
     /// The picture and its committed marks: exactly what copy and save write.
     shown: Arc<ColorImage>,
     /// `(image_rev, ink_rev)` of the doc that `shown` was built from.
@@ -1116,6 +1255,8 @@ struct CanvasTex {
     /// The marks burned into `shown`, to tell which ones an erase or undo took away or brought back.
     burned: Vec<Arc<Mark>>,
     live: Live,
+    /// A private copy of `shown` being made on a worker while a mark is drawn, and the picture it copies.
+    copying: Option<(Arc<ColorImage>, Receiver<ColorImage>)>,
 }
 
 /// The texture tiles that show a mark still being drawn instead of `shown`.
@@ -1123,13 +1264,18 @@ struct Live {
     tiles: Tiles,
     /// Points of the stroke already painted into `tiles`.
     done: usize,
-    /// Any other mark, as last painted.
+    /// A shape, as last painted.
     last: Option<Mark>,
+    /// Text being typed, as last painted, with the tiles of it rendered so far.
+    text: Option<TextRaster>,
+    /// The pixels the texture shows in each live tile (by tile index), so a commit burns them into
+    /// `shown` as they are instead of painting the mark again.
+    patches: HashMap<usize, Vec<Color32>>,
 }
 
 impl Live {
     fn new(size: [usize; 2]) -> Self {
-        Self { tiles: Tiles::new(size), done: 0, last: None }
+        Self { tiles: Tiles::new(size), done: 0, last: None, text: None, patches: HashMap::new() }
     }
 }
 
@@ -1137,15 +1283,49 @@ impl CanvasTex {
     /// The canvas for `doc`, flattened in full.
     fn new(ctx: &egui::Context, doc: &Doc) -> Self {
         let shown = if doc.marks.is_empty() { doc.image.clone() } else { Arc::new(doc.flatten()) };
-        let tex = ctx.load_texture("snip", shown.clone(), TextureOptions::LINEAR);
+        let tex = Chunks::new(ctx, &shown);
         let live = Live::new(shown.size);
-        Self { tex, shown, rev: (doc.image_rev, doc.ink_rev), burned: doc.marks.clone(), live }
+        Self { tex, shown, rev: (doc.image_rev, doc.ink_rev), burned: doc.marks.clone(), live, copying: None }
+    }
+
+    /// Makes sure `shown` will be this canvas's own when the mark being drawn is burned into it. Until
+    /// the first mark it is the doc's bare picture (which undo needs untouched), and a copy or save
+    /// worker may still hold it; copying 33 MB of 4K picture then would stall the mouse-up, so the copy
+    /// is made on a worker while the mark is drawn and adopted once it is ready.
+    fn own_picture(&mut self) {
+        if self.copying.is_some() {
+            self.adopt_copy();
+        } else if Arc::strong_count(&self.shown) > 1 {
+            let (tx, rx) = channel();
+            let from = self.shown.clone();
+            let source = from.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send((*source).clone());
+            });
+            self.copying = Some((from, rx));
+        }
+    }
+
+    /// Takes the copy `own_picture` started, if it is ready and still of the picture shown.
+    fn adopt_copy(&mut self) {
+        if let Some((from, rx)) = &self.copying {
+            match rx.try_recv() {
+                Ok(copy) => {
+                    if Arc::ptr_eq(from, &self.shown) {
+                        self.shown = Arc::new(copy);
+                    }
+                    self.copying = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => self.copying = None,
+            }
+        }
     }
 
     /// Brings the picture and texture up to date with `doc`. When only marks changed (an erase, an
     /// undo of a mark) just the tiles those marks cover are redrawn and uploaded; a new picture
     /// (crop, or undoing one) is flattened and uploaded whole.
-    fn sync(&mut self, doc: &Doc) {
+    fn sync(&mut self, doc: &mut Doc) {
         let rev = (doc.image_rev, doc.ink_rev);
         if self.rev == rev {
             return;
@@ -1156,50 +1336,98 @@ impl CanvasTex {
             let shown = Arc::make_mut(&mut self.shown);
             for (r, patch) in doc.render_runs(&tiles) {
                 markup::paste(shown, &patch, r.pos());
-                self.tex.set_partial(r.pos(), patch, TextureOptions::LINEAR);
+                self.tex.set_partial(r.pos(), patch);
             }
         } else {
             self.shown = if doc.marks.is_empty() { doc.image.clone() } else { Arc::new(doc.flatten()) };
-            self.tex.set(self.shown.clone(), TextureOptions::LINEAR);
+            self.tex.set(&self.shown);
         }
         self.rev = rev;
         self.burned = doc.marks.clone();
         self.live = Live::new(self.shown.size);
     }
 
-    /// Uploads the runs of `tiles` with `m` painted over the committed picture, or plain when `m` is `None`.
-    fn upload(&mut self, tiles: &Tiles, m: Option<&Mark>) {
-        let raster = m.map(|m| m.raster(self.shown.size));
+    /// Uploads the runs of `tiles` with `raster` painted over the committed picture, or plain when
+    /// it is `None`, and remembers what each live tile now shows.
+    fn upload(&mut self, tiles: &Tiles, mut raster: Option<&mut markup::Raster>) {
+        let cols = self.shown.size[0].div_ceil(markup::TILE);
         for r in tiles.runs() {
             let mut patch = markup::sub_image(&self.shown, r.x0, r.y0, r.x1 - r.x0, r.y1 - r.y0);
-            if let Some(raster) = &raster {
+            let first = (r.y0 / markup::TILE) * cols + r.x0 / markup::TILE;
+            if let Some(raster) = raster.as_deref_mut() {
                 raster.paint(&mut patch, r.pos());
+                for (i, x) in (r.x0..r.x1).step_by(markup::TILE).enumerate() {
+                    let w = markup::TILE.min(r.x1 - x);
+                    let mut pixels = Vec::with_capacity(w * patch.size[1]);
+                    for row in patch.pixels.chunks(patch.size[0]) {
+                        pixels.extend_from_slice(&row[x - r.x0..x - r.x0 + w]);
+                    }
+                    self.live.patches.insert(first + i, pixels);
+                }
+            } else {
+                for i in 0..(r.x1 - r.x0).div_ceil(markup::TILE) {
+                    self.live.patches.remove(&(first + i));
+                }
             }
-            self.tex.set_partial(r.pos(), patch, TextureOptions::LINEAR);
+            self.tex.set_partial(r.pos(), patch);
         }
     }
 
     /// Adds a finished mark, burning just that mark into the picture and texture rather than
-    /// re-flattening the whole snip.
+    /// re-flattening the whole snip. Tiles the texture already shows with the mark (it was drawn
+    /// live) are copied into the picture as shown, neither painted again nor uploaded.
     fn commit(&mut self, doc: &mut Doc, m: Mark) {
         let current = self.rev == (doc.image_rev, doc.ink_rev);
+        let size = doc.size();
+        let live_text = self.live.text.take().filter(|r| matches!(&m, Mark::Text(t) if r.text() == t));
+        // The live tiles that show `m` exactly as it will be burned.
+        let as_shown = match &m {
+            _ if !current => Tiles::new(size),
+            Mark::Text(_) if live_text.is_some() => self.live.tiles.clone(),
+            Mark::Stroke(s) if self.live.last.is_none() && self.live.done > 0 && self.live.done <= s.points.len() => {
+                // Points added since the last frame still have to be painted.
+                let mut newer = Tiles::new(size);
+                s.footprint_from(self.live.done, &mut newer);
+                self.live.tiles.minus(&newer)
+            }
+            Mark::Shape(_) if self.live.last.as_ref() == Some(&m) => self.live.tiles.clone(),
+            _ => Tiles::new(size),
+        };
+        let mut raster = match live_text {
+            Some(text) => markup::Raster::of_text(&m, text),
+            None => m.raster(size),
+        };
         if current {
-            let mut tiles = Tiles::new(doc.size());
+            let mut tiles = Tiles::new(size);
             m.footprint(&mut tiles);
+            // Takes the copy made while the mark was drawn if it is ready; otherwise `make_mut` copies here.
+            self.adopt_copy();
+            self.copying = None;
             let shown = Arc::make_mut(&mut self.shown);
-            let raster = m.raster(doc.size());
-
-            for r in tiles.runs() {
+            let cols = size[0].div_ceil(markup::TILE);
+            let mut reused = tiles.intersect(&as_shown);
+            reused.retain(|idx| self.live.patches.contains_key(&idx));
+            for idx in reused.indices() {
+                if let Some(pixels) = self.live.patches.get(&idx) {
+                    let at = [(idx % cols) * markup::TILE, (idx / cols) * markup::TILE];
+                    let w = markup::TILE.min(size[0] - at[0]);
+                    markup::paste(shown, &ColorImage::new([w, pixels.len() / w], pixels.clone()), at);
+                }
+            }
+            for r in tiles.minus(&reused).runs() {
                 let mut patch = markup::sub_image(shown, r.x0, r.y0, r.x1 - r.x0, r.y1 - r.y0);
                 raster.paint(&mut patch, r.pos());
                 markup::paste(shown, &patch, r.pos());
-                self.tex.set_partial(r.pos(), patch, TextureOptions::LINEAR);
+                self.tex.set_partial(r.pos(), patch);
             }
             // Live tiles the mark no longer reaches go back to the picture.
             let stale = self.live.tiles.minus(&tiles);
             self.upload(&stale, None);
         }
-        doc.add_mark(m);
+        match raster.into_text() {
+            Some(text) => doc.add_text(text),
+            None => doc.add_mark(m),
+        }
         if current {
             self.rev.1 = doc.ink_rev;
             self.burned = doc.marks.clone();
@@ -1208,11 +1436,14 @@ impl CanvasTex {
     }
 
     /// Shows `m`, the mark being drawn. A stroke only grows, so only the tiles its newest segments
-    /// reach are repainted; any other mark is repainted where it is now, and the tiles it has left
-    /// go back to the picture. Nothing is redone while the mark stays the same.
+    /// reach are repainted; text is repainted where its changed letters are; a shape is repainted
+    /// where it is now; and the tiles a mark has left go back to the picture. Nothing is redone while
+    /// the mark stays the same.
     fn show_live(&mut self, m: &Mark) {
-        let mut fresh = Tiles::new(self.shown.size);
-        match m {
+        let size = self.shown.size;
+        let mut fresh = Tiles::new(size);
+        let mut covered = Tiles::new(size);
+        let mut raster = match m {
             Mark::Stroke(s) => {
                 if s.points.len() < self.live.done {
                     self.clear_live();
@@ -1223,28 +1454,45 @@ impl CanvasTex {
                 s.footprint_from(self.live.done, &mut fresh);
                 self.live.done = s.points.len();
                 self.live.tiles.union(&fresh);
+                let mut raster = m.raster(size);
+                self.upload(&fresh, Some(&mut raster));
+                return;
             }
-            _ => {
+            Mark::Text(t) => {
+                let text = match self.live.text.take() {
+                    Some(text) if text.text() == t => {
+                        self.live.text = Some(text);
+                        return;
+                    }
+                    // Typing changes a letter at a time: only the changed letters' tiles are repainted.
+                    Some(mut text) => {
+                        text.retext(t, &mut fresh);
+                        text
+                    }
+                    None => {
+                        let text = TextRaster::new(t, size);
+                        fresh.add(text.bounds());
+                        text
+                    }
+                };
+                covered.add(text.bounds());
+                markup::Raster::of_text(m, text)
+            }
+            Mark::Shape(_) => {
                 if self.live.last.as_ref() == Some(m) {
                     return;
                 }
-                let mut covered = Tiles::new(self.shown.size);
                 m.footprint(&mut covered);
-                let left = self.live.tiles.minus(&covered);
-                self.upload(&left, None);
-                match (&self.live.last, m) {
-                    // Typing changes a letter at a time: only the changed letters' tiles are repainted.
-                    (Some(Mark::Text(old)), Mark::Text(new)) => {
-                        markup::text_changes(old, new, &mut fresh);
-                        fresh = fresh.intersect(&covered);
-                    }
-                    _ => fresh = covered.clone(),
-                }
-                self.live.tiles = covered;
+                fresh = covered.clone();
                 self.live.last = Some(m.clone());
+                m.raster(size)
             }
-        }
-        self.upload(&fresh, Some(m));
+        };
+        let left = self.live.tiles.minus(&covered);
+        self.upload(&left, None);
+        self.live.tiles = covered.clone();
+        self.upload(&fresh.intersect(&covered), Some(&mut raster));
+        self.live.text = raster.into_text();
     }
 
     /// Puts back the committed picture wherever a cancelled mark was showing.
@@ -1265,19 +1513,112 @@ fn placeable(m: Option<Mark>) -> Option<Mark> {
     }
 }
 
-/// Applies this frame's typing to `text`, taking those events so nothing else reacts to them.
-/// True when Enter (without Shift) asks to place the text.
-fn type_into(ctx: &egui::Context, text: &mut String) -> bool {
+/// `t` with an input method's uncommitted `preedit` after it, as it shows while composing.
+fn with_preedit(t: &Text, preedit: &str) -> Text {
+    Text { text: format!("{}{preedit}", t.text), ..t.clone() }
+}
+
+/// What a change to the draft is, for grouping changes into undo steps.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+enum Edit {
+    #[default]
+    None,
+    Typing,
+    Deleting,
+}
+
+/// Text being typed, beyond its letters (which live in the `Text` mark being drawn): the font size
+/// it was last set from, the input method's composition, and its own undo history.
+#[derive(Debug, Default)]
+struct Draft {
+    /// The size option, in points, that the text's size in pixels was last worked out from.
+    size_pt: f32,
+    /// What the input method is composing: shown after the text, not part of it until committed.
+    preedit: String,
+    undo: Vec<String>,
+    redo: Vec<String>,
+    /// The kind of the last change, so a run of typing (a word) or of deleting is one undo step.
+    run: Edit,
+}
+
+impl Draft {
+    fn new(size_pt: f32) -> Self {
+        Self { size_pt, ..Self::default() }
+    }
+
+    /// Call before changing `text`: starts a new undo step unless the change continues the last
+    /// run. Typing starts one at each new word; anything other than typing or deleting is a step of
+    /// its own.
+    fn begin(&mut self, kind: Edit, text: &str, new_word: bool) {
+        if kind == Edit::None || kind != self.run || new_word {
+            self.undo.push(text.to_string());
+            self.redo.clear();
+        }
+        self.run = kind;
+    }
+
+    /// Takes back the last step. False when there is nothing to take back.
+    fn undo(&mut self, text: &mut String) -> bool {
+        let Some(before) = self.undo.pop() else { return false };
+        self.redo.push(std::mem::replace(text, before));
+        self.run = Edit::None;
+        true
+    }
+
+    fn redo(&mut self, text: &mut String) {
+        if let Some(after) = self.redo.pop() {
+            self.undo.push(std::mem::replace(text, after));
+            self.run = Edit::None;
+        }
+    }
+
+    fn insert(&mut self, text: &mut String, s: &str, kind: Edit) {
+        let s = clean(s);
+        if s.is_empty() {
+            return;
+        }
+        let new_word = kind == Edit::Typing && !s.starts_with(char::is_whitespace) && text.ends_with(|c: char| c.is_whitespace());
+        self.begin(kind, text, new_word);
+        text.push_str(&s);
+    }
+}
+
+/// `s` as text can hold it: tabs become four spaces, and returns and other control characters go.
+fn clean(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\t' => out.push_str("    "),
+            '\n' => out.push('\n'),
+            c if c.is_control() => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Applies this frame's typing to `text`, taking those events so nothing else reacts to them. An
+/// input method's composition goes to `draft.preedit` until it is committed. True when Enter
+/// (without Shift) asks to place the text.
+fn type_into(ctx: &egui::Context, text: &mut String, draft: &mut Draft) -> bool {
     let mut place = false;
     ctx.input_mut(|i| {
         i.events.retain(|e| {
             match e {
-                Event::Text(s) => text.push_str(s),
-                Event::Paste(s) => text.push_str(&s.replace("\r\n", "\n")),
-                Event::Key { key: Key::Backspace, pressed: true, .. } => {
-                    text.pop();
+                Event::Text(s) => draft.insert(text, s, Edit::Typing),
+                Event::Paste(s) => draft.insert(text, s, Edit::None),
+                Event::Ime(egui::ImeEvent::Preedit { text: s, .. }) => draft.preedit = clean(s).replace('\n', " "),
+                Event::Ime(egui::ImeEvent::Commit(s)) => {
+                    draft.preedit.clear();
+                    draft.insert(text, s, Edit::None);
                 }
-                Event::Key { key: Key::Enter, pressed: true, modifiers, .. } if modifiers.shift => text.push('\n'),
+                Event::Key { key: Key::Backspace, pressed: true, .. } => {
+                    if !text.is_empty() {
+                        draft.begin(Edit::Deleting, text, false);
+                        text.pop();
+                    }
+                }
+                Event::Key { key: Key::Enter, pressed: true, modifiers, .. } if modifiers.shift => draft.insert(text, "\n", Edit::None),
                 Event::Key { key: Key::Enter, pressed: true, .. } => place = true,
                 _ => return true,
             }
@@ -1286,6 +1627,7 @@ fn type_into(ctx: &egui::Context, text: &mut String) -> bool {
     });
     place
 }
+
 /// Where the canvas's scroll area is scrolled to, as of its last frame. Call from the `Ui` that holds it.
 fn scroll_offset(ui: &egui::Ui) -> Vec2 {
     let id = ui.make_persistent_id(egui::IdSalt::new(SCROLL_ID));
@@ -1422,7 +1764,7 @@ mod tests {
     fn undo_drops_a_stroke_in_progress() {
         let mut doc = Doc::new(white(100, 80));
         doc.crop(Rect::from_min_max(pos2(10.0, 10.0), pos2(60.0, 50.0)));
-        let mut drawing = Some(Mark::Stroke(Stroke { ink: Ink::Pen, color: Color32::RED, width: 4.0, points: vec![pos2(1.0, 1.0)] }));
+        let mut drawing = Some(Mark::Stroke(Stroke { on_dark: false, ink: Ink::Pen, color: Color32::RED, width: 4.0, points: vec![pos2(1.0, 1.0)] }));
         step_history(&mut doc, &mut None, &mut drawing, false);
         assert!(drawing.is_none(), "a stroke in the old image's coordinates must not land on the restored one");
     }
@@ -1653,7 +1995,7 @@ mod tests {
     #[test]
     fn copy_and_save_use_the_canvas_picture_only_while_it_is_current() {
         let mut snip = Snip::new(white(8, 8), Tools::default());
-        let stroke = || Stroke { ink: Ink::Pen, color: Color32::RED, width: 2.0, points: vec![pos2(1.0, 1.0), pos2(6.0, 6.0)] };
+        let stroke = || Stroke { on_dark: false, ink: Ink::Pen, color: Color32::RED, width: 2.0, points: vec![pos2(1.0, 1.0), pos2(6.0, 6.0)] };
         snip.doc.add_mark(stroke());
         assert_eq!(*snip.flattened(), snip.doc.flatten(), "no canvas yet: flattened from the doc");
         let ctx = egui::Context::default();
@@ -1678,14 +2020,25 @@ Arc::ptr_eq(&snip.flattened(), &shown), "a current canvas is reused, not re-burn
     }
 
     impl Screen {
-        fn apply(&mut self, delta: &egui::TexturesDelta, id: Option<egui::TextureId>) {
-            let Some(id) = id else { return };
-            for d in delta.set.get(&id).into_iter().flatten() {
-                let egui::ImageData::Color(img) = &d.image;
-                match (d.pos, self.image.as_mut()) {
-                    (None, _) => self.image = Some((**img).clone()),
-                    (Some(at), Some(screen)) => markup::paste(screen, img, at),
-                    (Some(_), None) => panic!("partial upload before the texture exists"),
+        /// Applies the uploads to the canvas's texture pieces, each at its place in the picture.
+        fn apply(&mut self, delta: &egui::TexturesDelta, tex: Option<&Chunks>) {
+            let Some(tex) = tex else { return };
+            let size = tex.parts.iter().fold([0, 0], |s, (r, _)| [s[0].max(r.x1), s[1].max(r.y1)]);
+            for (c, t) in &tex.parts {
+                for d in delta.set.get(&t.id()).into_iter().flatten() {
+                    let egui::ImageData::Color(img) = &d.image;
+                    assert!(img.size[0] <= c.x1 - c.x0 && img.size[1] <= c.y1 - c.y0, "an upload larger than its piece");
+                    match (d.pos, self.image.as_mut()) {
+                        (None, screen) => {
+                            let screen = match screen {
+                                Some(s) if s.size == size => s,
+                                _ => self.image.insert(ColorImage::new(size, vec![Color32::TRANSPARENT; size[0] * size[1]])),
+                            };
+                            markup::paste(screen, img, c.pos());
+                        }
+                        (Some(at), Some(screen)) => markup::paste(screen, img, [c.x0 + at[0], c.y0 + at[1]]),
+                        (Some(_), None) => panic!("partial upload before the texture exists"),
+                    }
                 }
             }
         }
@@ -1702,7 +2055,7 @@ Arc::ptr_eq(&snip.flattened(), &shown), "a current canvas is reused, not re-burn
         let mut out = ctx.run_ui(input, |ui| {
             egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| snip.canvas(ui, &guard));
         });
-        screen.apply(&out.textures_delta, snip.texture.as_ref().map(|c| c.tex.id()));
+        screen.apply(&out.textures_delta, snip.texture.as_ref().map(|c| &c.tex));
         out.textures_delta.clear();
     }
 
@@ -1743,6 +2096,29 @@ Arc::ptr_eq(&snip.flattened(), &shown), "a current canvas is reused, not re-burn
             drag_and_compare(&mut snip, &PATH[1..]);
         }
     }
+    #[test]
+    fn the_highlighter_screens_on_a_dark_snip_and_multiplies_on_a_light_one_exactly_as_saved() {
+        for (base, dark) in [(Color32::from_rgb(28, 30, 34), true), (Color32::from_rgb(250, 250, 248), false)] {
+            let mut snip = Snip::new(ColorImage::new([300, 200], vec![base; 60000]), Tools { tool: Tool::Highlighter, ..Tools::default() });
+            drag_and_compare(&mut snip, &PATH);
+            assert!(matches!(&*snip.doc.marks[0], Mark::Stroke(s) if s.on_dark == dark), "on a {base:?} snip");
+            // A second stroke starting on the first keeps reading the picture as shown.
+            drag_and_compare(&mut snip, &PATH[1..]);
+        }
+    }
+
+    #[test]
+    fn a_snip_wider_than_the_gpu_allows_is_shown_in_pieces_exactly_as_saved() {
+        // Headless egui allows 2048 px a side; a 12000 x 2000 snip (three 4K monitors and more) needs six pieces.
+        let mut snip = Snip::new(gradient(12000, 2000), Tools { tool: Tool::Highlighter, ..Tools::default() });
+        drag_and_compare(&mut snip, &PATH);
+        let parts: Vec<PxRect> = snip.texture.as_ref().unwrap().tex.parts.iter().map(|(r, _)| *r).collect();
+        assert_eq!(parts.len(), 6, "{parts:?}");
+        assert!(parts.iter().all(|r| r.x1 - r.x0 <= 2048 && r.y1 - r.y0 <= 2048));
+        let s = &snip.doc.marks[0].bounds();
+        assert!(parts.iter().filter(|r| s.intersects(r.rect())).count() > 1, "the stroke crosses a seam between pieces");
+    }
+
     #[test]
     fn shapes_show_exactly_what_is_saved_while_they_are_dragged() {
         for (kind, _, _) in SHAPES {
@@ -1837,7 +2213,8 @@ Arc::ptr_eq(&snip.flattened(), &shown), "a current canvas is reused, not re-burn
             canvas_frame(&ctx, &mut snip, &mut screen, vec![pointer(*path.last().unwrap(), false)]);
         }
         assert_eq!(snip.doc.marks.len(), 2);
-        let full = snip.texture.as_ref().map(|c| c.tex.id());
+        let ids = |s: &Snip| s.texture.as_ref().map(|c| c.tex.parts.iter().map(|(_, t)| t.id()).collect::<Vec<_>>());
+        let full = ids(&snip);
         snip.tools.tool = Tool::Eraser;
         canvas_frame(&ctx, &mut snip, &mut screen, vec![Event::PointerMoved(PATH[0]), pointer(PATH[0], true)]);
         canvas_frame(&ctx, &mut snip, &mut screen, vec![pointer(PATH[0], false)]);
@@ -1846,7 +2223,7 @@ Arc::ptr_eq(&snip.flattened(), &shown), "a current canvas is reused, not re-burn
         snip.step(false);
         canvas_frame(&ctx, &mut snip, &mut screen, vec![]);
         assert!(screen.pixels() == snip.doc.flatten().pixels, "undo shows the stroke again");
-        assert_eq!(snip.texture.as_ref().map(|c| c.tex.id()), full, "the same texture, patched rather than replaced");
+        assert_eq!(ids(&snip), full, "the same texture, patched rather than replaced");
         assert!(*snip.flattened() == snip.doc.flatten());
     }
 
@@ -1889,7 +2266,7 @@ Arc::ptr_eq(&snip.flattened(), &shown), "a current canvas is reused, not re-burn
     fn esc_drops_the_draft_empty_text_is_never_placed_and_a_crop_places_it_first() {
         let ctx = egui::Context::default();
         let fresh = Snip::new(white(300, 200), Tools { tool: Tool::Text, ..Tools::default() });
-        let mut ed = Editor::new(Content::Snip(Box::new(fresh)), "t".into(), ViewportId::ROOT, 0, None, String::new(), MIN_EDIT_W);
+        let mut ed = Editor::new(Content::Snip(Box::new(fresh)), "t".into(), ViewportId::ROOT, 0, None, Default::default(), MIN_EDIT_W);
         let mut screen = Screen { image: None };
         fn snip(ed: &mut Editor) -> &mut Snip {
             match &mut ed.content {
@@ -1978,7 +2355,7 @@ Arc::ptr_eq(&snip.flattened(), &shown), "a current canvas is reused, not re-burn
 
         editors.with(a, |e| {
             let Content::Snip(s) = &mut e.content else { panic!("a snip") };
-            s.doc.add_mark(Stroke { ink: Ink::Pen, color: Color32::RED, width: 2.0, points: vec![pos2(1.0, 1.0)] });
+            s.doc.add_mark(Stroke { on_dark: false, ink: Ink::Pen, color: Color32::RED, width: 2.0, points: vec![pos2(1.0, 1.0)] });
         });
         let undo = |id| editors.with(id, |e| e.snip().is_some_and(|s| s.doc.can_undo())).unwrap();
         assert!(undo(a) && !undo(b), "undo stacks are separate");
@@ -2051,14 +2428,385 @@ Arc::ptr_eq(&snip.flattened(), &shown), "a current canvas is reused, not re-burn
     }
 
     #[test]
+    fn the_canvas_copies_the_shared_picture_while_a_mark_is_drawn_not_on_mouse_up() {
+        let ctx = egui::Context::default();
+        let mut snip = Snip::new(gradient(300, 200), Tools::default());
+        let mut screen = Screen { image: None };
+        canvas_frame(&ctx, &mut snip, &mut screen, vec![]);
+        let shared = |s: &Snip| Arc::ptr_eq(&s.texture.as_ref().unwrap().shown, &s.doc.image);
+        assert!(shared(&snip), "before any mark the canvas shows the doc's own picture");
+        canvas_frame(&ctx, &mut snip, &mut screen, vec![Event::PointerMoved(PATH[0]), pointer(PATH[0], true)]);
+        canvas_frame(&ctx, &mut snip, &mut screen, vec![Event::PointerMoved(PATH[1])]);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while shared(&snip) {
+            assert!(std::time::Instant::now() < deadline, "the copy should arrive while drawing");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            canvas_frame(&ctx, &mut snip, &mut screen, vec![Event::PointerMoved(PATH[1])]);
+        }
+        let own = snip.texture.as_ref().map(|c| Arc::as_ptr(&c.shown)).unwrap();
+        canvas_frame(&ctx, &mut snip, &mut screen, vec![pointer(PATH[1], false)]);
+        assert_eq!(snip.texture.as_ref().map(|c| Arc::as_ptr(&c.shown)).unwrap(), own, "the mark went into the copy made while drawing");
+        assert!(screen.pixels() == snip.doc.flatten().pixels);
+        assert_eq!(*snip.doc.image, gradient(300, 200), "the doc's picture is untouched");
+    }
+
+    #[test]
+    fn a_second_save_while_one_is_under_way_is_ignored() {
+        let ctx = egui::Context::default();
+        let fresh = Snip::new(white(10, 10), Tools::default());
+        let mut ed = Editor::new(Content::Snip(Box::new(fresh)), "t".into(), ViewportId::ROOT, 0, None, Default::default(), MIN_EDIT_W);
+        // As if a Save dialog were open: another Save must return at once and open nothing.
+        ed.saving.store(true, Ordering::Release);
+        ed.save_as(&ctx);
+        assert!(ed.saving.load(Ordering::Acquire), "the first save still owns the flag");
+        // The worker frees it however it ends, a panic included.
+        let busy = Busy(ed.saving.clone());
+        let _ = std::thread::spawn(move || {
+            let _busy = busy;
+            panic!("a failed save");
+        })
+        .join();
+        assert!(!ed.saving.load(Ordering::Acquire), "a new Save can start");
+    }
+
+    #[test]
+    fn the_shell_never_waits_on_an_editor_mid_frame() {
+        let ctx = egui::Context::default();
+        let mut editors = Editors::new(None);
+        let (a, _, _) = editors.open_snip(&ctx, white(10, 10), 0, None);
+        // Hold the editor as its own frame would; on this thread a blocking lock would never return.
+        let held = editors.slots[0].editor.clone();
+        let guard = held.lock().unwrap();
+        editors.set_new_tip("New snip (Alt+Shift+S)".into());
+        editors.newest_notifier(&ctx).expect("a notifier without the lock").send("Saved".into());
+        assert!(editors.with(a, |_| ()).is_none(), "a busy editor is skipped, not waited for");
+        assert_eq!(editors.poll(), Requests::default());
+        drop(guard);
+        frame(&ctx, &editors, vec![]);
+        assert_eq!(editors.with(a, |e| (e.new_tip.clone(), e.note.as_ref().map(|n| n.msg.clone()))).unwrap(), ("New snip (Alt+Shift+S)".to_string(), Some("Saved".to_string())));
+    }
+
+    #[test]
     fn new_button_tooltips_follow_the_shell() {
         let ctx = egui::Context::default();
         let mut editors = Editors::new(None);
         let (a, _, _) = editors.open_snip(&ctx, white(10, 10), 0, None);
         editors.set_new_tip("New recording (Ctrl+N)".into());
         let (b, _, _) = editors.open_snip(&ctx, white(10, 10), 0, None);
+        frame(&ctx, &editors, vec![]);
         for id in [a, b] {
             assert_eq!(editors.with(id, |e| e.new_tip.clone()).unwrap(), "New recording (Ctrl+N)");
         }
+    }
+
+    /// A snip editor with the text tool, typing `typed` into a draft started by a click on the middle of its 300x200 snip.
+    fn typing(typed: &str) -> (egui::Context, Editor, Screen) {
+        let ctx = egui::Context::default();
+        let fresh = Snip::new(gradient(300, 200), Tools { tool: Tool::Text, ..Tools::default() });
+        let mut ed = Editor::new(Content::Snip(Box::new(fresh)), "t".into(), ViewportId::ROOT, 0, None, Default::default(), MIN_EDIT_W);
+        let mut screen = Screen { image: None };
+        let at = pos2(640.0, 400.0);
+        for events in [vec![], vec![Event::PointerMoved(at), pointer(at, true)], vec![pointer(at, false)]] {
+            canvas_frame(&ctx, snip_of(&mut ed), &mut screen, events);
+        }
+        for ch in typed.chars() {
+            canvas_frame(&ctx, snip_of(&mut ed), &mut screen, vec![Event::Text(ch.to_string())]);
+        }
+        (ctx, ed, screen)
+    }
+
+    fn snip_of(ed: &mut Editor) -> &mut Snip {
+        match &mut ed.content {
+            Content::Snip(s) => s,
+            Content::Video(_) => panic!("a snip"),
+        }
+    }
+
+    fn draft_text(ed: &mut Editor) -> Option<String> {
+        match &snip_of(ed).drawing {
+            Some(Mark::Text(t)) => Some(t.text.clone()),
+            _ => None,
+        }
+    }
+
+    /// Presses `k` with `mods` through the editor's own shortcut handling.
+    fn shortcut(ctx: &egui::Context, ed: &mut Editor, k: Key, mods: Modifiers) {
+        let input = egui::RawInput { events: vec![key(k, mods)], ..Default::default() };
+        let mut out = ctx.run_ui(input, |ui| ed.shortcuts(ui.ctx()));
+        out.textures_delta.clear();
+    }
+
+    #[test]
+    fn ctrl_z_while_typing_takes_back_a_word_at_a_time_and_ctrl_y_never_discards() {
+        let (ctx, mut ed, _) = typing("hello big world");
+        shortcut(&ctx, &mut ed, Key::Y, Modifiers::COMMAND);
+        assert_eq!(draft_text(&mut ed).as_deref(), Some("hello big world"), "nothing to redo leaves the draft alone");
+        shortcut(&ctx, &mut ed, Key::Z, Modifiers::COMMAND);
+        assert_eq!(draft_text(&mut ed).as_deref(), Some("hello big "));
+        shortcut(&ctx, &mut ed, Key::Z, Modifiers::COMMAND);
+        assert_eq!(draft_text(&mut ed).as_deref(), Some("hello "));
+        shortcut(&ctx, &mut ed, Key::Y, Modifiers::COMMAND);
+        assert_eq!(draft_text(&mut ed).as_deref(), Some("hello big "));
+        shortcut(&ctx, &mut ed, Key::Z, Modifiers::COMMAND);
+        shortcut(&ctx, &mut ed, Key::Z, Modifiers::COMMAND);
+        assert_eq!(draft_text(&mut ed).as_deref(), Some(""), "back to the empty draft");
+        shortcut(&ctx, &mut ed, Key::Z, Modifiers::COMMAND);
+        assert_eq!(draft_text(&mut ed), None, "Ctrl+Z on the empty draft cancels it");
+        assert!(snip_of(&mut ed).doc.marks.is_empty(), "and never touched the snip's own history");
+    }
+
+    #[test]
+    fn deleting_is_its_own_undo_step() {
+        let (ctx, mut ed, mut screen) = typing("abc");
+        let back = || vec![key(Key::Backspace, Modifiers::NONE)];
+        canvas_frame(&ctx, snip_of(&mut ed), &mut screen, back());
+        canvas_frame(&ctx, snip_of(&mut ed), &mut screen, back());
+        assert_eq!(draft_text(&mut ed).as_deref(), Some("a"));
+        shortcut(&ctx, &mut ed, Key::Z, Modifiers::COMMAND);
+        assert_eq!(draft_text(&mut ed).as_deref(), Some("abc"), "both deletions come back at once");
+    }
+
+    #[test]
+    fn pasted_text_loses_returns_and_control_characters_and_tabs_become_spaces() {
+        let (ctx, mut ed, mut screen) = typing("");
+        canvas_frame(&ctx, snip_of(&mut ed), &mut screen, vec![Event::Paste("a\tb\r\nc\u{7}d\u{1F600}".into())]);
+        assert_eq!(draft_text(&mut ed).as_deref(), Some("a    b\ncd\u{1F600}"));
+        // Accented letters from dead keys arrive as ordinary text and stay.
+        for s in ["á", "ç", "ã"] {
+            canvas_frame(&ctx, snip_of(&mut ed), &mut screen, vec![Event::Text(s.into())]);
+        }
+        assert_eq!(draft_text(&mut ed).as_deref(), Some("a    b\ncd\u{1F600}áçã"));
+        let mut want = snip_of(&mut ed).doc.flatten();
+        markup::burn(&mut want, snip_of(&mut ed).drawing.as_ref().unwrap());
+        assert!(screen.pixels() == want.pixels, "the emoji draws nothing, the rest shows as saved");
+    }
+
+    #[test]
+    fn an_input_method_composes_inline_and_commits_into_the_text() {
+        let (ctx, mut ed, mut screen) = typing("Hi ");
+        // Runs one canvas frame and returns the input method request it made.
+        let frame = |ed: &mut Editor, screen: &mut Screen, events: Vec<Event>| {
+            let input = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1280.0, 800.0))), events, ..Default::default() };
+            let guard = PopupClickGuard::default();
+            let snip = snip_of(ed);
+            let mut out = ctx.run_ui(input, |ui| {
+                egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| snip.canvas(ui, &guard));
+            });
+            screen.apply(&out.textures_delta, snip.texture.as_ref().map(|c| &c.tex));
+            out.textures_delta.clear();
+            out.platform_output.ime
+        };
+        let ime = frame(&mut ed, &mut screen, vec![Event::Ime(egui::ImeEvent::Preedit { text: "にほ".into(), active_range_chars: None })]);
+        let ime = ime.expect("typing turns the input method on");
+        assert!(ime.cursor_rect.height() > 10.0 && ime.rect.contains(ime.cursor_rect.center()), "{ime:?}");
+        assert_eq!(draft_text(&mut ed).as_deref(), Some("Hi "), "the composition is not part of the text yet");
+        let Some(Mark::Text(t)) = snip_of(&mut ed).drawing.clone() else { panic!("typing") };
+        let mut want = snip_of(&mut ed).doc.flatten();
+        markup::burn(&mut want, &Mark::Text(Text { text: "Hi にほ".into(), ..t }));
+        assert!(screen.pixels() == want.pixels, "but it shows inline");
+        frame(&mut ed, &mut screen, vec![Event::Ime(egui::ImeEvent::Preedit { text: String::new(), active_range_chars: None }), Event::Ime(egui::ImeEvent::Commit("日本".into()))]);
+        assert_eq!(draft_text(&mut ed).as_deref(), Some("Hi 日本"));
+        let ime = frame(&mut ed, &mut screen, vec![key(Key::Enter, Modifiers::NONE)]);
+        assert!(ime.is_none(), "placing the text turns the input method off");
+        assert!(matches!(&*snip_of(&mut ed).doc.marks[0], Mark::Text(t) if t.text == "Hi 日本"));
+    }
+
+    #[test]
+    fn zooming_while_typing_keeps_the_text_size_and_the_size_option_still_sets_it() {
+        let (ctx, mut ed, mut screen) = typing("Hey");
+        let size = |ed: &mut Editor| match &snip_of(ed).drawing {
+            Some(Mark::Text(t)) => t.size,
+            _ => panic!("typing"),
+        };
+        let first = size(&mut ed);
+        snip_of(&mut ed).zoom = Some(0.5);
+        canvas_frame(&ctx, snip_of(&mut ed), &mut screen, vec![]);
+        assert_eq!(size(&mut ed), first, "zooming out leaves the text alone");
+        snip_of(&mut ed).tools.text.1 = 40.0;
+        canvas_frame(&ctx, snip_of(&mut ed), &mut screen, vec![]);
+        assert_eq!(size(&mut ed), 80.0, "40 pt at 50% zoom is 80 px");
+    }
+
+    #[test]
+    fn clicking_the_chosen_text_tool_opens_its_options_without_placing_the_draft() {
+        let (ctx, mut ed, _) = typing("draft");
+        // The markup buttons laid out from the window's corner: Text is the fourth.
+        let button = |n: f32| pos2(n * (BTN.x + GAP) + BTN.x / 2.0, BTN.y / 2.0);
+        let click = |ed: &mut Editor, at: Pos2| {
+            // egui hit-tests against the last frame's layout, so the buttons are laid out once first.
+            for events in [vec![Event::PointerMoved(at)], vec![pointer(at, true)], vec![pointer(at, false)], vec![]] {
+                let input = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1280.0, 800.0))), events, ..Default::default() };
+                let snip = snip_of(ed);
+                let mut out = ctx.run_ui(input, |ui| {
+                    egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing = vec2(GAP, 0.0);
+                            snip.markup_controls(ui);
+                        });
+                    });
+                });
+                out.textures_delta.clear();
+            }
+        };
+        click(&mut ed, button(3.0));
+        assert_eq!(draft_text(&mut ed).as_deref(), Some("draft"), "the draft is still being typed");
+        assert!(egui::Popup::is_any_open(&ctx), "the text options opened");
+        click(&mut ed, button(0.0));
+        click(&mut ed, button(0.0));
+        assert_eq!(draft_text(&mut ed), None, "switching tools places it");
+        assert_eq!(snip_of(&mut ed).doc.marks.len(), 1);
+    }
+
+    /// Writes review renders, made by the same rasteriser as a saved snip, into `SNIPSCREEN_RENDER_DIR`.
+    #[test]
+    #[ignore = "writes PNGs for a person to look at"]
+    fn render_samples_for_review() {
+        let Ok(dir) = std::env::var("SNIPSCREEN_RENDER_DIR") else { return };
+        let dir = PathBuf::from(dir);
+        let lines = ["The quick brown fox jumps over", "the lazy dog, then naps again.", "(this line multiplied, as before)"];
+        for (name, bg, fg) in [("highlighter-on-light", Color32::from_rgb(250, 250, 248), PEN_COLORS[0]), ("highlighter-on-dark", Color32::from_rgb(30, 31, 34), Color32::from_gray(225))] {
+            let mut d = Doc::new(ColorImage::new([560, 190], vec![bg; 560 * 190]));
+            for (i, line) in lines.iter().enumerate() {
+                d.add_mark(Text { text: line.to_string(), color: fg, size: 30.0, outline: false, pos: pos2(20.0, 16.0 + i as f32 * 56.0) });
+            }
+            for (i, color) in [HIGHLIGHT_COLORS[0], HIGHLIGHT_COLORS[3], HIGHLIGHT_COLORS[0]].into_iter().enumerate() {
+                let y = 16.0 + i as f32 * 56.0 + 20.0;
+                let points = vec![pos2(16.0, y), pos2(500.0, y)];
+                let on_dark = i < 2 && markup::is_dark_under(&d.flatten(), points[0], 15.0);
+                d.add_mark(Stroke { ink: Ink::Highlighter, color, width: 30.0, points, on_dark });
+            }
+            win::save_png(&dir.join(format!("{name}.png")), &d.flatten()).expect("render saved");
+        }
+        let pasted = clean("Tab\there, emoji \u{1F600} skipped\r\nnext line");
+        let mut d = Doc::new(gradient(900, 420));
+        for (i, (size, color)) in [(24.0, PEN_COLORS[2]), (96.0, PEN_COLORS[3])].into_iter().enumerate() {
+            d.add_mark(Text { text: format!("{size} pt: {pasted}"), color, size, outline: true, pos: pos2(16.0, 10.0 + i as f32 * 80.0) });
+        }
+        win::save_png(&dir.join("text-24-and-96-pt.png"), &d.flatten()).expect("render saved");
+    }
+
+    /// One headless frame of the snip's canvas without mirroring its uploads, for timing.
+    fn bench_frame(ctx: &egui::Context, snip: &mut Snip, events: Vec<Event>) -> f64 {
+        let input = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1280.0, 800.0))), max_texture_side: Some(16384), events, ..Default::default() };
+        let guard = PopupClickGuard::default();
+        let t = std::time::Instant::now();
+        let mut out = ctx.run_ui(input, |ui| {
+            egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| snip.canvas(ui, &guard));
+        });
+        let ms = t.elapsed().as_secs_f64() * 1000.0;
+        out.textures_delta.clear();
+        ms
+    }
+
+    fn stats(name: &str, v: &[f64]) {
+        let mut s = v.to_vec();
+        s.sort_by(f64::total_cmp);
+        println!("{name:<46} n={:<4} median {:>7.2} ms   max {:>7.2} ms", s.len(), s[s.len() / 2], s[s.len() - 1]);
+    }
+
+    /// Timings on a 4K snip. Run in release: `cargo test --release perf_ -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "timing report, not a check"]
+    fn perf_editor_on_4k() {
+        let ms = |t: std::time::Instant| t.elapsed().as_secs_f64() * 1000.0;
+        // Typing a 12-line block at 160 px, shown at 100%.
+        let ctx = egui::Context::default();
+        let mut snip = Snip::new(gradient(3840, 2160), Tools { tool: Tool::Text, text: (PEN_COLORS[2], 160.0), ..Tools::default() });
+        snip.zoom = Some(1.0);
+        bench_frame(&ctx, &mut snip, vec![]);
+        let at = pos2(40.0, 110.0);
+        bench_frame(&ctx, &mut snip, vec![Event::PointerMoved(at), pointer(at, true)]);
+        bench_frame(&ctx, &mut snip, vec![pointer(at, false)]);
+        let mut lines = Vec::new();
+        for l in 0..12 {
+            if l > 0 {
+                bench_frame(&ctx, &mut snip, vec![key(Key::Enter, Modifiers::SHIFT)]);
+            }
+            let mut line = Vec::new();
+            for ch in "The quick brown fox jumps".chars() {
+                line.push(bench_frame(&ctx, &mut snip, vec![Event::Text(ch.to_string())]));
+            }
+            lines.push(line);
+        }
+        let Some(Mark::Text(t)) = snip.drawing.as_ref() else { panic!("typing") };
+        // The last line wholly on the snip: lower ones are cut off by its bottom edge.
+        let on = ((2160.0 - t.pos.y) / t.line_height()).floor() as usize;
+        stats("type: keystroke, line 1", &lines[0]);
+        stats(&format!("type: keystroke, line {on} (last whole line on 4K)"), &lines[on - 1]);
+        stats("type: keystroke, any of the 12 lines", &lines.concat());
+        let mut back = Vec::new();
+        for _ in 0..5 {
+            back.push(bench_frame(&ctx, &mut snip, vec![key(Key::Backspace, Modifiers::NONE)]));
+        }
+        stats("type: backspace at the end of the block", &back);
+        let mut slider = Vec::new();
+        for i in 0..10 {
+            snip.tools.text.1 = 159.0 - i as f32;
+            slider.push(bench_frame(&ctx, &mut snip, vec![]));
+        }
+        stats("type: size slider frame (12 lines)", &slider);
+        let commit = bench_frame(&ctx, &mut snip, vec![key(Key::Enter, Modifiers::NONE)]);
+        stats("type: Enter places the 12-line block", &[commit]);
+
+        // Highlighter drag across the whole snip at fit zoom.
+        let ctx = egui::Context::default();
+        let mut snip = Snip::new(gradient(3840, 2160), Tools { tool: Tool::Highlighter, ..Tools::default() });
+        bench_frame(&ctx, &mut snip, vec![]);
+        let path: Vec<Pos2> = (0..120).map(|i| pos2(40.0 + i as f32 * 10.0, 300.0 + (i as f32 * 0.3).sin() * 120.0)).collect();
+        bench_frame(&ctx, &mut snip, vec![Event::PointerMoved(path[0]), pointer(path[0], true)]);
+        let mut drag = Vec::new();
+        for &p in &path[1..] {
+            drag.push(bench_frame(&ctx, &mut snip, vec![Event::PointerMoved(p)]));
+        }
+        stats("highlighter: drag frame (120 points)", &drag);
+        let up = bench_frame(&ctx, &mut snip, vec![pointer(*path.last().unwrap(), false)]);
+        stats("highlighter: first stroke's mouse-up", &[up]);
+        let path2: Vec<Pos2> = path.iter().map(|p| *p + vec2(0.0, 60.0)).collect();
+        bench_frame(&ctx, &mut snip, vec![Event::PointerMoved(path2[0]), pointer(path2[0], true)]);
+        for &p in &path2[1..] {
+            bench_frame(&ctx, &mut snip, vec![Event::PointerMoved(p)]);
+        }
+        let up = bench_frame(&ctx, &mut snip, vec![pointer(*path2.last().unwrap(), false)]);
+        stats("highlighter: second stroke's mouse-up", &[up]);
+
+        // Erase, undo and redo beside 20 text marks.
+        let mut d = Doc::new(gradient(3840, 2160));
+        for i in 0..20 {
+            let pos = pos2(100.0 + (i % 4) as f32 * 900.0, 100.0 + (i / 4) as f32 * 400.0);
+            d.add_mark(Text { text: "Label 12345\nsecond line".into(), color: PEN_COLORS[2], size: 96.0, outline: true, pos });
+        }
+        d.add_mark(Shape { kind: ShapeKind::Line, color: Color32::RED, width: 4.0, from: pos2(3700.0, 2100.0), to: pos2(3710.0, 2100.0) });
+        let (mut erase, mut undo, mut redo, mut hits) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for _ in 0..5 {
+            let before = d.marks.clone();
+            let t = std::time::Instant::now();
+            d.checkpoint();
+            assert!(d.erase_at(pos2(3705.0, 2100.0), 3.0));
+            let tiles = d.changed_tiles(&before);
+            std::hint::black_box(d.render_runs(&tiles));
+            erase.push(ms(t));
+            let before = d.marks.clone();
+            let t = std::time::Instant::now();
+            d.undo();
+            let tiles = d.changed_tiles(&before);
+            std::hint::black_box(d.render_runs(&tiles));
+            undo.push(ms(t));
+            let before = d.marks.clone();
+            let t = std::time::Instant::now();
+            d.redo();
+            let tiles = d.changed_tiles(&before);
+            std::hint::black_box(d.render_runs(&tiles));
+            redo.push(ms(t));
+            d.undo();
+            let t = std::time::Instant::now();
+            for i in 0..20 {
+                std::hint::black_box(d.hits(pos2(150.0 + i as f32 * 10.0, 150.0), 10.0));
+            }
+            hits.push(ms(t) / 20.0);
+        }
+        stats("erase a dot beside 20 text marks", &erase);
+        stats("undo that erase", &undo);
+        stats("redo that erase", &redo);
+        stats("eraser hit test over 20 text marks", &hits);
     }
 }
