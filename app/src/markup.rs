@@ -260,7 +260,7 @@ impl Text {
         let advances = font.glyph_metrics(skrifa::instance::Size::new(self.size), skrifa::instance::LocationRef::default());
         let mut pen = from;
         for (i, ch) in self.text[from.byte..upto].char_indices() {
-            if pen.chars % CHECKPOINT_CHARS == 0 && pen.chars > from.chars {
+            if pen.chars.is_multiple_of(CHECKPOINT_CHARS) && pen.chars > from.chars {
                 step(Step::Mark(Pen { byte: from.byte + i, ..pen }));
             }
             pen.chars += 1;
