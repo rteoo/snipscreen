@@ -19,6 +19,8 @@
 #define MyAppIcon "..\app\assets\snipscreen.ico"
 #define MyBuildDir "..\app\target\release"
 #define MyAppId "SnipScreen.App"
+; tray.rs MUTEX: held by a running copy for as long as it runs.
+#define MyInstanceMutex "Local\SnipScreen.Instance"
 
 [Setup]
 ; Stable AppId so future versions upgrade in place instead of installing twice.
@@ -76,18 +78,22 @@ Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#MyAppName}}
 
 [Code]
 // Asks a running copy to quit and waits (up to ~15 s, enough to finish saving a
-// recording) until it is gone, so its files can be replaced or removed.
+// recording) until it is gone, so its files can be replaced or removed. Only a
+// copy that holds the instance mutex understands --quit; a build from before
+// it would open a window instead, so without the mutex nothing is run and
+// Restart Manager closes whatever is running. The --quit launch is not waited
+// for: it only forwards the request, and the mutex says when the copy is gone.
 procedure QuitRunningCopy();
 var
   Exe: String;
   Code, Waited: Integer;
 begin
   Exe := ExpandConstant('{app}\{#MyAppExeName}');
-  if not FileExists(Exe) then
+  if not FileExists(Exe) or not CheckForMutexes('{#MyInstanceMutex}') then
     Exit;
-  Exec(Exe, '--quit', '', SW_HIDE, ewWaitUntilTerminated, Code);
+  Exec(Exe, '--quit', '', SW_HIDE, ewNoWait, Code);
   Waited := 0;
-  while CheckForMutexes('Local\SnipScreen.Instance') and (Waited < 15000) do
+  while CheckForMutexes('{#MyInstanceMutex}') and (Waited < 15000) do
   begin
     Sleep(100);
     Waited := Waited + 100;
