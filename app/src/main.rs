@@ -922,6 +922,8 @@ impl eframe::App for App {
         self.startup = None;
         // Dropping the agent also tells a sign-out waiting in `WM_ENDSESSION` that all is written.
         self.agent = None;
+        // Its window and shortcuts are gone: a launch from here on can start as the running copy.
+        tray::release_single_instance();
     }
 
     /// Transparent so the recording-area outline window shows only its dashes.
@@ -1792,6 +1794,7 @@ fn start_resident(intent: tray::Intent, hotkey: Hotkey) -> Option<Boot> {
     while !tray::claim_single_instance() {
         let failed = match tray::forward(&intent) {
             Ok(tray::Forwarded::Taken) => return None,
+            Ok(tray::Forwarded::Gone) => continue,
             Ok(tray::Forwarded::Closing) if intent == tray::Intent::Quit => return None,
             Ok(tray::Forwarded::Closing) if Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(100));

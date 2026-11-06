@@ -80,6 +80,7 @@ const MENU_QUIT: usize = 4;
 #[link(name = "kernel32")]
 extern "system" {
     fn CreateMutexW(attributes: *const c_void, initial_owner: i32, name: *const u16) -> HANDLE;
+    fn OpenMutexW(access: u32, inherit: i32, name: *const u16) -> HANDLE;
     fn GetModuleHandleW(name: *const u16) -> HMODULE;
 }
 
@@ -160,18 +161,49 @@ pub enum Event {
     TaskbarCreated,
 }
 
-/// True when this is the only running copy. The mutex lives as long as the process.
+/// The instance mutex this copy holds, once `claim_single_instance` has taken it.
+static INSTANCE: AtomicIsize = AtomicIsize::new(0);
+
+/// True when this is the only running copy. The mutex is held until `release_single_instance`, or
+/// the end of the process.
 pub fn claim_single_instance() -> bool {
     let name = wide(MUTEX);
     unsafe {
         let handle = CreateMutexW(null(), 0, name.as_ptr());
         // Without a mutex there is no way to tell; running is better than refusing to start.
-        if handle.is_null() || GetLastError() != ERROR_ALREADY_EXISTS {
+        if handle.is_null() {
+            return true;
+        }
+        if GetLastError() != ERROR_ALREADY_EXISTS {
+            INSTANCE.store(handle as isize, Ordering::Relaxed);
             return true;
         }
         // Ours would keep the mutex alive after the running copy has gone.
         CloseHandle(handle);
         false
+    }
+}
+
+/// Lets go of the instance mutex once the agent window is gone, so a launch made while this copy
+/// finishes exiting starts at once instead of waiting for the process to end.
+pub fn release_single_instance() {
+    let handle = INSTANCE.swap(0, Ordering::Relaxed);
+    if handle != 0 {
+        unsafe { CloseHandle(handle as HANDLE) };
+    }
+}
+
+/// Whether a mutex called `name` exists, that is, whether some copy still holds the instance slot.
+fn mutex_exists(name: &[u16]) -> bool {
+    // SYNCHRONIZE: the least access that opens a mutex.
+    const SYNCHRONIZE: u32 = 0x0010_0000;
+    unsafe {
+        let handle = OpenMutexW(SYNCHRONIZE, 0, name.as_ptr());
+        if handle.is_null() {
+            return false;
+        }
+        CloseHandle(handle);
+        true
     }
 }
 
@@ -181,16 +213,27 @@ pub enum Forwarded {
     Taken,
     /// It is quitting; this launch should wait for it to go and then run itself.
     Closing,
+    /// It went (its window and then its mutex are gone): this launch should claim the slot again.
+    Gone,
 }
 
 /// Hands `intent` to the copy that is already running, waiting up to ~3 s for its window (it may
 /// still be starting) and letting it take the foreground, which this launch was given.
 pub fn forward(intent: &Intent) -> Result<Forwarded, String> {
-    let class = wide(CLASS);
+    forward_to(CLASS, MUTEX, intent)
+}
+
+fn forward_to(class: &str, mutex: &str, intent: &Intent) -> Result<Forwarded, String> {
+    let (class, mutex) = (wide(class), wide(mutex));
     let text: Vec<u16> = intent.encode().encode_utf16().collect();
     for _ in 0..150 {
         let hwnd = unsafe { FindWindowW(class.as_ptr(), null()) };
         if hwnd.is_null() {
+            // No window yet: still starting, or already quitting. Once the mutex is gone too, the
+            // slot is free.
+            if !mutex_exists(&mutex) {
+                return Ok(Forwarded::Gone);
+            }
             std::thread::sleep(std::time::Duration::from_millis(20));
             continue;
         }
@@ -741,6 +784,21 @@ mod tests {
         assert_eq!(Intent::from_args(&["--quit"]), Intent::Quit);
         assert_eq!(Intent::from_args(&["snipscreen:open?id=4&path=x"]), Intent::Show, "a link counts only after --open-link");
         assert_eq!(Intent::from_args(&["--unknown", "--tray"]), Intent::Tray);
+    }
+
+    #[test]
+    fn a_launch_finding_neither_window_nor_mutex_claims_the_slot_again() {
+        // Names of our own, so no running SnipScreen is reached.
+        let (class, mutex) = (format!("SnipScreen.Test.{}", std::process::id()), format!("Local\\SnipScreen.Test.{}", std::process::id()));
+        let started = std::time::Instant::now();
+        assert_eq!(forward_to(&class, &mutex, &Intent::Show), Ok(Forwarded::Gone));
+        assert!(started.elapsed() < Duration::from_millis(500), "no 3 s wait for a window that is never coming");
+        assert!(!mutex_exists(&wide(&mutex)));
+        let held = unsafe { CreateMutexW(null(), 0, wide(&mutex).as_ptr()) };
+        assert!(!held.is_null());
+        assert!(mutex_exists(&wide(&mutex)));
+        unsafe { CloseHandle(held) };
+        assert!(!mutex_exists(&wide(&mutex)), "gone with its last handle");
     }
 
     #[test]
