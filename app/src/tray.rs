@@ -839,7 +839,7 @@ mod tests {
         assert!(rx.try_recv().is_err(), "a cancelled recording reports nothing");
     }
 
-    /// The hook reports to the last agent that started recording (`RECORD_TO`); one test at a time.
+    /// The hook reports to the last agent that started recording (`RECORD_TO`); one recording test at a time.
     static HOOK_TESTS: Mutex<()> = Mutex::new(());
 
     /// Calls the hook as Windows would for a key going down, with SnipScreen in front or not.
@@ -932,5 +932,26 @@ mod tests {
         assert_eq!(press(VK_LWIN as u32, false), 0, "Win reaches the app in front");
         assert_eq!(next(&rx), Event::Recorded(None), "reported as cancelled");
         assert!(!free(), "the shortcut is back");
+    }
+
+    /// Another app takes the shortcut while it is set aside for recording: the shell hears that
+    /// none is in force any more, instead of advertising a dead one.
+    #[test]
+    fn a_shortcut_taken_while_recording_is_reported_lost() {
+        let _hook = HOOK_TESTS.lock().unwrap_or_else(PoisonError::into_inner);
+        let (tx, rx) = channel();
+        let first = obscure(16);
+        let Started { agent, .. } = Agent::start(first, false, move |e| tx.send(e).unwrap()).expect("agent window");
+        agent.record(true);
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        // This thread plays the other app: it grabs the shortcut as soon as the agent lets go.
+        while unsafe { RegisterHotKey(null_mut(), 81, first.mods, first.vk) } == 0 {
+            assert!(std::time::Instant::now() < deadline, "recording should set the shortcut aside");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        agent.record(false);
+        let lost = next(&rx);
+        unsafe { UnregisterHotKey(null_mut(), 81) };
+        assert!(matches!(&lost, Event::HotkeyLost(why) if why.contains("already used by another app")), "{lost:?}");
     }
 }
