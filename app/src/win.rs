@@ -333,7 +333,7 @@ fn write_dib(img: &ColorImage, out: &mut [u8]) {
         return;
     }
     for (src, dst) in img.pixels.chunks_exact(w).rev().zip(rows.chunks_exact_mut(w * 4)) {
-        for (c, d) in src.iter().zip(dst.chunks_exact_mut(4)) {
+        for (c, d) in src.iter().zip(dst.as_chunks_mut::<4>().0) {
             let [r, g, b, a] = c.to_array();
             // Opaque (nearly every pixel of a snip): premultiplied is the colour itself.
             let px = if a == 255 {
@@ -343,7 +343,7 @@ fn write_dib(img: &ColorImage, out: &mut [u8]) {
                 let mix = |v: u8| ((v as u32 * a as u32 + 255 * (255 - a as u32)) / 255) as u8;
                 [mix(b), mix(g), mix(r), 255]
             };
-            d.copy_from_slice(&px);
+            *d = px;
         }
     }
 }
