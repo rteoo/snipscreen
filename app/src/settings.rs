@@ -285,6 +285,14 @@ pub struct Loaded {
     pub path: Option<PathBuf>,
 }
 
+impl Loaded {
+    /// The file is there but couldn't be read: what it says is unknown, so nothing it governs
+    /// outside the app (the sign-in entry) should be changed from the defaults.
+    pub fn unreadable(&self) -> bool {
+        self.existed && self.path.is_none()
+    }
+}
+
 pub fn path() -> Option<PathBuf> {
     crate::win::roaming_app_data_dir().map(|d| d.join("SnipScreen").join("settings.ini"))
 }
@@ -469,6 +477,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!((loaded.settings.auto_save, loaded.settings.delay), (false, 5));
         assert_eq!(loaded.path, Some(path), "still saved to");
+        assert!(!loaded.unreadable());
+        assert!(!load_from(dir.join("missing.ini")).unreadable(), "a first run has nothing to protect");
     }
 
     #[test]
@@ -484,6 +494,7 @@ mod tests {
         drop(lock);
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(loaded.path, None, "saving is off for the session");
+        assert!(loaded.unreadable());
         assert!(loaded.problems[0].contains("won't be saved"), "{:?}", loaded.problems);
     }
 

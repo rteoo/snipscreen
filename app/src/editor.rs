@@ -37,6 +37,8 @@ const CANVAS_MARGIN: Vec2 = vec2(32.0, 32.0);
 const SCROLL_ID: &str = "snip_scroll";
 /// Frames spent keeping a new window on its monitor while Windows finishes any rescaling.
 const SETTLE_FRAMES: u8 = 8;
+/// Frames a Save waits for its window's handle (found by title once Windows has made the window).
+const SAVE_WAIT_FRAMES: u8 = 30;
 /// Each further open editor starts this many pixels down and right of the last, so none hides another.
 const CASCADE: i32 = 28;
 
@@ -244,6 +246,9 @@ pub struct Snip {
     key_zoom: f32,
     /// The rest of the text being typed, while `drawing` is text.
     draft: Draft,
+    /// Text was placed with an input method's composition in it; the editor cancels the composition
+    /// the input method still holds, so it isn't committed a second time.
+    ime_taken: bool,
 }
 
 pub enum Content {
@@ -282,6 +287,8 @@ pub struct Editor {
     closed: bool,
     /// A Save is under way (its dialog is open or its file is being written).
     saving: Arc<AtomicBool>,
+    /// Frames left to wait for this window's handle before a Save asked for too early gives up.
+    save_waiting: u8,
 }
 
 /// Clears its flag when dropped, however the worker holding it ends.
@@ -295,7 +302,7 @@ impl Drop for Busy {
 
 impl Snip {
     pub fn new(image: ColorImage, tools: Tools) -> Self {
-        Self { doc: Doc::new(image), tools, texture: None, drawing: None, erase_marked: false, crop: None, crop_drag: None, zoom: None, key_zoom: 1.0, draft: Draft::default() }
+        Self { doc: Doc::new(image), tools, texture: None, drawing: None, erase_marked: false, crop: None, crop_drag: None, zoom: None, key_zoom: 1.0, draft: Draft::default(), ime_taken: false }
     }
 
     /// The picture with its ink, as it would be copied or saved. The canvas texture already holds
@@ -333,7 +340,7 @@ impl Snip {
 
     /// Places the text being typed, if it has anything in it.
     fn finish_text(&mut self) {
-        if let (Some(m), Some(canvas)) = (placeable(self.drawing.take()), self.texture.as_mut()) {
+        if let (Some(m), Some(canvas)) = (take_typed(&mut self.drawing, &mut self.draft, &mut self.ime_taken), self.texture.as_mut()) {
             canvas.commit(&mut self.doc, m);
         }
     }
@@ -356,6 +363,21 @@ impl Snip {
         }
         step_history(&mut self.doc, &mut self.crop, &mut self.drawing, redo);
         self.crop_drag = None;
+    }
+
+    /// Whether Undo has something to take back: the text being typed (undoing past its start drops
+    /// it), or the snip's own history.
+    fn can_undo(&self) -> bool {
+        self.typing() || self.doc.can_undo()
+    }
+
+    /// Whether Redo has something to bring back, from the same history `step` would use.
+    fn can_redo(&self) -> bool {
+        if self.typing() {
+            !self.draft.redo.is_empty()
+        } else {
+            self.doc.can_redo()
+        }
     }
 
     fn markup_width(&self) -> f32 {
@@ -407,10 +429,10 @@ impl Snip {
             }
         }
         divider(ui);
-        if icon_button(ui, Icon::Undo, None, false, self.doc.can_undo(), "Undo (Ctrl+Z)").clicked() {
+        if icon_button(ui, Icon::Undo, None, false, self.can_undo(), "Undo (Ctrl+Z)").clicked() {
             self.step(false);
         }
-        if icon_button(ui, Icon::Redo, None, false, self.doc.can_redo(), "Redo (Ctrl+Y)").clicked() {
+        if icon_button(ui, Icon::Redo, None, false, self.can_redo(), "Redo (Ctrl+Y)").clicked() {
             self.step(true);
         }
     }
@@ -458,7 +480,7 @@ impl Snip {
 
     fn canvas(&mut self, ui: &mut egui::Ui, guard: &PopupClickGuard) {
         let ctx = ui.ctx().clone();
-        let Snip { doc, tools, texture, drawing, erase_marked, crop, crop_drag, zoom: zoom_choice, key_zoom, draft } = self;
+        let Snip { doc, tools, texture, drawing, erase_marked, crop, crop_drag, zoom: zoom_choice, key_zoom, draft, ime_taken } = self;
         let canvas = texture.get_or_insert_with(|| CanvasTex::new(&ctx, doc));
         canvas.sync(doc);
 
@@ -581,7 +603,7 @@ impl Snip {
                     if resp.clicked() {
                         if let Some(p) = pointer {
                             // A click places the text being typed and starts new text there, its first line centred on the click.
-                            if let Some(m) = placeable(drawing.take()) {
+                            if let Some(m) = take_typed(drawing, draft, ime_taken) {
                                 canvas.commit(doc, m);
                             }
                             let mut t = Text { text: String::new(), color: tools.text.0, size: tools.text.1 * k, outline: tools.text_outline, pos: to_px(p) };
@@ -599,27 +621,10 @@ impl Snip {
                             (t.size, draft.size_pt) = (tools.text.1 * k, tools.text.1);
                         }
                         if type_into(&ctx, &mut t.text, draft) {
-                            if let Some(m) = placeable(drawing.take()) {
+                            if let Some(m) = take_typed(drawing, draft, ime_taken) {
                                 canvas.commit(doc, m);
                             }
                         }
-                    }
-                    if let Some(Mark::Text(t)) = drawing.as_ref() {
-                        let line = t.line_height() / k;
-                        let typed = to_pt(t.caret());
-                        // An input method's composition shows after the text, underlined, until it is committed.
-                        let end = if draft.preedit.is_empty() { typed } else { to_pt(with_preedit(t, &draft.preedit).caret()) };
-                        if end != typed {
-                            let under = vec2(0.0, line * 0.92);
-                            painter.line_segment([typed + under, end + under], (1.5, t.color));
-                        }
-                        let caret = [end, end + vec2(0.0, line)];
-                        painter.line_segment(caret, (3.0, t.halo_color()));
-                        painter.line_segment(caret, (1.5, t.color));
-                        // Turns the window's input method on and tells it where the text is.
-                        let rect = Rect::from_min_max(to_pt(t.pos), end + vec2(1.0, line));
-                        let cursor_rect = Rect::from_min_size(end, vec2(1.0, line));
-                        ctx.output_mut(|o| o.ime = Some(egui::output::IMEOutput { purpose: egui::IMEPurpose::Normal, rect, cursor_rect, should_interrupt_composition: false }));
                     }
                 }
                 Tool::Eraser => {
@@ -647,13 +652,40 @@ impl Snip {
             }
             // An erase above changed the doc after the first sync: show it in this same frame.
             canvas.sync(doc);
-            if drawing.is_some() {
-                canvas.own_picture();
+            // A pen or highlighter press always ends in a mark, a click too, so the copy starts then.
+            let pressing_ink = resp.is_pointer_button_down_on() && matches!(tools.tool, Tool::Pen | Tool::Highlighter) && crop.is_none();
+            if drawing.is_some() || pressing_ink {
+                canvas.own_picture(drawing.is_some());
+            } else if !resp.is_pointer_button_down_on() {
+                // A copy started for a press that drew nothing (it only closed a popup) isn't kept.
+                canvas.copying = None;
             }
+            // The tiles of the snip inside the scroll area's view this frame.
+            let mut visible = Tiles::new(doc.size());
+            visible.add(Rect::from_min_max(to_px(ui.clip_rect().min), to_px(ui.clip_rect().max)).expand(1.0));
             match drawing {
-                Some(Mark::Text(t)) if !draft.preedit.is_empty() => canvas.show_live(&Mark::Text(with_preedit(t, &draft.preedit))),
-                Some(m) => canvas.show_live(m),
+                Some(Mark::Text(t)) if !draft.preedit.is_empty() => canvas.show_live(&Mark::Text(with_preedit(t, &draft.preedit)), &visible),
+                Some(m) => canvas.show_live(m, &visible),
                 None => canvas.clear_live(),
+            }
+            if let Some(Mark::Text(t)) = drawing.as_ref() {
+                let line = t.line_height() / k;
+                // From the text's raster, laid out already, rather than laying out a long paste again.
+                let live = canvas.live.text.as_ref();
+                let typed = to_pt(live.map_or_else(|| t.caret(), |r| r.caret_at(t.text.len())));
+                // An input method's composition shows after the text, underlined, until it is committed.
+                let end = if draft.preedit.is_empty() { typed } else { to_pt(live.map_or_else(|| with_preedit(t, &draft.preedit).caret(), |r| r.caret())) };
+                if end != typed {
+                    let under = vec2(0.0, line * 0.92);
+                    painter.line_segment([typed + under, end + under], (1.5, t.color));
+                }
+                let caret = [end, end + vec2(0.0, line)];
+                painter.line_segment(caret, (3.0, t.halo_color()));
+                painter.line_segment(caret, (1.5, t.color));
+                // Turns the window's input method on and tells it where the text is.
+                let rect = Rect::from_min_max(to_pt(t.pos), end + vec2(1.0, line));
+                let cursor_rect = Rect::from_min_size(end, vec2(1.0, line));
+                ctx.output_mut(|o| o.ime = Some(egui::output::IMEOutput { purpose: egui::IMEPurpose::Normal, rect, cursor_rect, should_interrupt_composition: false }));
             }
         });
         zoom_badge(ui.painter(), view_rect, zoom);
@@ -683,6 +715,7 @@ impl Editor {
             new_requested: false,
             closed: false,
             saving: Arc::default(),
+            save_waiting: 0,
         }
     }
 
@@ -720,6 +753,7 @@ impl Editor {
             }
         }
         self.attach_title_bar(&ctx);
+        self.retry_save(&ctx);
         self.settle_window(&ctx);
         self.popup_guard.begin_frame(&ctx);
         self.shortcuts(&ctx);
@@ -735,6 +769,15 @@ impl Editor {
         });
         if let Some(msg) = widgets::live_note(&mut self.note, &ctx) {
             widgets::toast(&ctx, &msg, video_top);
+        }
+        let ime_taken = match &mut self.content {
+            Content::Snip(s) => std::mem::take(&mut s.ime_taken),
+            Content::Video(_) => false,
+        };
+        if ime_taken {
+            if let Some(hwnd) = self.own_hwnd() {
+                win::cancel_ime_composition(hwnd);
+            }
         }
     }
 
@@ -760,9 +803,20 @@ impl Editor {
         ctx.request_repaint();
     }
 
-    /// Owner for dialogs: this window, or the shell's until this one is found.
-    fn owner(&mut self) -> HWND {
-        self.own_hwnd().unwrap_or(self.root_hwnd as HWND)
+    /// A Save asked for before this window's handle was known runs once it is.
+    fn retry_save(&mut self, ctx: &egui::Context) {
+        if self.save_waiting == 0 {
+            return;
+        }
+        self.save_waiting -= 1;
+        if self.own_hwnd().is_some() {
+            self.save_waiting = 0;
+            self.save_as(ctx);
+        } else if self.save_waiting == 0 {
+            self.say("Couldn't open Save: this window isn't ready. Try again in a moment".into());
+        } else {
+            ctx.request_repaint();
+        }
     }
 
     /// First frames only: move to the chosen corner, then keep the window inside its monitor once
@@ -919,6 +973,13 @@ impl Editor {
     /// takes a moment to encode, a long recording a moment to copy. A second Save while one is under
     /// way is ignored.
     fn save_as(&mut self, ctx: &egui::Context) {
+        // The dialog is modal to its owner, which must be this window: owned by the shell's, on
+        // another thread's terms, it would block the home window or the recording bar instead.
+        let Some(owner) = self.own_hwnd() else {
+            self.save_waiting = SAVE_WAIT_FRAMES;
+            ctx.request_repaint();
+            return;
+        };
         if self.saving.swap(true, Ordering::AcqRel) {
             return;
         }
@@ -927,13 +988,17 @@ impl Editor {
             snip.finish_text();
         }
         // Window handles are plain numbers to Windows; this one is only used to own the dialog.
-        let (owner, report) = (self.owner() as isize, self.notifier(ctx));
+        let (owner, report) = (owner as isize, self.notifier(ctx));
         let job: Box<dyn FnOnce() + Send> = match &self.content {
             Content::Snip(snip) => {
                 let (start, name, image) = (win::pictures_dir().map(|d| d.join("Screenshots")), format!("Snip {}", win::timestamp()), snip.flattened());
                 Box::new(move || {
                     let _busy = busy;
-                    let Some(path) = win::ask_save_path(owner as HWND, start.as_deref(), &name, ("PNG image", "png")) else { return };
+                    let path = match win::ask_save_path(owner as HWND, start.as_deref(), &name, ("PNG image", "png")) {
+                        Ok(Some(path)) => path,
+                        Ok(None) => return,
+                        Err(e) => return report.send(format!("Couldn't save: {e}")),
+                    };
                     let png = win::encode_png(&image);
                     // Let go of the picture once it is encoded, so the editor's next mark needn't copy it.
                     drop(image);
@@ -946,7 +1011,11 @@ impl Editor {
                 let from = v.path.clone();
                 Box::new(move || {
                     let _busy = busy;
-                    let Some(path) = win::ask_save_path(owner as HWND, start.as_deref(), &name, ("MP4 video", "mp4")) else { return };
+                    let path = match win::ask_save_path(owner as HWND, start.as_deref(), &name, ("MP4 video", "mp4")) {
+                        Ok(Some(path)) => path,
+                        Ok(None) => return,
+                        Err(e) => return report.send(format!("Couldn't save: {e}")),
+                    };
                     report.send(saved_note(&path, std::fs::copy(&from, &path).map(|_| ()).map_err(|e| e.to_string())));
                 })
             }
@@ -1046,6 +1115,11 @@ impl Editors {
 
     pub fn is_empty(&self) -> bool {
         self.slots.is_empty()
+    }
+
+    /// Whether window `id` is still open.
+    pub fn contains(&self, id: ViewportId) -> bool {
+        self.slots.iter().any(|s| s.id == id)
     }
 
     #[cfg(test)]
@@ -1271,13 +1345,27 @@ struct Live {
     /// The pixels the texture shows in each live tile (by tile index), so a commit burns them into
     /// `shown` as they are instead of painting the mark again.
     patches: HashMap<usize, Vec<Color32>>,
+    /// Tiles out of view whose texture is behind: they should show the text being typed (those in
+    /// `tiles`) or the picture (the rest). Brought up to date as they come into view, a few at a
+    /// time on frames where the text doesn't change, and by a commit.
+    pending: Tiles,
 }
 
 impl Live {
     fn new(size: [usize; 2]) -> Self {
-        Self { tiles: Tiles::new(size), done: 0, last: None, text: None, patches: HashMap::new() }
+        Self { tiles: Tiles::new(size), done: 0, last: None, text: None, patches: HashMap::new(), pending: Tiles::new(size) }
+    }
+
+    /// Every tile whose texture differs from the picture or is behind.
+    fn touched(&self) -> Tiles {
+        let mut t = self.tiles.clone();
+        t.union(&self.pending);
+        t
     }
 }
+
+/// Time a frame on which the text being typed didn't change spends on its tiles out of view.
+const PENDING_BUDGET: std::time::Duration = std::time::Duration::from_millis(4);
 
 impl CanvasTex {
     /// The canvas for `doc`, flattened in full.
@@ -1291,10 +1379,13 @@ impl CanvasTex {
     /// Makes sure `shown` will be this canvas's own when the mark being drawn is burned into it. Until
     /// the first mark it is the doc's bare picture (which undo needs untouched), and a copy or save
     /// worker may still hold it; copying 33 MB of 4K picture then would stall the mouse-up, so the copy
-    /// is made on a worker while the mark is drawn and adopted once it is ready.
-    fn own_picture(&mut self) {
+    /// is made on a worker from the press on (a click is a mark too) and adopted once it is ready, if
+    /// `adopt` (a mark is being drawn).
+    fn own_picture(&mut self, adopt: bool) {
         if self.copying.is_some() {
-            self.adopt_copy();
+            if adopt {
+                self.adopt_copy(false);
+            }
         } else if Arc::strong_count(&self.shown) > 1 {
             let (tx, rx) = channel();
             let from = self.shown.clone();
@@ -1306,10 +1397,12 @@ impl CanvasTex {
         }
     }
 
-    /// Takes the copy `own_picture` started, if it is ready and still of the picture shown.
-    fn adopt_copy(&mut self) {
+    /// Takes the copy `own_picture` started, if it is ready (or, with `wait`, once it is: it is
+    /// already under way, and sooner done than a copy made from scratch) and still of the picture shown.
+    fn adopt_copy(&mut self, wait: bool) {
         if let Some((from, rx)) = &self.copying {
-            match rx.try_recv() {
+            let copy = if wait { rx.recv().map_err(|_| std::sync::mpsc::TryRecvError::Disconnected) } else { rx.try_recv() };
+            match copy {
                 Ok(copy) => {
                     if Arc::ptr_eq(from, &self.shown) {
                         self.shown = Arc::new(copy);
@@ -1332,7 +1425,7 @@ impl CanvasTex {
         }
         if self.rev.0 == rev.0 {
             let mut tiles = doc.changed_tiles(&self.burned);
-            tiles.union(&self.live.tiles);
+            tiles.union(&self.live.touched());
             let shown = Arc::make_mut(&mut self.shown);
             for (r, patch) in doc.render_runs(&tiles) {
                 markup::paste(shown, &patch, r.pos());
@@ -1400,8 +1493,8 @@ impl CanvasTex {
         if current {
             let mut tiles = Tiles::new(size);
             m.footprint(&mut tiles);
-            // Takes the copy made while the mark was drawn if it is ready; otherwise `make_mut` copies here.
-            self.adopt_copy();
+            // Takes the copy made while the mark was drawn; without one `make_mut` copies here.
+            self.adopt_copy(true);
             self.copying = None;
             let shown = Arc::make_mut(&mut self.shown);
             let cols = size[0].div_ceil(markup::TILE);
@@ -1420,8 +1513,8 @@ impl CanvasTex {
                 markup::paste(shown, &patch, r.pos());
                 self.tex.set_partial(r.pos(), patch);
             }
-            // Live tiles the mark no longer reaches go back to the picture.
-            let stale = self.live.tiles.minus(&tiles);
+            // Live tiles the mark no longer reaches go back to the picture, as do tiles left behind.
+            let stale = self.live.touched().minus(&tiles);
             self.upload(&stale, None);
         }
         match raster.into_text() {
@@ -1439,7 +1532,7 @@ impl CanvasTex {
     /// reach are repainted; text is repainted where its changed letters are; a shape is repainted
     /// where it is now; and the tiles a mark has left go back to the picture. Nothing is redone while
     /// the mark stays the same.
-    fn show_live(&mut self, m: &Mark) {
+    fn show_live(&mut self, m: &Mark, visible: &Tiles) {
         let size = self.shown.size;
         let mut fresh = Tiles::new(size);
         let mut covered = Tiles::new(size);
@@ -1459,24 +1552,32 @@ impl CanvasTex {
                 return;
             }
             Mark::Text(t) => {
-                let text = match self.live.text.take() {
-                    Some(text) if text.text() == t => {
-                        self.live.text = Some(text);
-                        return;
-                    }
+                let (text, changed) = match self.live.text.take() {
+                    Some(text) if text.text() == t => (text, false),
                     // Typing changes a letter at a time: only the changed letters' tiles are repainted.
                     Some(mut text) => {
                         text.retext(t, &mut fresh);
-                        text
+                        (text, true)
                     }
                     None => {
                         let text = TextRaster::new(t, size);
                         fresh.add(text.bounds());
-                        text
+                        (text, true)
                     }
                 };
                 covered.add(text.bounds());
-                markup::Raster::of_text(m, text)
+                let mut raster = markup::Raster::of_text(m, text);
+                // Only the tiles in view are painted now (a size change redoes the whole text, which
+                // on a big block is far more than one frame can paint); the rest wait, out of sight.
+                if changed {
+                    let mut stale = self.live.tiles.minus(&covered);
+                    stale.union(&fresh.intersect(&covered));
+                    self.live.pending.union(&stale);
+                    self.live.tiles = covered;
+                }
+                self.catch_up(&mut raster, visible, !changed);
+                self.live.text = raster.into_text();
+                return;
             }
             Mark::Shape(_) => {
                 if self.live.last.as_ref() == Some(m) {
@@ -1495,10 +1596,47 @@ impl CanvasTex {
         self.live.text = raster.into_text();
     }
 
+    /// Brings the pending tiles in view up to date, and with `idle` some out of view as well, a
+    /// row at a time within `PENDING_BUDGET`; asks for another frame while any are left.
+    fn catch_up(&mut self, raster: &mut markup::Raster, visible: &Tiles, idle: bool) {
+        if self.live.pending.is_empty() {
+            return;
+        }
+        let started = std::time::Instant::now();
+        let now = self.live.pending.intersect(visible);
+        self.refresh(&now, raster);
+        self.live.pending = self.live.pending.minus(&now);
+        if idle {
+            for run in self.live.pending.runs() {
+                if started.elapsed() >= PENDING_BUDGET {
+                    break;
+                }
+                let mut row = Tiles::new(self.shown.size);
+                row.add(run.rect());
+                self.refresh(&row, raster);
+                self.live.pending = self.live.pending.minus(&row);
+            }
+        }
+        // What a pending tile shows is behind, so a commit must not take it as shown.
+        let behind: Vec<usize> = self.live.pending.indices().collect();
+        for idx in behind {
+            self.live.patches.remove(&idx);
+        }
+        if !self.live.pending.is_empty() {
+            self.tex.ctx.request_repaint();
+        }
+    }
+
+    /// Uploads `tiles` as they should be: the live text over the picture where it reaches, the picture elsewhere.
+    fn refresh(&mut self, tiles: &Tiles, raster: &mut markup::Raster) {
+        self.upload(&tiles.minus(&self.live.tiles), None);
+        self.upload(&tiles.intersect(&self.live.tiles), Some(raster));
+    }
+
     /// Puts back the committed picture wherever a cancelled mark was showing.
     fn clear_live(&mut self) {
-        if !self.live.tiles.is_empty() {
-            let tiles = std::mem::replace(&mut self.live.tiles, Tiles::new([0, 0]));
+        let tiles = self.live.touched();
+        if !tiles.is_empty() {
             self.upload(&tiles, None);
         }
         self.live = Live::new(self.shown.size);
@@ -1511,6 +1649,19 @@ fn placeable(m: Option<Mark>) -> Option<Mark> {
         Some(Mark::Text(t)) if !t.text.trim().is_empty() => Some(Mark::Text(t)),
         _ => None,
     }
+}
+
+/// Takes the text being typed to be placed, with an input method's composition, which shows after
+/// it, taken in as if committed: what is placed is what was on screen. Sets `ime_taken` when it did.
+fn take_typed(drawing: &mut Option<Mark>, draft: &mut Draft, ime_taken: &mut bool) -> Option<Mark> {
+    let mut m = drawing.take();
+    if let Some(Mark::Text(t)) = &mut m {
+        if !draft.preedit.is_empty() {
+            t.text.push_str(&std::mem::take(&mut draft.preedit));
+            *ime_taken = true;
+        }
+    }
+    placeable(m)
 }
 
 /// `t` with an input method's uncommitted `preedit` after it, as it shows while composing.
@@ -2451,14 +2602,100 @@ Arc::ptr_eq(&snip.flattened(), &shown), "a current canvas is reused, not re-burn
     }
 
     #[test]
+    fn a_text_size_change_paints_what_is_in_view_and_the_rest_before_it_is_seen() {
+        let ctx = egui::Context::default();
+        let mut snip = Snip::new(gradient(2400, 1600), Tools { tool: Tool::Text, text: (PEN_COLORS[2], 96.0), ..Tools::default() });
+        snip.zoom = Some(1.0);
+        let mut screen = Screen { image: None };
+        canvas_frame(&ctx, &mut snip, &mut screen, vec![]);
+        let at = pos2(60.0, 110.0);
+        canvas_frame(&ctx, &mut snip, &mut screen, vec![Event::PointerMoved(at), pointer(at, true)]);
+        canvas_frame(&ctx, &mut snip, &mut screen, vec![pointer(at, false)]);
+        for line in 0..10 {
+            if line > 0 {
+                canvas_frame(&ctx, &mut snip, &mut screen, vec![key(Key::Enter, Modifiers::SHIFT)]);
+            }
+            canvas_frame(&ctx, &mut snip, &mut screen, vec![Event::Text("A wide line of text".into())]);
+        }
+        let live = |snip: &Snip| {
+            let mut want = snip.doc.flatten();
+            markup::burn(&mut want, snip.drawing.as_ref().expect("typing"));
+            want
+        };
+        let pending = |snip: &Snip| snip.texture.as_ref().unwrap().live.pending.clone();
+        // The 1280x800 view shows the picture from (-16, -16), inside the canvas margin.
+        let in_view = |a: &ColorImage, b: &[Color32]| (0..760).all(|y| a.pixels[y * 2400..y * 2400 + 1240] == b[y * 2400..y * 2400 + 1240]);
+        assert!(in_view(&live(&snip), screen.pixels()), "typing shows exactly what will be placed");
+        let settle = |snip: &mut Snip, screen: &mut Screen| {
+            let mut frames = 0;
+            while !pending(snip).is_empty() {
+                frames += 1;
+                assert!(frames < 500, "frames where the text doesn't change catch up");
+                canvas_frame(&ctx, snip, screen, vec![]);
+            }
+        };
+        settle(&mut snip, &mut screen);
+        assert!(screen.pixels() == live(&snip).pixels, "lines typed out of view too, once typing stops");
+        snip.tools.text.1 = 120.0;
+        canvas_frame(&ctx, &mut snip, &mut screen, vec![]);
+        assert!(!pending(&snip).is_empty(), "the block reaches past the view; that part waits");
+        assert!(in_view(&live(&snip), screen.pixels()), "what is in view is exact at once");
+        settle(&mut snip, &mut screen);
+        assert!(screen.pixels() == live(&snip).pixels, "and then all of it is exact");
+        // Placed right after a size change, with tiles still behind: exactly as saved.
+        snip.tools.text.1 = 80.0;
+        canvas_frame(&ctx, &mut snip, &mut screen, vec![]);
+        assert!(!pending(&snip).is_empty());
+        canvas_frame(&ctx, &mut snip, &mut screen, vec![key(Key::Enter, Modifiers::NONE)]);
+        assert!(snip.drawing.is_none() && snip.doc.marks.len() == 1);
+        assert!(screen.pixels() == snip.doc.flatten().pixels);
+        // A size change, then zooming out to see it all: everything shows as it will be placed.
+        canvas_frame(&ctx, &mut snip, &mut screen, vec![Event::PointerMoved(at), pointer(at, true)]);
+        canvas_frame(&ctx, &mut snip, &mut screen, vec![pointer(at, false)]);
+        canvas_frame(&ctx, &mut snip, &mut screen, vec![Event::Text("Another\nblock of text that runs well past the view on the right".into())]);
+        snip.tools.text.1 = 160.0;
+        canvas_frame(&ctx, &mut snip, &mut screen, vec![]);
+        snip.zoom = None;
+        canvas_frame(&ctx, &mut snip, &mut screen, vec![]);
+        assert!(pending(&snip).is_empty(), "in view now, so painted now");
+        assert!(screen.pixels() == live(&snip).pixels);
+    }
+
+    #[test]
+    fn a_click_dot_takes_the_copy_started_at_the_press() {
+        let ctx = egui::Context::default();
+        let mut snip = Snip::new(gradient(300, 200), Tools::default());
+        let mut screen = Screen { image: None };
+        canvas_frame(&ctx, &mut snip, &mut screen, vec![]);
+        let at = pos2(640.0, 400.0);
+        canvas_frame(&ctx, &mut snip, &mut screen, vec![Event::PointerMoved(at), pointer(at, true)]);
+        assert!(snip.texture.as_ref().unwrap().copying.is_some(), "the copy starts on the press, before egui knows it's a click");
+        canvas_frame(&ctx, &mut snip, &mut screen, vec![pointer(at, false)]);
+        let canvas = snip.texture.as_ref().unwrap();
+        assert!(canvas.copying.is_none() && !Arc::ptr_eq(&canvas.shown, &snip.doc.image));
+        assert_eq!(snip.doc.marks.len(), 1, "the click drew a dot");
+        assert!(screen.pixels() == snip.doc.flatten().pixels);
+        assert_eq!(*snip.doc.image, gradient(300, 200), "the doc's picture is untouched");
+        // A press with a tool that draws nothing on a click starts no copy.
+        let mut snip = Snip::new(gradient(300, 200), Tools { tool: Tool::Shape, ..Tools::default() });
+        canvas_frame(&ctx, &mut snip, &mut screen, vec![]);
+        canvas_frame(&ctx, &mut snip, &mut screen, vec![Event::PointerMoved(at), pointer(at, true)]);
+        assert!(snip.texture.as_ref().unwrap().copying.is_none());
+        canvas_frame(&ctx, &mut snip, &mut screen, vec![pointer(at, false)]);
+        assert!(Arc::ptr_eq(&snip.texture.as_ref().unwrap().shown, &snip.doc.image), "nothing drawn, nothing copied");
+    }
+
+    #[test]
     fn a_second_save_while_one_is_under_way_is_ignored() {
         let ctx = egui::Context::default();
         let fresh = Snip::new(white(10, 10), Tools::default());
         let mut ed = Editor::new(Content::Snip(Box::new(fresh)), "t".into(), ViewportId::ROOT, 0, None, Default::default(), MIN_EDIT_W);
         // As if a Save dialog were open: another Save must return at once and open nothing.
+        ed.hwnd = Some(1);
         ed.saving.store(true, Ordering::Release);
         ed.save_as(&ctx);
         assert!(ed.saving.load(Ordering::Acquire), "the first save still owns the flag");
+        assert_eq!(ed.save_waiting, 0);
         // The worker frees it however it ends, a panic included.
         let busy = Busy(ed.saving.clone());
         let _ = std::thread::spawn(move || {
@@ -2467,6 +2704,23 @@ Arc::ptr_eq(&snip.flattened(), &shown), "a current canvas is reused, not re-burn
         })
         .join();
         assert!(!ed.saving.load(Ordering::Acquire), "a new Save can start");
+    }
+
+    #[test]
+    fn a_save_before_the_window_is_found_waits_for_it_and_never_borrows_the_shells() {
+        let ctx = egui::Context::default();
+        let fresh = Snip::new(white(10, 10), Tools::default());
+        let mut ed = Editor::new(Content::Snip(Box::new(fresh)), "no window has this title 7f3a".into(), ViewportId::ROOT, 0, None, Default::default(), MIN_EDIT_W);
+        ed.save_as(&ctx);
+        assert!(!ed.saving.load(Ordering::Acquire), "no dialog yet: there is no window of its own to own it");
+        assert_eq!(ed.save_waiting, SAVE_WAIT_FRAMES);
+        for _ in 0..SAVE_WAIT_FRAMES {
+            assert!(ed.note.is_none());
+            ed.retry_save(&ctx);
+        }
+        assert_eq!(ed.save_waiting, 0);
+        assert!(!ed.saving.load(Ordering::Acquire));
+        assert!(ed.note.is_some(), "giving up says so");
     }
 
     #[test]
@@ -2553,6 +2807,47 @@ Arc::ptr_eq(&snip.flattened(), &shown), "a current canvas is reused, not re-burn
         shortcut(&ctx, &mut ed, Key::Z, Modifiers::COMMAND);
         assert_eq!(draft_text(&mut ed), None, "Ctrl+Z on the empty draft cancels it");
         assert!(snip_of(&mut ed).doc.marks.is_empty(), "and never touched the snip's own history");
+    }
+
+    #[test]
+    fn placing_text_mid_composition_keeps_what_the_input_method_showed() {
+        let (ctx, mut ed, mut screen) = typing("Hi ");
+        canvas_frame(&ctx, snip_of(&mut ed), &mut screen, vec![Event::Ime(egui::ImeEvent::Preedit { text: "にほ".into(), active_range_chars: None })]);
+        let shown = screen.pixels();
+        // Switching tools places the text, as copy and save do.
+        snip_of(&mut ed).finish_text();
+        let snip = snip_of(&mut ed);
+        assert!(matches!(&*snip.doc.marks[0], Mark::Text(t) if t.text == "Hi にほ"), "the composition is placed with it");
+        assert!(snip.ime_taken && snip.draft.preedit.is_empty(), "and the input method is told to drop its copy");
+        assert!(snip.doc.flatten().pixels == shown, "exactly as it showed");
+        // A click elsewhere places it too, then starts new text there without the composition.
+        let (ctx, mut ed, mut screen) = typing("Hi ");
+        canvas_frame(&ctx, snip_of(&mut ed), &mut screen, vec![Event::Ime(egui::ImeEvent::Preedit { text: "にほ".into(), active_range_chars: None })]);
+        let at = pos2(100.0, 100.0);
+        canvas_frame(&ctx, snip_of(&mut ed), &mut screen, vec![Event::PointerMoved(at), pointer(at, true)]);
+        canvas_frame(&ctx, snip_of(&mut ed), &mut screen, vec![pointer(at, false)]);
+        assert!(matches!(&*snip_of(&mut ed).doc.marks[0], Mark::Text(t) if t.text == "Hi にほ"));
+        assert_eq!(draft_text(&mut ed).as_deref(), Some(""));
+        assert!(snip_of(&mut ed).draft.preedit.is_empty());
+    }
+
+    #[test]
+    fn undo_and_redo_buttons_follow_the_text_being_typed() {
+        let (ctx, mut ed, _) = typing("one two");
+        let buttons = |ed: &mut Editor| {
+            let s = snip_of(ed);
+            (s.can_undo(), s.can_redo())
+        };
+        assert!(!snip_of(&mut ed).doc.can_undo(), "the snip itself has nothing to undo yet");
+        assert_eq!(buttons(&mut ed), (true, false), "undo takes back typing; nothing to redo");
+        shortcut(&ctx, &mut ed, Key::Z, Modifiers::COMMAND);
+        assert_eq!(buttons(&mut ed), (true, true));
+        shortcut(&ctx, &mut ed, Key::Y, Modifiers::COMMAND);
+        assert_eq!(buttons(&mut ed), (true, false));
+        // A placed mark redone by the snip's history doesn't light Redo while new text is typed.
+        snip_of(&mut ed).finish_text();
+        snip_of(&mut ed).step(false);
+        assert_eq!(buttons(&mut ed), (false, true), "back on the snip's own history");
     }
 
     #[test]
@@ -2745,8 +3040,30 @@ Arc::ptr_eq(&snip.flattened(), &shown), "a current canvas is reused, not re-burn
             slider.push(bench_frame(&ctx, &mut snip, vec![]));
         }
         stats("type: size slider frame (12 lines)", &slider);
+        // The tiles out of view catch up on the frames after the slider stops, before Enter.
+        let mut catch_up = Vec::new();
+        while !snip.texture.as_ref().is_some_and(|c| c.live.pending.is_empty()) {
+            catch_up.push(bench_frame(&ctx, &mut snip, vec![]));
+        }
+        stats("type: catch-up frame after the slider", &catch_up);
         let commit = bench_frame(&ctx, &mut snip, vec![key(Key::Enter, Modifiers::NONE)]);
         stats("type: Enter places the 12-line block", &[commit]);
+
+        // A 100k-character paste (lines of 80), then typing after it.
+        let ctx = egui::Context::default();
+        let mut snip = Snip::new(gradient(3840, 2160), Tools { tool: Tool::Text, ..Tools::default() });
+        snip.zoom = Some(1.0);
+        bench_frame(&ctx, &mut snip, vec![]);
+        bench_frame(&ctx, &mut snip, vec![Event::PointerMoved(at), pointer(at, true)]);
+        bench_frame(&ctx, &mut snip, vec![pointer(at, false)]);
+        let line = format!("{}
+", "pasted log line 0123456789 ".repeat(3).chars().take(79).collect::<String>());
+        let paste = bench_frame(&ctx, &mut snip, vec![Event::Paste(line.repeat(100_000 / line.len()))]);
+        stats("paste: 100k characters", &[paste]);
+        let typed: Vec<f64> = "typing after it".chars().map(|ch| bench_frame(&ctx, &mut snip, vec![Event::Text(ch.to_string())])).collect();
+        stats("paste: keystroke after 100k characters", &typed);
+        let back: Vec<f64> = (0..5).map(|_| bench_frame(&ctx, &mut snip, vec![key(Key::Backspace, Modifiers::NONE)])).collect();
+        stats("paste: backspace after 100k characters", &back);
 
         // Highlighter drag across the whole snip at fit zoom.
         let ctx = egui::Context::default();

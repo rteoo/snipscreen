@@ -248,44 +248,68 @@ impl Text {
         }
     }
 
-    /// Lays the text out: calls `glyph(id, x, baseline)` for every character the font has, then
-    /// returns the end of the last line (the caret's spot, on the top of that line). A character
-    /// the font lacks (an emoji, CJK) is skipped and takes no room, so nothing draws a box for it.
-    fn lay_out(&self, font: &skrifa::FontRef, mut glyph: impl FnMut(skrifa::GlyphId, f32, f32)) -> Pos2 {
+    /// Lays the text out from `from` (the start, or a checkpoint of an earlier layout of a text
+    /// with the same letters up to there) to byte `upto`: tells `step` of every character the font
+    /// has and of a checkpoint every `CHECKPOINT_CHARS` characters, then returns the end of the last
+    /// line (the caret's spot, on the top of that line). A character the font lacks (an emoji, CJK)
+    /// is skipped and takes no room, so nothing draws a box for it. Resuming from a checkpoint gives
+    /// exactly the positions a whole layout gives.
+    fn lay_out(&self, font: &skrifa::FontRef, from: Pen, upto: usize, mut step: impl FnMut(Step)) -> Pos2 {
         let lm = self.line_metrics(font);
         let charmap = font.charmap();
         let advances = font.glyph_metrics(skrifa::instance::Size::new(self.size), skrifa::instance::LocationRef::default());
-        let mut end = self.pos;
-        for (i, line) in self.text.split('\n').enumerate() {
-            let top = self.pos.y + i as f32 * lm.height;
-            let mut x = self.pos.x;
-            for id in line.chars().filter_map(|ch| charmap.map(ch)) {
-                glyph(id, x, top + lm.ascent);
-                x += advances.advance_width(id).unwrap_or(0.0);
+        let mut pen = from;
+        for (i, ch) in self.text[from.byte..upto].char_indices() {
+            if pen.chars.is_multiple_of(CHECKPOINT_CHARS) && pen.chars > from.chars {
+                step(Step::Mark(Pen { byte: from.byte + i, ..pen }));
             }
-            end = Pos2::new(x, top);
+            pen.chars += 1;
+            if ch == '\n' {
+                (pen.line, pen.x) = (pen.line + 1, self.pos.x);
+            } else if let Some(id) = charmap.map(ch) {
+                step(Step::Glyph(id, pen.x, self.pos.y + pen.line as f32 * lm.height + lm.ascent));
+                pen.x += advances.advance_width(id).unwrap_or(0.0);
+            }
         }
-        end
+        Pos2::new(pen.x, self.pos.y + pen.line as f32 * lm.height)
     }
 
     /// Where the caret goes: after the last letter, at the top of its line.
     pub fn caret(&self) -> Pos2 {
-        Self::font().map_or(self.pos, |f| self.lay_out(&f, |_, _, _| {}))
+        Self::font().map_or(self.pos, |f| self.lay_out(&f, Pen::start(self), self.text.len(), |_| {}))
     }
 
     /// Every glyph that draws something, flattened and placed, in reading order.
     fn placed(&self) -> Vec<Placed> {
-        let mut out = Vec::new();
-        let Some(font) = Self::font() else { return out };
+        let mut layout = Layout::default();
+        self.place(Pen::start(self), &mut layout);
+        layout.glyphs
+    }
+
+    /// Lays the text out from `from` onto `layout`, which holds what comes before it (nothing, from
+    /// the start): its glyphs that draw something, its checkpoints, their bounds and the caret.
+    fn place(&self, from: Pen, layout: &mut Layout) {
+        let Some(font) = Self::font() else {
+            layout.end = self.pos;
+            return;
+        };
         let halo = self.halo();
         let mut cache = GLYPHS.lock().unwrap_or_else(PoisonError::into_inner);
-        self.lay_out(&font, |id, x, baseline| {
-            let edges = cache.get(&font, id, self.size, halo);
-            if edges.bbox[0] <= edges.bbox[2] {
-                out.push(Placed { edges, at: [fixed(x), fixed(baseline)] });
+        let Layout { glyphs, marks, bounds, end } = layout;
+        *end = self.lay_out(&font, from, self.text.len(), |step| match step {
+            Step::Mark(pen) => marks.push(Checkpoint { pen, glyphs: glyphs.len(), bounds: *bounds }),
+            // Far past any picture (a long pasted line at a big size): left out, as it can't show,
+            // and before its 1/256 px origin outgrows an i32.
+            Step::Glyph(_, x, baseline) if x.abs() > MAX_ORIGIN || baseline.abs() > MAX_ORIGIN => {}
+            Step::Glyph(id, x, baseline) => {
+                let edges = cache.get(&font, id, self.size, halo);
+                if edges.bbox[0] <= edges.bbox[2] {
+                    let g = Placed { edges, at: [fixed(x), fixed(baseline)] };
+                    *bounds = bounds.union(g.rect());
+                    glyphs.push(g);
+                }
             }
         });
-        out
     }
 
     /// Image pixels the text can touch, its halo included.
@@ -294,8 +318,59 @@ impl Text {
     }
 }
 
+/// What `Text::lay_out` comes to: a glyph `(id, x, baseline)`, or a checkpoint.
+enum Step {
+    Glyph(skrifa::GlyphId, f32, f32),
+    Mark(Pen),
+}
+
+/// Characters between layout checkpoints: how far back an edit has to start laying out again.
+const CHECKPOINT_CHARS: usize = 256;
+
+/// Where a layout stands before the character at `byte`: its index, line, and pen position.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Pen {
+    byte: usize,
+    chars: usize,
+    line: usize,
+    x: f32,
+}
+
+impl Pen {
+    fn start(t: &Text) -> Self {
+        Self { byte: 0, chars: 0, line: 0, x: t.pos.x }
+    }
+}
+
+/// A layout's state at a checkpoint: the pen, and the glyphs placed before it and their bounds.
+#[derive(Clone, Copy, Debug)]
+struct Checkpoint {
+    pen: Pen,
+    glyphs: usize,
+    bounds: Rect,
+}
+
+/// A text laid out: the glyphs that draw something, checkpoints to resume from, the glyphs' bounds,
+/// and the end of the text (the caret).
+struct Layout {
+    glyphs: Vec<Placed>,
+    marks: Vec<Checkpoint>,
+    bounds: Rect,
+    end: Pos2,
+}
+
+impl Default for Layout {
+    fn default() -> Self {
+        Self { glyphs: Vec::new(), marks: Vec::new(), bounds: Rect::NOTHING, end: Pos2::ZERO }
+    }
+}
+
 /// Precision of glyph edges: 1/256 of a pixel, as FreeType keeps them.
 const SUB: i32 = 256;
+/// Glyphs placed farther than this many pixels from the picture's corner are dropped. In 1/256 px
+/// it is half of what an i32 holds, which leaves room for the glyph's own edges (well under 1M px
+/// even at the largest text size and zoom).
+const MAX_ORIGIN: f32 = (1 << 22) as f32;
 /// How far a flattened curve may stray from the true one, in pixels (vello's tolerance, which drew text before).
 const FLATNESS: f64 = 0.25;
 
@@ -435,10 +510,14 @@ fn placed_bounds(glyphs: &[Placed]) -> Rect {
     glyphs.iter().fold(Rect::NOTHING, |b, g| b.union(g.rect()))
 }
 
-/// Exact antialiased coverage of closed outlines (nonzero winding) over the pixels of `r`. Each
-/// edge adds whole-number cover and area to the pixel cells it crosses, worked out from its own
-/// end points alone; so a pixel's value never depends on which rectangle is being filled or in
-/// what order edges arrive, and any tile can be rendered on its own, bit for bit as in a whole render.
+/// Antialiased coverage of closed outlines over the pixels of `r`: the area each pixel's signed
+/// winding covers, clamped to full. That is exact nonzero filling wherever no two loops overlap
+/// inside a pixel, as with a glyph's own outline. A stroked halo's loops do overlap (at joins and
+/// tight curves), and a pixel only partly covered there counts the overlap twice, so it can come
+/// out a little more opaque than true nonzero; fully covered pixels are still exact. Each edge adds
+/// whole-number cover and area to the pixel cells it crosses, worked out from its own end points
+/// alone; so a pixel's value never depends on which rectangle is being filled or in what order
+/// edges arrive, and any tile can be rendered on its own, bit for bit as in a whole render.
 struct Coverage {
     r: PxRect,
     /// `[cover, area]` per pixel of `r`, FreeType style.
@@ -533,8 +612,7 @@ struct TextTile {
 /// redoes only the tiles its changed letters reach.
 pub struct TextRaster {
     text: Text,
-    glyphs: Vec<Placed>,
-    bounds: Rect,
+    layout: Layout,
     size: [usize; 2],
     /// Rendered tiles by index (`None`: nothing of the text there).
     tiles: std::collections::HashMap<usize, Option<TextTile>>,
@@ -542,8 +620,9 @@ pub struct TextRaster {
 
 impl TextRaster {
     pub fn new(t: &Text, size: [usize; 2]) -> Self {
-        let glyphs = t.placed();
-        Self { text: t.clone(), bounds: placed_bounds(&glyphs), glyphs, size, tiles: Default::default() }
+        let mut layout = Layout::default();
+        t.place(Pen::start(t), &mut layout);
+        Self { text: t.clone(), layout, size, tiles: Default::default() }
     }
 
     pub fn text(&self) -> &Text {
@@ -552,7 +631,20 @@ impl TextRaster {
 
     /// Image pixels the text can touch.
     pub fn bounds(&self) -> Rect {
-        self.bounds
+        self.layout.bounds
+    }
+
+    /// Where the caret goes after the whole text, as `Text::caret` puts it, without laying it out again.
+    pub fn caret(&self) -> Pos2 {
+        self.layout.end
+    }
+
+    /// Where the caret goes after the text's first `byte` bytes (a char boundary): laid out from the
+    /// checkpoint before it.
+    pub fn caret_at(&self, byte: usize) -> Pos2 {
+        let t = &self.text;
+        let from = self.layout.marks.iter().rev().find(|m| m.pen.byte <= byte).map_or(Pen::start(t), |m| m.pen);
+        Text::font().map_or(t.pos, |f| t.lay_out(&f, from, byte, |_| {}))
     }
 
     /// Renders tiles `tx0..tx1` of tile row `ty` in one pass (every glyph's edges are walked once
@@ -562,7 +654,7 @@ impl TextRaster {
         let (x0, y0, x1, y1) = (r.x0 as i32 * SUB, r.y0 as i32 * SUB, r.x1 as i32 * SUB, r.y1 as i32 * SUB);
         let mut fill = Coverage::new(r);
         let mut halo = self.text.outline.then(|| Coverage::new(r));
-        for g in &self.glyphs {
+        for g in &self.layout.glyphs {
             let b = g.bbox();
             // A glyph wholly left of the span adds no cover to it (its loops are closed), nor does one
             // wholly above, below or right of it.
@@ -600,7 +692,7 @@ impl TextRaster {
     /// Composites the text onto `patch` (top-left image pixel `at`): the halo first, the letters over it.
     pub fn paint(&mut self, patch: &mut ColorImage, at: [usize; 2]) {
         let r = patch_rect(patch, at);
-        let reach = self.bounds.intersect(r.rect());
+        let reach = self.layout.bounds.intersect(r.rect());
         let cols = self.size[0].div_ceil(TILE);
         // Tiles not rendered yet, rendered a row at a time.
         let mut missing: Vec<usize> = tiles_in(reach, self.size).filter(|i| !self.tiles.contains_key(i)).collect();
@@ -635,33 +727,49 @@ impl TextRaster {
     /// Turns this into the raster of `new`, adding to `dirty` the tiles whose pixels can differ. While
     /// only letters at the end change (typing), only the tiles those letters reach are redone.
     pub fn retext(&mut self, new: &Text, dirty: &mut Tiles) {
-        // ceiling: a new size redoes the whole text (~45 ms per size-slider frame for a 12-line 160 px
-        // block on 4K, release); render the visible tiles first if the slider drags on big text.
+        // ceiling: a new size redoes every tile of the text. The editor paints only those in view at
+        // once (~13 ms per slider frame for a 12-line 160 px block at 100% in a 1280x800 view,
+        // release), but at fit zoom all of a big block is in view (~45 ms); show a scaled preview
+        // while the slider moves if dragging it there feels sticky.
         if (self.text.size, self.text.outline, self.text.pos) != (new.size, new.outline, new.pos) {
-            dirty.add(self.bounds);
+            dirty.add(self.layout.bounds);
             *self = TextRaster::new(new, self.size);
-            dirty.add(self.bounds);
+            dirty.add(self.layout.bounds);
             return;
         }
         if self.text.color != new.color {
-            dirty.add(self.bounds);
+            dirty.add(self.layout.bounds);
         }
-        let glyphs = new.placed();
-        let same = self.glyphs.iter().zip(&glyphs).take_while(|(a, b)| a.same(b)).count();
+        // Only what follows the last checkpoint before the first changed letter is laid out again,
+        // so a keystroke after a long paste costs as much as one after a word.
+        let (old, now) = (self.text.text.as_bytes(), new.text.as_bytes());
+        let mut common = old.iter().zip(now).take_while(|(a, b)| a == b).count();
+        while !new.text.is_char_boundary(common) {
+            common -= 1;
+        }
+        let keep = self.layout.marks.partition_point(|m| m.pen.byte <= common);
+        let (from, kept, bounds) = match keep.checked_sub(1).map(|i| self.layout.marks[i]) {
+            Some(m) => (m.pen, m.glyphs, m.bounds),
+            None => (Pen::start(new), 0, Rect::NOTHING),
+        };
+        self.layout.marks.truncate(keep);
+        let before = self.layout.glyphs.split_off(kept);
+        self.layout.bounds = bounds;
+        new.place(from, &mut self.layout);
+        let after = &self.layout.glyphs[kept..];
+        let same = before.iter().zip(after).take_while(|(a, b)| a.same(b)).count();
         let mut changed = Tiles::new(self.size);
-        for g in self.glyphs[same..].iter().chain(&glyphs[same..]) {
+        for g in before[same..].iter().chain(&after[same..]) {
             changed.add(g.rect());
         }
         self.tiles.retain(|&idx, _| !changed.on[idx]);
         dirty.union(&changed);
-        self.bounds = placed_bounds(&glyphs);
-        self.glyphs = glyphs;
         self.text = new.clone();
     }
 
     /// Whether `p` is within `radius` of one of the letters (their halo included).
     fn touches(&self, p: Pos2, radius: f32) -> bool {
-        self.bounds.expand(radius).contains(p) && self.glyphs.iter().any(|g| g.rect().expand(radius).contains(p))
+        self.layout.bounds.expand(radius).contains(p) && self.layout.glyphs.iter().any(|g| g.rect().expand(radius).contains(p))
     }
 }
 
@@ -1166,7 +1274,8 @@ pub struct Doc {
     pub image_rev: u64,
     /// Bumped whenever `marks` change, for the same reason.
     pub ink_rev: u64,
-    /// Rendered text marks by identity, for the picture size `texts_size`. Each entry keeps its mark's
+    /// Rendered text marks by identity, for the picture size `texts_size`: only marks in `marks`, as
+    /// a text's tiles take megabytes and undo history can hold many. Each entry keeps its mark's
     /// allocation alive (`Weak`), so no other mark can take its address while the entry exists.
     texts: std::collections::HashMap<usize, (Weak<Mark>, TextRaster)>,
     texts_size: [usize; 2],
@@ -1253,14 +1362,19 @@ impl Doc {
         }
     }
 
-    /// Drops cached text rasters of marks no version of the list holds any more, and all of them when
-    /// the picture changed size (a raster's tiles are cut to the picture).
+    /// Drops cached text rasters of marks the list doesn't hold now (an undo that brings one back
+    /// renders it again), and all of them when the picture changed size (a raster's tiles are cut
+    /// to the picture).
     fn sync_text_cache(&mut self) {
         if self.texts_size != self.size() {
             self.texts.clear();
             self.texts_size = self.size();
         }
-        self.texts.retain(|_, (m, _)| m.strong_count() > 0);
+        if self.texts.is_empty() {
+            return;
+        }
+        let shown: std::collections::HashSet<usize> = self.marks.iter().filter(|m| matches!(***m, Mark::Text(_))).map(|m| Arc::as_ptr(m) as usize).collect();
+        self.texts.retain(|key, _| shown.contains(key));
     }
 
     fn cached_text(&self, m: &Arc<Mark>) -> Option<&TextRaster> {
@@ -2026,6 +2140,33 @@ mod tests {
     }
 
     #[test]
+    fn a_long_text_relaid_from_its_checkpoints_matches_a_whole_layout() {
+        // Past several checkpoints, with lines, spaces, a letter the font lacks and a multi-byte one.
+        let line = "Pasted line \u{1F600} with é and spaces   ";
+        let long: String = (0..40).map(|i| format!("{i} {line}\n")).collect();
+        let at = |s: &str| Text { text: s.into(), color: Color32::RED, size: 20.0, outline: true, pos: Pos2::new(7.5, 3.25) };
+        let same_layout = |a: &TextRaster, b: &TextRaster| {
+            a.layout.glyphs.len() == b.layout.glyphs.len()
+                && a.layout.glyphs.iter().zip(&b.layout.glyphs).all(|(x, y)| x.same(y))
+                && a.bounds() == b.bounds()
+                && a.caret() == b.caret()
+        };
+        let mut live = TextRaster::new(&at(""), [800, 600]);
+        let cut = long.char_indices().map(|(i, _)| i).nth(5000 % long.chars().count()).unwrap();
+        for s in [long.as_str(), &format!("{long}more"), &format!("{long}mor"), &long[..cut], &long[..long.len() - 1], &long.replacen("17 ", "seventeen ", 1), "", &long] {
+            let mut dirty = Tiles::new([800, 600]);
+            live.retext(&at(s), &mut dirty);
+            let fresh = TextRaster::new(&at(s), [800, 600]);
+            assert!(same_layout(&live, &fresh), "after retyping to {} bytes", s.len());
+            assert_eq!(fresh.caret(), at(s).caret());
+        }
+        assert!(live.layout.marks.len() >= long.chars().count() / CHECKPOINT_CHARS, "checkpoints all along");
+        for b in (0..=long.len()).filter(|&b| long.is_char_boundary(b)).step_by(97) {
+            assert_eq!(live.caret_at(b), at(&long[..b]).caret(), "caret after {b} bytes");
+        }
+    }
+
+    #[test]
     fn characters_the_font_lacks_are_skipped_not_boxed() {
         let with = Text { text: "a\u{1F600}b\u{4E2D}".into(), color: Color32::BLACK, size: 30.0, outline: false, pos: Pos2::new(5.0, 5.0) };
         let without = Text { text: "ab".into(), ..with.clone() };
@@ -2034,6 +2175,24 @@ mod tests {
         burn(&mut a, &Mark::Text(with));
         burn(&mut b, &Mark::Text(without));
         assert!(a.pixels == b.pixels, "and draws nothing");
+    }
+
+    #[test]
+    fn a_line_running_millions_of_pixels_past_the_picture_is_cut_short_not_a_panic() {
+        // A long paste at a big size: past ~8.4M px a 1/256 px origin no longer fits an i32.
+        let mut t = Text { text: "W".repeat(6000), color: Color32::RED, size: 2000.0, outline: true, pos: Pos2::ZERO };
+        // Baseline across the middle of the picture, so the first letter shows.
+        t.pos = Pos2::new(-200.0, 128.0 - t.line_metrics(&Text::font().unwrap()).ascent);
+        assert!(t.caret().x > 1.0e7, "the line does run that far");
+        let burn = |t: &Text| {
+            let mut d = Doc::new(white(256, 256));
+            d.add_mark(t.clone());
+            d.flatten()
+        };
+        let out = burn(&t);
+        assert!(out.pixels.iter().any(|&p| p != Color32::WHITE), "its start still shows");
+        assert!(out == burn(&Text { text: "WW".into(), ..t.clone() }), "exactly as the start of the line alone");
+        assert!(t.bounds().max.x <= MAX_ORIGIN + 4000.0);
     }
 
     #[test]
@@ -2067,5 +2226,26 @@ mod tests {
         let tiles = d.changed_tiles(&d.marks[..1]);
         d.render_runs(&tiles);
         assert_eq!(d.texts.values().map(|(_, r)| r.tiles.len()).sum::<usize>(), 0, "nor on undo");
+    }
+
+    #[test]
+    fn rendered_text_is_kept_only_while_it_is_on_the_snip() {
+        let mut d = Doc::new(white(600, 300));
+        d.add_mark(text("Kept", Color32::RED, true));
+        let all = |d: &Doc| {
+            let mut t = Tiles::new(d.size());
+            t.add(Rect::from_min_size(Pos2::ZERO, eframe::egui::vec2(600.0, 300.0)));
+            t
+        };
+        let shown = d.render_runs(&all(&d));
+        assert_eq!(d.texts.len(), 1);
+        let before = d.marks.clone();
+        d.checkpoint();
+        assert!(d.erase_at(Pos2::new(60.0, 40.0), 30.0), "rubs the text out");
+        d.render_runs(&d.changed_tiles(&before));
+        assert!(d.texts.is_empty(), "undo history still holds it, the cache doesn't");
+        d.undo();
+        assert!(d.render_runs(&all(&d)) == shown, "undo renders it again, the same");
+        assert_eq!(d.texts.len(), 1);
     }
 }

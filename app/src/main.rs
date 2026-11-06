@@ -218,6 +218,9 @@ struct App {
     recent: notify::Recent,
     /// Their notifications while still up, so Windows can say when one leaves the screen.
     toasts: Vec<(u64, notify::Shown)>,
+    /// The editor each clicked snip opened in (`None` while its file is being read), so another
+    /// click on the same snip, on its replaced notification say, brings that editor up instead.
+    snip_editors: Vec<(u64, Option<ViewportId>)>,
     last_snip_id: u64,
     snip_tx: Sender<SnipEvent>,
     snip_rx: Receiver<SnipEvent>,
@@ -235,6 +238,7 @@ impl App {
         let (grab_tx, grab_rx) = channel();
         let (bg_tx, bg_rx) = channel();
         let shot_run = shot.is_some();
+        let unreadable = loaded.unreadable();
         // A screenshot run renders the defaults and never writes the person's file.
         let save_to = if shot_run { None } else { loaded.path.clone() };
         let bg = Notifier::new(bg_tx, cc.egui_ctx.clone(), ViewportId::ROOT);
@@ -302,6 +306,7 @@ impl App {
             rec_rx,
             recent: notify::Recent::new(RECENT_SNIPS, RECENT_BYTES, RECENT_AGE),
             toasts: Vec::new(),
+            snip_editors: Vec::new(),
             last_snip_id: if shot_run { 0 } else { notify::recent_dir().map_or(0, |d| notify::newest_id(&d)) },
             snip_tx,
             snip_rx,
@@ -318,9 +323,12 @@ impl App {
         }
         app.resident = app.agent.is_some();
         if !shot_run {
-            // Every start: the exe may have moved since the entry was written.
+            // Every start: the exe may have moved since the entry was written. Not from the defaults
+            // standing in for a file that couldn't be read, which may have said "off".
             let startup = StartupEntry::new(app.bg.clone(), tray::sync_run_at_startup);
-            startup.set(app.settings.start_with_windows);
+            if !unreadable {
+                startup.set(app.settings.start_with_windows);
+            }
             app.startup = Some(startup);
             app.register_notifications();
         }
@@ -544,6 +552,7 @@ impl App {
     /// Explorer restarted: it, and winit, put a taskbar button back on every window. Taken off now,
     /// and again a moment later in case winit's own re-add lands after this.
     fn on_taskbar_created(&mut self, ctx: &egui::Context) {
+        win::forget_taskbar_list();
         if self.concealed {
             win::set_taskbar_button(self.hwnd as HWND, false);
             self.retab_at = Some(Instant::now() + Duration::from_secs(2));
@@ -578,6 +587,9 @@ impl App {
             Stage::Idle => {
                 self.home_visible = false;
                 self.conceal();
+                // The foreground is handed on in `keep_concealed`, at the start of a pass; without
+                // this one it would wait for the next event.
+                ctx.request_repaint();
             }
             Stage::Counting { .. } => {
                 self.home_visible = false;
@@ -680,8 +692,21 @@ impl App {
             self.say(ctx, "That link doesn't name a snip".into());
             return;
         };
+        self.snip_editors.retain(|(_, e)| e.is_none_or(|e| self.editors.contains(e)));
+        match self.snip_editors.iter().find(|(i, _)| *i == id) {
+            Some((_, Some(editor))) => {
+                for cmd in [ViewportCommand::Minimized(false), ViewportCommand::Focus] {
+                    ctx.send_viewport_cmd_to(*editor, cmd);
+                }
+                return;
+            }
+            // Already being read from its file.
+            Some((_, None)) => return,
+            None => {}
+        }
         if let Some(image) = self.recent.take(id) {
-            self.open_editor(ctx, Arc::unwrap_or_clone(image));
+            let (editor, _, _) = self.open_editor(ctx, Arc::unwrap_or_clone(image));
+            self.snip_editors.push((id, Some(editor)));
             return;
         }
         let folders: Vec<PathBuf> = [win::pictures_dir().map(|d| d.join("Screenshots")), notify::recent_dir()].into_iter().flatten().collect();
@@ -690,22 +715,30 @@ impl App {
             self.say(ctx, format!("SnipScreen only opens its own snips, not {}", path.display()));
             return;
         }
+        self.snip_editors.push((id, None));
         let (tx, ctx) = (self.snip_tx.clone(), ctx.clone());
         std::thread::spawn(move || {
-            let _ = tx.send(SnipEvent::Loaded(notify::load_png(&path)));
+            let _ = tx.send(SnipEvent::Loaded { id, image: notify::load_png(&path) });
             wake_root(&ctx);
         });
     }
 
     fn on_snip_event(&mut self, ctx: &egui::Context, event: SnipEvent) {
         match event {
-            SnipEvent::Loaded(Ok(image)) => {
-                self.open_editor(ctx, image);
+            SnipEvent::Loaded { id, image } => {
+                self.snip_editors.retain(|(i, _)| *i != id);
+                match image {
+                    Ok(image) => {
+                        let (editor, _, _) = self.open_editor(ctx, image);
+                        self.snip_editors.push((id, Some(editor)));
+                    }
+                    Err(e) => {
+                        self.show_home(ctx);
+                        self.say(ctx, format!("Couldn't open the snip: {e}"));
+                    }
+                }
             }
-            SnipEvent::Loaded(Err(e)) => {
-                self.show_home(ctx);
-                self.say(ctx, format!("Couldn't open the snip: {e}"));
-            }
+            SnipEvent::Written(id) => self.recent.written(id),
             SnipEvent::Shown { id, toast } => {
                 // A replacement (copy or save went wrong after all) takes the place of the first.
                 self.toasts.retain(|(i, _)| *i != id);
@@ -717,7 +750,8 @@ impl App {
             }
             SnipEvent::NotShown { id, msg } => match self.recent.take(id) {
                 Some(image) => {
-                    let (_, report, _) = self.open_editor(ctx, Arc::unwrap_or_clone(image));
+                    let (editor, report, _) = self.open_editor(ctx, Arc::unwrap_or_clone(image));
+                    self.snip_editors.push((id, Some(editor)));
                     report.send(msg);
                 }
                 None => self.say(ctx, msg),
@@ -922,6 +956,8 @@ impl eframe::App for App {
         self.startup = None;
         // Dropping the agent also tells a sign-out waiting in `WM_ENDSESSION` that all is written.
         self.agent = None;
+        // Its window and shortcuts are gone: a launch from here on can start as the running copy.
+        tray::release_single_instance();
     }
 
     /// Transparent so the recording-area outline window shows only its dashes.
@@ -1792,6 +1828,7 @@ fn start_resident(intent: tray::Intent, hotkey: Hotkey) -> Option<Boot> {
     while !tray::claim_single_instance() {
         let failed = match tray::forward(&intent) {
             Ok(tray::Forwarded::Taken) => return None,
+            Ok(tray::Forwarded::Gone) => continue,
             Ok(tray::Forwarded::Closing) if intent == tray::Intent::Quit => return None,
             Ok(tray::Forwarded::Closing) if Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(100));
@@ -1847,8 +1884,10 @@ const RECENT_AGE: Duration = Duration::from_secs(180);
 
 /// What background snip work reports to the shell.
 enum SnipEvent {
-    /// A snip read back from its file for a click on an older notification.
-    Loaded(Result<ColorImage, String>),
+    /// Snip `id` read back from its file for a click on an older notification.
+    Loaded { id: u64, image: Result<ColorImage, String> },
+    /// Snip `id`'s PNG is encoded and written (or failed to be): its file can stand in for it now.
+    Written(u64),
     /// The notification for snip `id` couldn't be shown; `msg` says why and what copy/save did.
     NotShown { id: u64, msg: String },
     /// Snip `id`'s notification is up (or was replaced with one that tells what really happened).
@@ -1863,9 +1902,10 @@ fn next_snip_id(last: u64, now: std::time::SystemTime) -> u64 {
     ms.max(last + 1)
 }
 
-/// The worker behind `App::notify_snip`. The notification goes up as soon as the preview is made,
-/// worded for copy and save going as asked; the PNG is encoded, copied and written alongside, and
-/// a notification that turns out wrong is replaced with one that says what failed. A click before
+/// The worker behind `App::notify_snip`. The notification goes up as soon as the preview is made
+/// and the picture is on the clipboard (as a bitmap, which needs no PNG), worded for save going as
+/// asked; the PNG is encoded, added to the clipboard and written alongside, and a notification that
+/// turns out wrong is replaced with one that says what failed. A click before
 /// the file is written opens the snip from memory. A snip that isn't auto-saved is kept in
 /// `recent`, so a click from the notification centre can still open it after a restart.
 fn deliver_by_notification(id: u64, image: &ColorImage, hwnd: isize, copy: bool, save_to: Option<Result<PathBuf, String>>, report: impl Fn(SnipEvent) + Clone + Send + 'static) {
@@ -1885,9 +1925,15 @@ fn deliver_by_notification(id: u64, image: &ColorImage, hwnd: isize, copy: bool,
     // click from the notification centre then opens the file. With Do not disturb on, Windows
     // reports the notification gone before the PNG is even encoded.
     let (dismissed, written) = (Arc::new(std::sync::atomic::AtomicBool::new(false)), Arc::new(std::sync::atomic::AtomicBool::new(false)));
-    let gone = {
-        let (report, dismissed, written) = (report.clone(), dismissed.clone(), written.clone());
+    // Which of the snip's notifications is up: only that one's leaving the screen counts, so the
+    // first one going as its replacement takes its place never lets the snip go.
+    let showing = Arc::new(std::sync::atomic::AtomicU8::new(0));
+    let gone = |generation: u8| {
+        let (report, dismissed, written, showing) = (report.clone(), dismissed.clone(), written.clone(), showing.clone());
         move || {
+            if showing.load(std::sync::atomic::Ordering::SeqCst) != generation {
+                return;
+            }
             dismissed.store(true, std::sync::atomic::Ordering::SeqCst);
             if written.load(std::sync::atomic::Ordering::SeqCst) {
                 report(SnipEvent::Gone(id));
@@ -1895,24 +1941,28 @@ fn deliver_by_notification(id: u64, image: &ColorImage, hwnd: isize, copy: bool,
         }
     };
     let preview_path = recent.as_ref().map(|d| d.join(format!("preview-{id}.png")));
+    let (copied_tx, copied_rx) = channel();
     let (shown, files) = std::thread::scope(|s| {
-        let files = s.spawn(|| write_snip(image, hwnd, copy, reserved, kept.as_deref()));
+        let files = s.spawn(|| write_snip(image, hwnd, copy, reserved, kept.as_deref(), move |c| drop(copied_tx.send(c))));
         let shown = match &file {
             None => Err("couldn't find your local AppData folder".to_string()),
             Some(file) => {
                 let preview = preview_path.and_then(|p| win::save_png(&p, &notify::preview_of(image)).ok().map(|_| p));
-                let (title, lines) = toast_text(&copy.then_some(Ok(())), &planned, None);
-                notify::Toast { title, lines, image: preview, launch: notify::open_link(id, file), tag: id.to_string() }.show(gone.clone()).map(|t| (t, file.clone()))
+                // The title says "copied" only once it is so. A worker that died first counts as the copy failing.
+                let copied = if copy { copied_rx.recv().unwrap_or_else(|_| Some(Err("something went wrong".into()))) } else { None };
+                let (title, lines) = toast_text(&copied, &planned, None, None);
+                notify::Toast { title, lines, image: preview, launch: notify::open_link(id, file), tag: id.to_string() }.show(gone(0)).map(|t| (t, file.clone()))
             }
         };
         // A panic while encoding or writing counts as each job failing.
         let files = files.join().unwrap_or_else(|_| {
             let failed = "something went wrong".to_string();
-            Written { copied: copy.then(|| Err(failed.clone())), saved: planned.as_ref().map(|_| Err(failed.clone())), kept: kept.as_ref().map(|_| Err(failed.clone())) }
+            Written { copied: copy.then(|| Err(failed.clone())), png: None, saved: planned.as_ref().map(|_| Err(failed.clone())), kept: kept.as_ref().map(|_| Err(failed.clone())) }
         });
         (shown, files)
     });
-    let Written { copied, saved, kept } = files;
+    let Written { copied, png, saved, kept } = files;
+    report(SnipEvent::Written(id));
     written.store(true, std::sync::atomic::Ordering::SeqCst);
     if dismissed.load(std::sync::atomic::Ordering::SeqCst) {
         report(SnipEvent::Gone(id));
@@ -1921,15 +1971,22 @@ fn deliver_by_notification(id: u64, image: &ColorImage, hwnd: isize, copy: bool,
         Err(e) => report(SnipEvent::NotShown { id, msg: not_shown(&e, copied, saved) }),
         Ok((toast, file)) => {
             report(SnipEvent::Shown { id, toast });
-            let went_wrong = matches!(copied, Some(Err(_))) || matches!((&planned, &saved), (Some(Ok(_)), Some(Err(_)))) || matches!(kept, Some(Err(_)));
+            // A failed copy was already told: the first notification waited for it.
+            let went_wrong = matches!(png, Some(Err(_))) || matches!((&planned, &saved), (Some(Ok(_)), Some(Err(_)))) || matches!(kept, Some(Err(_)));
             if went_wrong {
                 let kept_err = kept.as_ref().and_then(|r| r.as_ref().err()).map(String::as_str);
-                let (title, lines) = toast_text(&copied, &saved, kept_err);
+                let png_err = png.as_ref().and_then(|r| r.as_ref().err()).map(String::as_str);
+                let (title, lines) = toast_text(&copied, &saved, kept_err, png_err);
                 // The preview file is there by now; its picture stays.
                 let image = recent.as_ref().map(|d| d.join(format!("preview-{id}.png"))).filter(|p| p.exists());
-                match (notify::Toast { title, lines, image, launch: notify::open_link(id, &file), tag: id.to_string() }).show(gone) {
+                // Set before showing: the first one may report itself gone while it is being replaced.
+                showing.store(1, std::sync::atomic::Ordering::SeqCst);
+                match (notify::Toast { title, lines, image, launch: notify::open_link(id, &file), tag: id.to_string() }).show(gone(1)) {
                     Ok(toast) => report(SnipEvent::Shown { id, toast }),
-                    Err(e) => report(SnipEvent::NotShown { id, msg: not_shown(&e, copied, saved) }),
+                    Err(e) => {
+                        showing.store(0, std::sync::atomic::Ordering::SeqCst);
+                        report(SnipEvent::NotShown { id, msg: not_shown(&e, copied, saved) });
+                    }
                 }
             }
         }
@@ -1957,21 +2014,31 @@ fn copy_and_save(hwnd: isize, image: &ColorImage, copy: bool, save_to: Option<Re
 
 /// What `write_snip` did; `None` for a job that wasn't asked for.
 struct Written {
+    /// The bitmap on the clipboard.
     copied: Option<Result<(), String>>,
+    /// The PNG added to it; `None` when there was no bitmap to add it to.
+    png: Option<Result<(), String>>,
     /// Into the reserved file in Pictures\Screenshots.
     saved: Option<Result<PathBuf, String>>,
     /// Into `recent`, for a snip that wasn't auto-saved.
     kept: Option<Result<(), String>>,
 }
 
-/// The snip as PNG, encoded once, then copied and written into the files given.
-fn write_snip(image: &ColorImage, hwnd: isize, copy: bool, reserved: Option<Result<(PathBuf, std::fs::File), String>>, kept: Option<&std::path::Path>) -> Written {
+/// Copies the snip as a bitmap first and tells `on_copied` how that went (`None`: no copy asked
+/// for), then encodes the PNG once, adds it to the clipboard and writes it into the files given.
+fn write_snip(image: &ColorImage, hwnd: isize, copy: bool, reserved: Option<Result<(PathBuf, std::fs::File), String>>, kept: Option<&std::path::Path>, on_copied: impl FnOnce(Option<Result<(), String>>)) -> Written {
+    let bitmap = copy.then(|| win::copy_bitmap(hwnd as HWND, image));
+    let copied = bitmap.as_ref().map(|r| r.as_ref().map(|_| ()).map_err(Clone::clone));
+    on_copied(copied.clone());
     let png = win::encode_png(image);
     let bytes = || png.as_ref().map_err(|e| format!("couldn't encode the snip: {e}"));
-    let copied = copy.then(|| bytes().and_then(|p| win::copy_image_with_png(hwnd as HWND, image, p)));
+    let png_added = match bitmap {
+        Some(Ok(seq)) => Some(bytes().and_then(|p| win::add_png(hwnd as HWND, seq, p))),
+        _ => None,
+    };
     let saved = reserved.map(|r| r.and_then(|(path, file)| fill(path, file, bytes())));
     let kept = kept.map(|path| bytes().and_then(|p| std::fs::write(path, p).map_err(|e| format!("{}: {e}", path.display()))));
-    Written { copied, saved, kept }
+    Written { copied, png: png_added, saved, kept }
 }
 
 /// Writes `bytes` into the new, empty `file` at `path`; on failure the empty file goes again.
@@ -2000,7 +2067,7 @@ fn not_shown(why: &str, copied: Option<Result<(), String>>, saved: Option<Result
 
 /// A new snip's notification text: the title says what happened to it (copied, saved, or neither),
 /// the first line where it was saved and what failed, the last what a click does.
-fn toast_text(copied: &Option<Result<(), String>>, saved: &Option<Result<PathBuf, String>>, kept: Option<&str>) -> (String, Vec<String>) {
+fn toast_text(copied: &Option<Result<(), String>>, saved: &Option<Result<PathBuf, String>>, kept: Option<&str>, png: Option<&str>) -> (String, Vec<String>) {
     let title = match (copied, saved) {
         (Some(Ok(())), _) => "Snip copied to clipboard",
         (_, Some(Ok(_))) => "Snip saved",
@@ -2012,6 +2079,9 @@ fn toast_text(copied: &Option<Result<(), String>>, saved: &Option<Result<PathBuf
     }
     if let Some(Err(e)) = copied {
         status.push(format!("Couldn't copy: {e}"));
+    }
+    if let Some(e) = png {
+        status.push(format!("Copied as a bitmap only: {e}"));
     }
     if let Some(Err(e)) = saved {
         status.push(format!("Couldn't auto-save: {e}"));
@@ -2256,20 +2326,25 @@ mod tests {
         let saved = || Some(Ok(PathBuf::from(r"C:\Users\a\Pictures\Screenshots\Snip 2026-11-05 141530.png")));
         let hint = "Select to mark it up".to_string();
         let as_saved = "Saved to Pictures\\Screenshots as Snip 2026-11-05 141530.png".to_string();
-        assert_eq!(toast_text(&ok(), &saved(), None), ("Snip copied to clipboard".into(), vec![as_saved.clone(), hint.clone()]));
-        assert_eq!(toast_text(&ok(), &None, None), ("Snip copied to clipboard".into(), vec![hint.clone()]));
-        assert_eq!(toast_text(&None, &saved(), None), ("Snip saved".into(), vec![as_saved.clone(), hint.clone()]));
-        assert_eq!(toast_text(&None, &None, None), ("Snip taken".into(), vec![hint.clone()]));
-        assert_eq!(toast_text(&Some(Err("busy".into())), &saved(), None), ("Snip saved".into(), vec![format!("{as_saved} · Couldn't copy: busy"), hint.clone()]));
+        assert_eq!(toast_text(&ok(), &saved(), None, None), ("Snip copied to clipboard".into(), vec![as_saved.clone(), hint.clone()]));
+        assert_eq!(toast_text(&ok(), &None, None, None), ("Snip copied to clipboard".into(), vec![hint.clone()]));
+        assert_eq!(toast_text(&None, &saved(), None, None), ("Snip saved".into(), vec![as_saved.clone(), hint.clone()]));
+        assert_eq!(toast_text(&None, &None, None, None), ("Snip taken".into(), vec![hint.clone()]));
+        assert_eq!(toast_text(&Some(Err("busy".into())), &saved(), None, None), ("Snip saved".into(), vec![format!("{as_saved} · Couldn't copy: busy"), hint.clone()]));
         assert_eq!(
-            toast_text(&ok(), &Some(Err("disk full".into())), None),
+            toast_text(&ok(), &Some(Err("disk full".into())), None, None),
             ("Snip copied to clipboard".into(), vec!["Couldn't auto-save: disk full".into(), hint.clone()])
         );
-        assert_eq!(toast_text(&Some(Err("busy".into())), &Some(Err("disk full".into())), None).0, "Snip taken");
+        assert_eq!(toast_text(&Some(Err("busy".into())), &Some(Err("disk full".into())), None, None).0, "Snip taken");
         assert_eq!(
-            toast_text(&ok(), &None, Some("access denied")),
+            toast_text(&ok(), &None, Some("access denied"), None),
             ("Snip copied to clipboard".into(), vec!["Couldn't keep it for later: access denied".into(), hint.clone()]),
             "an unsaved snip that couldn't be kept is reported"
+        );
+        assert_eq!(
+            toast_text(&ok(), &None, None, Some("the clipboard is busy")),
+            ("Snip copied to clipboard".into(), vec!["Copied as a bitmap only: the clipboard is busy".into(), hint.clone()]),
+            "a copy that lost its PNG says so"
         );
     }
 
@@ -2303,12 +2378,14 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("snipscreen-deliver-{}", std::process::id()));
         let img = ColorImage::new([4, 3], vec![Color32::from_rgb(1, 2, 3); 12]);
         let reserved = win::create_unique(&dir.join("Snip.png"));
-        let Written { copied, saved, kept } = write_snip(&img, 0, false, Some(reserved), Some(&dir.join("snip-1.png")));
+        let mut told = None;
+        let Written { copied, png, saved, kept } = write_snip(&img, 0, false, Some(reserved), Some(&dir.join("snip-1.png")), |c| told = Some(c));
         let on_disk = saved.as_ref().and_then(|r| r.as_ref().ok()).and_then(|p| std::fs::read(p).ok());
         let also = std::fs::read(dir.join("snip-1.png")).ok();
-        let failed = write_snip(&img, 0, false, Some(Err("couldn't find your Pictures folder".into())), Some(&dir.join("no-such-dir").join("x.png")));
+        let failed = write_snip(&img, 0, false, Some(Err("couldn't find your Pictures folder".into())), Some(&dir.join("no-such-dir").join("x.png")), |_| {});
         let _ = std::fs::remove_dir_all(&dir);
-        assert!(copied.is_none(), "copy wasn't asked for");
+        assert!(copied.is_none() && png.is_none(), "copy wasn't asked for");
+        assert_eq!(told, Some(None), "the copy's outcome is told before the PNG is encoded");
         assert_eq!(on_disk, win::encode_png(&img).ok(), "the saved file is the encoded PNG");
         assert_eq!((kept, also), (Some(Ok(())), on_disk));
         assert_eq!(failed.saved, Some(Err("couldn't find your Pictures folder".into())));
@@ -2452,6 +2529,61 @@ mod tests {
     #[test]
     fn bar_drops_inside_the_top_edge_when_there_is_no_room_above() {
         assert_eq!(bar_position([500, 20, 400, 300], WORK, 300, 60), (550, 32));
+    }
+
+    /// Grab to clipboard-ready on a 4K snip, the old way (PNG encoded first, then one clipboard
+    /// write) and the new (bitmap first, PNG added after), and how long the toast's preview takes,
+    /// which runs alongside. Overwrites the clipboard. Run in release:
+    /// `cargo test --release perf_snip_clipboard -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "timing report that writes the clipboard"]
+    fn perf_snip_clipboard() {
+        let ms = |t: Instant| t.elapsed().as_secs_f64() * 1000.0;
+        let (w, h) = (3840, 2160);
+        let img = ColorImage::new([w, h], (0..w * h).map(|i| Color32::from_rgb((i % w * 255 / w) as u8, (i / w * 255 / h) as u8, (i % 97) as u8)).collect());
+        let (mut old, mut new_copy, mut new_png, mut preview) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for _ in 0..5 {
+            let t = Instant::now();
+            let png = win::encode_png(&img).unwrap();
+            win::copy_image_with_png(std::ptr::null_mut(), &img, &png).unwrap();
+            old.push(ms(t));
+            let t = Instant::now();
+            let seq = win::copy_bitmap(std::ptr::null_mut(), &img).unwrap();
+            new_copy.push(ms(t));
+            let png = win::encode_png(&img).unwrap();
+            win::add_png(std::ptr::null_mut(), seq, &png).unwrap();
+            new_png.push(ms(t));
+            let t = Instant::now();
+            std::hint::black_box(win::encode_png(&notify::preview_of(&img)).unwrap());
+            preview.push(ms(t));
+        }
+        let median = |v: &mut Vec<f64>| {
+            v.sort_by(f64::total_cmp);
+            v[v.len() / 2]
+        };
+        println!("old: clipboard ready (PNG encoded first)  median {:>7.2} ms", median(&mut old));
+        println!("new: clipboard ready (bitmap)             median {:>7.2} ms", median(&mut new_copy));
+        println!("new: PNG added too                        median {:>7.2} ms", median(&mut new_png));
+        println!("toast preview made (runs alongside)       median {:>7.2} ms", median(&mut preview));
+    }
+
+    #[test]
+    #[ignore = "writes the clipboard"]
+    fn a_bitmap_copy_gets_its_png_unless_something_else_was_copied() {
+        use windows_sys::Win32::System::DataExchange::{IsClipboardFormatAvailable, RegisterClipboardFormatW};
+        let png_format = unsafe { RegisterClipboardFormatW("PNG\0".encode_utf16().collect::<Vec<u16>>().as_ptr()) };
+        let has = |f: u32| unsafe { IsClipboardFormatAvailable(f) } != 0;
+        let img = ColorImage::new([2, 2], vec![Color32::from_rgb(9, 8, 7); 4]);
+        let png = win::encode_png(&img).unwrap();
+        let seq = win::copy_bitmap(std::ptr::null_mut(), &img).unwrap();
+        assert!(has(windows_sys::Win32::System::Ole::CF_DIB as u32) && !has(png_format), "the bitmap goes first, alone");
+        win::add_png(std::ptr::null_mut(), seq, &png).unwrap();
+        assert!(has(png_format), "then the PNG joins it");
+        // Something else copied in between: its clipboard is left as it is.
+        let seq = win::copy_bitmap(std::ptr::null_mut(), &img).unwrap();
+        win::copy_bitmap(std::ptr::null_mut(), &img).unwrap();
+        win::add_png(std::ptr::null_mut(), seq, &png).unwrap();
+        assert!(!has(png_format));
     }
 
     #[test]
