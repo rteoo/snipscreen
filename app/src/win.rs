@@ -661,6 +661,10 @@ pub fn forget_taskbar_list() {
     });
 }
 
+pub fn is_visible(hwnd: HWND) -> bool {
+    unsafe { IsWindowVisible(hwnd) != 0 }
+}
+
 pub fn is_foreground(hwnd: HWND) -> bool {
     unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow() == hwnd }
 }

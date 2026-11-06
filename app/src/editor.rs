@@ -37,6 +37,8 @@ const CANVAS_MARGIN: Vec2 = vec2(32.0, 32.0);
 const SCROLL_ID: &str = "snip_scroll";
 /// Frames spent keeping a new window on its monitor while Windows finishes any rescaling.
 const SETTLE_FRAMES: u8 = 8;
+/// Frames a new window waits to be shown before it gives up asking for the foreground.
+const RAISE_FRAMES: u8 = 60;
 /// Frames a Save waits for its window's handle (found by title once Windows has made the window).
 const SAVE_WAIT_FRAMES: u8 = 30;
 /// Each further open editor starts this many pixels down and right of the last, so none hides another.
@@ -271,6 +273,8 @@ pub struct Editor {
     place: Option<[i32; 2]>,
     /// Frames left in which to keep the new window on screen.
     settle: u8,
+    /// Frames left in which the new window still asks for the foreground (see `raise`).
+    raise: u8,
     /// Minimum window width last sent to the OS, so the command goes out only on change.
     min_width: f32,
     popup_guard: PopupClickGuard,
@@ -705,6 +709,7 @@ impl Editor {
             bar_tried: false,
             place,
             settle: SETTLE_FRAMES,
+            raise: RAISE_FRAMES,
             min_width,
             popup_guard: PopupClickGuard::default(),
             note: None,
@@ -755,6 +760,7 @@ impl Editor {
         self.attach_title_bar(&ctx);
         self.retry_save(&ctx);
         self.settle_window(&ctx);
+        self.raise(&ctx);
         self.popup_guard.begin_frame(&ctx);
         self.shortcuts(&ctx);
         self.toolbar(ui);
@@ -801,6 +807,27 @@ impl Editor {
             self.say(e);
         }
         ctx.request_repaint();
+    }
+
+    /// Brings the new window to the front once it is on screen. eframe shows it with a plain
+    /// `ShowWindow`, which Windows' foreground lock leaves behind the active app unless this
+    /// process may take the foreground at that moment; a notification click hands that right to the
+    /// `--open-link` launch, and it is often gone by the time the window appears. winit's focus
+    /// gets past the lock.
+    fn raise(&mut self, ctx: &egui::Context) {
+        if self.raise == 0 {
+            return;
+        }
+        self.raise -= 1;
+        match self.own_hwnd() {
+            Some(hwnd) if win::is_visible(hwnd) => {
+                self.raise = 0;
+                if !win::is_foreground(hwnd) {
+                    ctx.send_viewport_cmd(ViewportCommand::Focus);
+                }
+            }
+            _ => ctx.request_repaint(),
+        }
     }
 
     /// A Save asked for before this window's handle was known runs once it is.
