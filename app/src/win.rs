@@ -29,7 +29,7 @@ use windows_sys::Win32::UI::Controls::Dialogs::{
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     RegisterHotKey, UnregisterHotKey, MOD_ALT, MOD_NOREPEAT, MOD_SHIFT, VK_ESCAPE,
 };
-use windows_sys::Win32::UI::Shell::{FOLDERID_Pictures, FOLDERID_Videos, SHGetKnownFolderPath};
+use windows_sys::Win32::UI::Shell::{FOLDERID_Pictures, FOLDERID_RoamingAppData, FOLDERID_Videos, SHGetKnownFolderPath};
 use windows_sys::Win32::System::Com::CoTaskMemFree;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     EnumWindows, FindWindowW, GetClientRect, GetCursorPos, GetWindowPlacement, WINDOWPLACEMENT, SetWindowDisplayAffinity, WDA_EXCLUDEFROMCAPTURE, WDA_NONE, GetMessageW, GetSystemMetrics, GetWindowLongW, GetWindowRect,
@@ -398,6 +398,11 @@ pub fn pictures_dir() -> Option<PathBuf> {
 
 pub fn videos_dir() -> Option<PathBuf> {
     known_folder(&FOLDERID_Videos)
+}
+
+/// `%APPDATA%`: settings that follow the person between PCs.
+pub fn roaming_app_data_dir() -> Option<PathBuf> {
+    known_folder(&FOLDERID_RoamingAppData)
 }
 
 fn known_folder(id: &windows_sys::core::GUID) -> Option<PathBuf> {

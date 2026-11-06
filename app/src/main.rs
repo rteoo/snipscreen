@@ -5,6 +5,7 @@ mod editor;
 mod icons;
 mod markup;
 mod recorder;
+mod settings;
 mod widgets;
 mod win;
 
@@ -19,6 +20,7 @@ use eframe::egui::{
     StrokeKind, TextureHandle, TextureOptions, Vec2, ViewportCommand, ViewportId, WindowLevel,
 };
 use icons::Icon;
+use settings::{Mode, Settings, Shape as Shape_, DELAYS};
 use widgets::{
     dim_outside, divider, dropdown, icon_button, style, take_escape, Note, Notifier, PopupClickGuard, ACCENT, BTN, BUTTON_BG, BUTTON_HOVER, DIM, DIVIDER_W,
     GAP, ICON, ICON_OFF, MIN_WINDOW_H, MIN_WINDOW_W, OUTLINE, TOOLBAR_BG,
@@ -29,20 +31,6 @@ use windows_sys::Win32::Foundation::HWND;
 const HOME_SIZE: Vec2 = vec2(620.0, 330.0);
 /// Time for the window's hide animation to finish before the screen is copied.
 const HIDE_SETTLE: Duration = Duration::from_millis(250);
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Mode {
-    Photo,
-    Video,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Shape_ {
-    Rectangle,
-    Window,
-    FullScreen,
-    Freeform,
-}
 
 impl Shape_ {
     const ALL: [Shape_; 4] = [Shape_::Rectangle, Shape_::Window, Shape_::FullScreen, Shape_::Freeform];
@@ -73,8 +61,6 @@ impl Shape_ {
         }
     }
 }
-
-const DELAYS: [u64; 4] = [0, 3, 5, 10];
 
 /// Whole seconds to show for a delay with `left` still to run, counting
 /// 3, 2, 1; `None` once it has run out.
@@ -169,9 +155,13 @@ enum Shot {
 /// runs), the capture settings, the global hotkeys, and the open editor windows.
 struct App {
     hwnd: isize,
-    mode: Mode,
-    shape: Shape_,
-    delay: u64,
+    /// Everything the person chose, including the capture mode, shape, delay and sound choices.
+    settings: Settings,
+    /// `settings` as last handed to `saver`; any difference is saved at the end of the pass.
+    saved: Settings,
+    saver: settings::Saver,
+    /// Messages from background work that has no window of its own (the settings saver).
+    bg_rx: Receiver<String>,
     stage: Stage,
     grab_tx: Sender<Result<win::Grab, String>>,
     grab_rx: Receiver<Result<win::Grab, String>>,
@@ -191,14 +181,8 @@ struct App {
     home_visible: bool,
     popup_guard: PopupClickGuard,
 
-    auto_copy: bool,
-    auto_save: bool,
     screenshot: Option<ScreenshotJob>,
 
-    record_system: bool,
-    record_mic: bool,
-    /// `None` is the Windows default microphone.
-    mic_choice: Option<String>,
     mics: Vec<audio::Mic>,
     rec_tx: Sender<recorder::Event>,
     rec_rx: Receiver<recorder::Event>,
@@ -206,10 +190,24 @@ struct App {
 }
 
 impl App {
-    fn new(cc: &eframe::CreationContext<'_>, shot: Option<Shot>, icon: Option<Arc<egui::IconData>>) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>, shot: Option<Shot>, icon: Option<Arc<egui::IconData>>, loaded: settings::Loaded) -> Self {
         style(&cc.egui_ctx);
         let hwnd = window_hwnd(cc);
         let (grab_tx, grab_rx) = channel();
+        let (bg_tx, bg_rx) = channel();
+        let shot_run = shot.is_some();
+        // A screenshot run renders the defaults and never writes the person's file.
+        let save_to = if shot_run { None } else { loaded.path.clone() };
+        let (tx, c) = (bg_tx, cc.egui_ctx.clone());
+        let saver = settings::Saver::new(save_to, move |e| {
+            let _ = tx.send(e);
+            c.request_repaint();
+        });
+        let settings = if shot_run { Settings::default() } else { loaded.settings };
+        if !loaded.existed {
+            saver.save(&settings);
+        }
+        let saved = settings.clone();
         let (rec_tx, rec_rx) = channel();
         let (mut hotkey_rx, mut hotkey_note, mut esc_rx, mut esc_hotkey) = (None, None, None, None);
         // A screenshot run must not steal the shortcut from a running copy.
@@ -233,9 +231,10 @@ impl App {
         }
         let mut app = Self {
             hwnd,
-            mode: Mode::Photo,
-            shape: Shape_::Rectangle,
-            delay: 0,
+            settings,
+            saved,
+            saver,
+            bg_rx,
             stage: Stage::Idle,
             grab_tx,
             grab_rx,
@@ -249,17 +248,15 @@ impl App {
             settle: 0,
             home_visible: true,
             popup_guard: PopupClickGuard::default(),
-            auto_copy: true,
-            auto_save: true,
             screenshot: None,
-            record_system: true,
-            record_mic: false,
-            mic_choice: None,
             mics: Vec::new(),
             rec_tx,
             rec_rx,
             editors: Editors::new(icon),
         };
+        if !loaded.problems.is_empty() && !shot_run {
+            app.say(&cc.egui_ctx, format!("Some settings couldn't be read and were reset: {}", loaded.problems.join(", ")));
+        }
         app.screenshot = shot.map(|shot| match shot {
             Shot::Home(path) => ScreenshotJob { path, target: ViewportId::ROOT, frames: 0, rx: None },
             Shot::Editor(path) => {
@@ -274,7 +271,7 @@ impl App {
         if !matches!(self.stage, Stage::Idle | Stage::Counting { .. }) {
             return;
         }
-        let delay = if self.mode == Mode::Photo { self.delay } else { 0 };
+        let delay = if self.settings.mode == Mode::Photo { self.settings.delay } else { 0 };
         if delay == 0 {
             self.hide_and_grab(ctx);
             return;
@@ -352,8 +349,8 @@ impl App {
                 return;
             }
         };
-        if self.shape == Shape_::FullScreen {
-            match self.mode {
+        if self.settings.shape == Shape_::FullScreen {
+            match self.settings.mode {
                 Mode::Photo => self.finish(ctx, grab.image),
                 Mode::Video => self.open_rec_bar(ctx, win::monitor_at_cursor()),
             }
@@ -481,15 +478,15 @@ impl App {
 
     /// Copies and/or saves a new snip on a worker, reporting through `report` what each job really did.
     fn auto_copy_save(&self, image: Arc<ColorImage>, report: Notifier) {
-        if !self.auto_copy && !self.auto_save {
+        if !self.settings.auto_copy && !self.settings.auto_save {
             return;
         }
-        let save_path = self.auto_save.then(|| {
+        let save_path = self.settings.auto_save.then(|| {
             win::pictures_dir()
                 .map(|dir| dir.join("Screenshots").join(format!("Snip {}.png", win::timestamp())))
                 .ok_or_else(|| "couldn't find your Pictures folder".to_string())
         });
-        let (copy, hwnd) = (self.auto_copy, self.hwnd);
+        let (copy, hwnd) = (self.settings.auto_copy, self.hwnd);
         std::thread::spawn(move || {
             let copied = copy.then(|| win::copy_image(hwnd as HWND, &image));
             let saved = save_path.map(|path| path.and_then(|p| win::save_png_new(&p, &image).map(|_| ())));
@@ -497,6 +494,14 @@ impl App {
                 report.send(msg);
             }
         });
+    }
+
+    /// Hands changed settings to the saver; a few field compares per pass when nothing changed.
+    fn persist(&mut self) {
+        if self.settings != self.saved {
+            self.saved = self.settings.clone();
+            self.saver.save(&self.settings);
+        }
     }
 
     /// Shows `msg` in the home window (or the recording bar), or in the newest editor while the home window is closed.
@@ -538,6 +543,9 @@ impl eframe::App for App {
 
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.on_home_close(ctx);
+        while let Ok(msg) = self.bg_rx.try_recv() {
+            self.say(ctx, msg);
+        }
         while let Ok(event) = self.rec_rx.try_recv() {
             self.on_record_event(ctx, event);
         }
@@ -552,8 +560,9 @@ impl eframe::App for App {
         self.reveal_picker(ctx);
         self.settle_window(ctx);
         self.sync_escape_hotkey();
-        self.editors.set_new_tip(new_tooltip(self.mode, self.hotkey_rx.is_some(), self.hotkey_note.as_deref()));
+        self.editors.set_new_tip(new_tooltip(self.settings.mode, self.hotkey_rx.is_some(), self.hotkey_note.as_deref()));
         self.close_when_no_window_is_left(ctx);
+        self.persist();
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -568,6 +577,7 @@ impl eframe::App for App {
         // Every pass, or egui closes the editor windows.
         self.editors.show(&ctx);
         self.drive_screenshot(&ctx);
+        self.persist();
     }
 }
 
@@ -605,8 +615,8 @@ impl App {
     fn home_menu(&mut self, ui: &mut egui::Ui) {
         let more = icon_button(ui, Icon::More, None, false, true, "More");
         egui::Popup::menu(&more).show(|ui| {
-            ui.checkbox(&mut self.auto_copy, "Copy snips to the clipboard automatically");
-            ui.checkbox(&mut self.auto_save, "Save snips to Pictures\\Screenshots automatically");
+            ui.checkbox(&mut self.settings.auto_copy, "Copy snips to the clipboard automatically");
+            ui.checkbox(&mut self.settings.auto_save, "Save snips to Pictures\\Screenshots automatically");
             if ui.button("Open the Screenshots folder").clicked() {
                 if let Some(dir) = win::pictures_dir().map(|d| d.join("Screenshots")) {
                     let _ = std::fs::create_dir_all(&dir);
@@ -618,7 +628,7 @@ impl App {
 
     fn capture_controls(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
-        let tip = new_tooltip(self.mode, self.hotkey_rx.is_some(), self.hotkey_note.as_deref());
+        let tip = new_tooltip(self.settings.mode, self.hotkey_rx.is_some(), self.hotkey_note.as_deref());
         if widgets::new_button(ui, &tip).clicked() {
             self.start_snip(&ctx);
         }
@@ -626,15 +636,15 @@ impl App {
         self.mode_switch(ui);
         ui.add_space(4.0);
         self.shape_menu(ui);
-        if self.mode == Mode::Video {
+        if self.settings.mode == Mode::Video {
             return;
         }
 
-        let (timer, badge) = if self.delay == 0 { (Icon::TimerOff, None) } else { (Icon::Timer, Some(self.delay)) };
-        let resp = dropdown(ui, timer, badge).on_hover_text(format!("Delay: {}", delay_label(self.delay)));
+        let (timer, badge) = if self.settings.delay == 0 { (Icon::TimerOff, None) } else { (Icon::Timer, Some(self.settings.delay)) };
+        let resp = dropdown(ui, timer, badge).on_hover_text(format!("Delay: {}", delay_label(self.settings.delay)));
         egui::Popup::menu(&resp).show(|ui| {
             for d in DELAYS {
-                ui.selectable_value(&mut self.delay, d, delay_label(d));
+                ui.selectable_value(&mut self.settings.delay, d, delay_label(d));
             }
         });
     }
@@ -650,7 +660,7 @@ impl App {
             let cell = Rect::from_min_size(group.min + vec2(3.0 + i as f32 * BTN.x, 3.0), BTN - vec2(0.0, 6.0));
             let resp = ui.interact(cell, ui.scope_id().with(("mode", i)), Sense::click()).on_hover_text(tip);
             let p = ui.painter();
-            if self.mode == mode {
+            if self.settings.mode == mode {
                 p.rect_filled(cell, 4.0, BUTTON_HOVER);
                 let bar = Rect::from_center_size(cell.center_bottom() - vec2(0.0, 3.0), vec2(14.0, 3.0));
                 p.rect_filled(bar, 1.5, ACCENT);
@@ -665,29 +675,29 @@ impl App {
     }
 
     fn set_mode(&mut self, mode: Mode) {
-        self.mode = mode;
-        if !Shape_::choices(mode).contains(&self.shape) {
-            self.shape = Shape_::Rectangle;
+        self.settings.mode = mode;
+        if !Shape_::choices(mode).contains(&self.settings.shape) {
+            self.settings.shape = Shape_::Rectangle;
         }
     }
 
     fn shape_menu(&mut self, ui: &mut egui::Ui) {
-        let resp = dropdown(ui, self.shape.icon(), None).on_hover_text(format!("Shape: {}", self.shape.label()));
+        let resp = dropdown(ui, self.settings.shape.icon(), None).on_hover_text(format!("Shape: {}", self.settings.shape.label()));
         egui::Popup::menu(&resp).show(|ui| {
-            for &s in Shape_::choices(self.mode) {
+            for &s in Shape_::choices(self.settings.mode) {
                 let (rect, item) = ui.allocate_exact_size(vec2(150.0, 32.0), Sense::click());
                 let p = ui.painter();
                 if item.hovered() {
                     p.rect_filled(rect, 4.0, BUTTON_HOVER);
                 }
-                if self.shape == s {
+                if self.settings.shape == s {
                     let pill = Rect::from_center_size(rect.left_center() + vec2(3.0, 0.0), vec2(3.0, 16.0));
                     p.rect_filled(pill, 1.5, ACCENT);
                 }
                 icons::paint(p, Rect::from_center_size(rect.left_center() + vec2(22.0, 0.0), vec2(18.0, 18.0)), s.icon(), ICON, None);
                 p.text(rect.left_center() + vec2(42.0, 0.0), Align2::LEFT_CENTER, s.label(), FontId::proportional(14.0), ICON);
                 if item.clicked() {
-                    self.shape = s;
+                    self.settings.shape = s;
                     ui.close();
                 }
             }
@@ -711,13 +721,13 @@ impl App {
     fn empty_state(&mut self, ui: &mut egui::Ui) {
         ui.with_layout(Layout::top_down(Align::Center), |ui| {
             ui.add_space((ui.available_height() * 0.5 - 50.0).max(8.0));
-            let title = match self.mode {
+            let title = match self.settings.mode {
                 Mode::Photo => "Snip anything on your screen",
                 Mode::Video => "Record anything on your screen",
             };
             ui.label(RichText::new(title).size(20.0).strong());
             ui.add_space(6.0);
-            let hint = match (self.mode, self.hotkey_rx.is_some()) {
+            let hint = match (self.settings.mode, self.hotkey_rx.is_some()) {
                 (Mode::Photo, true) => "Press Alt+Shift+S anywhere, or pick a shape and click New.",
                 (Mode::Photo, false) => "Pick a shape and click New.",
                 (Mode::Video, _) => "Click New, choose an area, then press Start to record.",
@@ -734,7 +744,7 @@ impl App {
         let ctx = ui.ctx().clone();
         self.popup_guard.begin_frame(&ctx);
         let rect = ui.max_rect();
-        let video = self.mode == Mode::Video;
+        let video = self.settings.mode == Mode::Video;
         let Stage::Picking(pk) = &mut self.stage else { return };
         let img = vec2(pk.grab.image.size[0] as f32, pk.grab.image.size[1] as f32);
         let k = img / rect.size();
@@ -758,7 +768,7 @@ impl App {
         let mut window_click = false;
         let mut cancel = take_escape(&ctx);
 
-        match self.shape {
+        match self.settings.shape {
             Shape_::Rectangle => {
                 if resp.drag_started() {
                     pk.start = origin.map(to_px);
@@ -918,8 +928,8 @@ impl App {
         };
         let settings = recorder::Settings {
             area: bar.area,
-            system_sound: self.record_system,
-            microphone: self.record_mic.then(|| self.mic_choice.clone()),
+            system_sound: self.settings.record_system,
+            microphone: self.settings.record_mic.then(|| self.settings.mic.clone()),
             path: dir.join("Screen Recordings").join(format!("Screen Recording {}.mp4", win::timestamp())),
         };
         let (tx, c) = (self.rec_tx.clone(), ctx.clone());
@@ -1038,10 +1048,10 @@ impl App {
                     let (t, _) = ui.allocate_exact_size(vec2(REC_CLOCK_W, BTN.y), Sense::hover());
                     ui.painter().text(t.center(), Align2::CENTER_CENTER, clock, FontId::monospace(14.0), ICON);
 
-                    let mic_icon = if self.record_mic { Icon::Mic } else { Icon::MicOff };
-                    let mic_tip = if self.record_mic { "Mute microphone" } else { "Unmute microphone" };
+                    let mic_icon = if self.settings.record_mic { Icon::Mic } else { Icon::MicOff };
+                    let mic_tip = if self.settings.record_mic { "Mute microphone" } else { "Unmute microphone" };
                     if icon_button(ui, mic_icon, None, false, !recording, mic_tip).clicked() {
-                        self.record_mic = !self.record_mic;
+                        self.settings.record_mic = !self.settings.record_mic;
                     }
                     let (chev, chev_resp) = ui.allocate_exact_size(vec2(REC_CHEVRON_W, BTN.y), if recording { Sense::hover() } else { Sense::click() });
                     icons::paint(ui.painter(), Rect::from_center_size(chev.center(), vec2(12.0, 12.0)), Icon::Chevron, if recording { ICON_OFF } else { ICON }, None);
@@ -1049,19 +1059,19 @@ impl App {
                         self.mics = audio::microphones();
                     }
                     egui::Popup::menu(&chev_resp).show(|ui| {
-                        if ui.selectable_label(!self.record_mic, "Mute").clicked() {
-                            self.record_mic = false;
+                        if ui.selectable_label(!self.settings.record_mic, "Mute").clicked() {
+                            self.settings.record_mic = false;
                         }
                         ui.separator();
                         for (i, m) in self.mics.iter().enumerate() {
-                            let chosen = self.record_mic
-                                && match &self.mic_choice {
+                            let chosen = self.settings.record_mic
+                                && match &self.settings.mic {
                                     Some(id) => *id == m.id,
                                     None => i == 0,
                                 };
                             if ui.selectable_label(chosen, &m.name).clicked() {
-                                self.record_mic = true;
-                                self.mic_choice = Some(m.id.clone());
+                                self.settings.record_mic = true;
+                                self.settings.mic = Some(m.id.clone());
                             }
                         }
                         if self.mics.is_empty() {
@@ -1069,10 +1079,10 @@ impl App {
                         }
                     });
 
-                    let sys_icon = if self.record_system { Icon::SystemSound } else { Icon::SystemSoundOff };
-                    let sys_tip = if self.record_system { "Mute system audio" } else { "Unmute system audio" };
+                    let sys_icon = if self.settings.record_system { Icon::SystemSound } else { Icon::SystemSoundOff };
+                    let sys_tip = if self.settings.record_system { "Mute system audio" } else { "Unmute system audio" };
                     if icon_button(ui, sys_icon, None, false, !recording, sys_tip).clicked() {
-                        self.record_system = !self.record_system;
+                        self.settings.record_system = !self.settings.record_system;
                     }
                     divider(ui);
                     let close_tip = if recording { "Stop and save" } else { "Close (Esc)" };
@@ -1225,8 +1235,9 @@ fn main() -> eframe::Result {
     if let Some(icon) = &icon {
         viewport = viewport.with_icon(icon.clone());
     }
+    let loaded = settings::load();
     let options = eframe::NativeOptions { viewport, ..Default::default() };
-    eframe::run_native("Snipscreen", options, Box::new(move |cc| Ok(Box::new(App::new(cc, shot, icon)))))
+    eframe::run_native("Snipscreen", options, Box::new(move |cc| Ok(Box::new(App::new(cc, shot, icon, loaded)))))
 }
 
 /// The window and taskbar icon: the 256 px render of `assets/snipscreen-icon.svg`, built into the binary.
