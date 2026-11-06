@@ -16,15 +16,15 @@ use eframe::egui::{
 use windows_sys::Win32::Foundation::HWND;
 
 use crate::icons::{self, Icon};
-use crate::markup::{self, Doc, Ink, Mark, Shape, ShapeKind, Stroke, Tiles};
+use crate::markup::{self, Doc, Ink, Mark, Shape, ShapeKind, Stroke, Text, Tiles};
 use crate::widgets::{
     self, dim_outside, divider, escape_for_app, icon_button, Note, Notifier, PopupClickGuard, ACCENT, BTN, BUTTON_HOVER, DIVIDER_W, GAP, GROUP_GAP, ICON,
     ICON_OFF, MIN_WINDOW_H, MIN_WINDOW_W, TOOLBAR_BG,
 };
 use crate::win;
 
-/// Measured: New button 80 + markup with crop buttons 390 + output group 133 + 2 gaps + 24 toolbar margin = 659.
-pub const MIN_EDIT_W: f32 = 670.0;
+/// Measured: New button 80 + markup with crop buttons 430 + output group 133 + 2 gaps + 24 toolbar margin = 699.
+pub const MIN_EDIT_W: f32 = 710.0;
 const MIN_ZOOM: f32 = 0.05;
 const MAX_ZOOM: f32 = 8.0;
 /// Snip zoom change per Ctrl+Plus / Ctrl+Minus press.
@@ -42,6 +42,7 @@ pub enum Tool {
     Pen,
     Highlighter,
     Shape,
+    Text,
     Eraser,
 }
 
@@ -195,6 +196,9 @@ pub struct Tools {
     pub highlighter: (Color32, f32),
     pub shape_kind: ShapeKind,
     pub shape: (Color32, f32),
+    /// Colour and font size in screen points.
+    pub text: (Color32, f32),
+    pub text_outline: bool,
 }
 
 impl Default for Tools {
@@ -205,6 +209,8 @@ impl Default for Tools {
             highlighter: (HIGHLIGHT_COLORS[0], 18.0),
             shape_kind: ShapeKind::Arrow,
             shape: (PEN_COLORS[2], 4.0),
+            text: (PEN_COLORS[2], 24.0),
+            text_outline: true,
         }
     }
 }
@@ -296,7 +302,19 @@ impl Snip {
             None => Some(Rect::from_min_size(Pos2::ZERO, vec2(w as f32, h as f32))),
         };
         self.crop_drag = None;
-        self.drawing = None;
+        self.finish_text();
+    }
+
+    /// True while text is being typed.
+    fn typing(&self) -> bool {
+        matches!(self.drawing, Some(Mark::Text(_)))
+    }
+
+    /// Places the text being typed, if it has anything in it.
+    fn finish_text(&mut self) {
+        if let (Some(m), Some(canvas)) = (placeable(self.drawing.take()), self.texture.as_mut()) {
+            canvas.commit(&mut self.doc, m);
+        }
     }
 
     fn cancel_crop(&mut self) {
@@ -310,7 +328,7 @@ impl Snip {
     }
 
     fn markup_width(&self) -> f32 {
-        let buttons = if self.crop.is_some() { 9.0 } else { 7.0 };
+        let buttons = if self.crop.is_some() { 10.0 } else { 8.0 };
         let dividers = 2.0;
         buttons * BTN.x + dividers * DIVIDER_W + (buttons + dividers - 1.0) * GAP
     }
@@ -320,12 +338,14 @@ impl Snip {
             (Tool::Pen, Icon::Pen, "Pen (click again for colour and size)"),
             (Tool::Highlighter, Icon::Highlighter, "Highlighter (click again for colour and size)"),
             (Tool::Shape, shape_icon(self.tools.shape_kind), "Shapes (click again for shape, colour and size; Shift keeps lines at 45° and boxes square)"),
+            (Tool::Text, Icon::Text, "Text: click and type, Enter places it, Shift+Enter starts a new line (click again for colour, size and outline)"),
             (Tool::Eraser, Icon::Eraser, "Eraser: rubs out whole marks"),
         ] {
             let ink = match tool {
                 Tool::Pen => Some(self.tools.pen.0),
                 Tool::Highlighter => Some(self.tools.highlighter.0),
                 Tool::Shape => Some(self.tools.shape.0),
+                Tool::Text => Some(self.tools.text.0),
                 _ => None,
             };
             let resp = icon_button(ui, icon, ink, self.tools.tool == tool, true, tip);
@@ -333,7 +353,7 @@ impl Snip {
             if resp.clicked() {
                 self.tools.tool = tool;
                 self.cancel_crop();
-                self.drawing = None;
+                self.finish_text();
             }
             if ink.is_some() {
                 egui::Popup::from_response(&resp)
@@ -378,6 +398,7 @@ impl Snip {
         let ((color, width), palette, range) = match tool {
             Tool::Highlighter => (&mut self.tools.highlighter, &HIGHLIGHT_COLORS[..], 6.0..=48.0),
             Tool::Shape => (&mut self.tools.shape, &PEN_COLORS[..], 1.0..=24.0),
+            Tool::Text => (&mut self.tools.text, &PEN_COLORS[..], 10.0..=96.0),
             _ => (&mut self.tools.pen, &PEN_COLORS[..], 1.0..=24.0),
         };
         ui.horizontal(|ui| {
@@ -398,6 +419,9 @@ impl Snip {
             ui.label("Size");
             ui.add(egui::Slider::new(width, range).show_value(false));
         });
+        if tool == Tool::Text {
+            ui.checkbox(&mut self.tools.text_outline, "Outline");
+        }
     }
 
     fn canvas(&mut self, ui: &mut egui::Ui, guard: &PopupClickGuard) {
@@ -515,6 +539,37 @@ impl Snip {
                             Some(m) => canvas.commit(doc, m),
                             None => {}
                         }
+                    }
+                }
+                Tool::Text => {
+                    if resp.hovered() {
+                        ctx.set_cursor_icon(CursorIcon::Text);
+                    }
+                    if resp.clicked() {
+                        if let Some(p) = pointer {
+                            // A click places the text being typed and starts new text there, its first line centred on the click.
+                            if let Some(m) = placeable(drawing.take()) {
+                                canvas.commit(doc, m);
+                            }
+                            let mut t = Text { text: String::new(), color: tools.text.0, size: tools.text.1 * k, outline: tools.text_outline, pos: to_px(p) };
+                            t.pos.y -= t.line_height() / 2.0;
+                            *drawing = Some(Mark::Text(t));
+                        }
+                    }
+                    if let Some(Mark::Text(t)) = drawing.as_mut() {
+                        // Colour, size and outline follow the options while typing; size is in screen points like the pen's.
+                        (t.color, t.size, t.outline) = (tools.text.0, tools.text.1 * k, tools.text_outline);
+                        if type_into(&ctx, &mut t.text) {
+                            if let Some(m) = placeable(drawing.take()) {
+                                canvas.commit(doc, m);
+                            }
+                        }
+                    }
+                    if let Some(Mark::Text(t)) = drawing.as_ref() {
+                        let top = to_pt(t.caret());
+                        let caret = [top, top + vec2(0.0, t.line_height() / k)];
+                        painter.line_segment(caret, (3.0, t.halo_color()));
+                        painter.line_segment(caret, (1.5, t.color));
                     }
                 }
                 Tool::Eraser => {
@@ -647,7 +702,9 @@ impl Editor {
     fn shortcuts(&mut self, ctx: &egui::Context) {
         // Popups close themselves on Esc and a focused button activates itself on Enter, so those keys are left to them.
         let (popup_open, focused) = (egui::Popup::is_any_open(ctx), ctx.memory(|m| m.focused().is_some()));
-        let Keys { new, save, undo, redo, copy, enter, esc, zoom_in, zoom_out, zoom_fit } = ctx.input_mut(|i| read_keys(i, popup_open, focused));
+        // While text is being typed Enter belongs to it, as it would to a focused widget.
+        let typing = matches!(&self.content, Content::Snip(s) if s.typing());
+        let Keys { new, save, undo, redo, copy, enter, esc, zoom_in, zoom_out, zoom_fit } = ctx.input_mut(|i| read_keys(i, popup_open, focused || typing));
         if new {
             self.request_new(ctx);
         }
@@ -658,8 +715,13 @@ impl Editor {
             self.copy(ctx);
         }
         let Content::Snip(snip) = &mut self.content else { return };
-        if undo {
-            snip.step(false);
+        if undo || esc {
+            if snip.typing() {
+                // The first Ctrl+Z or Esc throws away the text being typed, and nothing else.
+                snip.drawing = None;
+            } else if undo {
+                snip.step(false);
+            }
         }
         if redo {
             snip.step(true);
@@ -667,7 +729,7 @@ impl Editor {
         if enter {
             snip.apply_crop();
         }
-        if esc {
+        if esc && !typing {
             snip.cancel_crop();
         }
         if zoom_fit {
@@ -760,8 +822,10 @@ impl Editor {
         }
     }
 
-    fn copy(&self, ctx: &egui::Context) {
-        let Content::Snip(snip) = &self.content else { return };
+    fn copy(&mut self, ctx: &egui::Context) {
+        let Content::Snip(snip) = &mut self.content else { return };
+        // What is copied is what is on screen, text still being typed included.
+        snip.finish_text();
         let (image, hwnd, report) = (snip.flattened(), self.root_hwnd, self.notifier(ctx));
         std::thread::spawn(move || {
             report.send(match win::copy_image(hwnd as HWND, &image) {
@@ -774,7 +838,11 @@ impl Editor {
     /// Asks where to save, then writes the file on a worker thread: a big PNG takes a moment to
     /// encode, and a long recording a moment to copy.
     fn save_as(&mut self, ctx: &egui::Context) {
+        if let Content::Snip(snip) = &mut self.content {
+            snip.finish_text();
+        }
         let owner = self.owner();
+
         let report = self.notifier(ctx);
         match &self.content {
             Content::Snip(snip) => {
@@ -1080,7 +1148,7 @@ impl CanvasTex {
 
     /// Uploads the runs of `tiles` with `m` painted over the committed picture, or plain when `m` is `None`.
     fn upload(&mut self, tiles: &Tiles, m: Option<&Mark>) {
-        let raster = m.map(Mark::raster);
+        let raster = m.map(|m| m.raster(self.shown.size));
         for r in tiles.runs() {
             let mut patch = markup::sub_image(&self.shown, r.x0, r.y0, r.x1 - r.x0, r.y1 - r.y0);
             if let Some(raster) = &raster {
@@ -1098,7 +1166,8 @@ impl CanvasTex {
             let mut tiles = Tiles::new(doc.size());
             m.footprint(&mut tiles);
             let shown = Arc::make_mut(&mut self.shown);
-            let raster = m.raster();
+            let raster = m.raster(doc.size());
+
             for r in tiles.runs() {
                 let mut patch = markup::sub_image(shown, r.x0, r.y0, r.x1 - r.x0, r.y1 - r.y0);
                 raster.paint(&mut patch, r.pos());
@@ -1138,10 +1207,19 @@ impl CanvasTex {
                 if self.live.last.as_ref() == Some(m) {
                     return;
                 }
-                m.footprint(&mut fresh);
-                let left = self.live.tiles.minus(&fresh);
+                let mut covered = Tiles::new(self.shown.size);
+                m.footprint(&mut covered);
+                let left = self.live.tiles.minus(&covered);
                 self.upload(&left, None);
-                self.live.tiles = fresh.clone();
+                match (&self.live.last, m) {
+                    // Typing changes a letter at a time: only the changed letters' tiles are repainted.
+                    (Some(Mark::Text(old)), Mark::Text(new)) => {
+                        markup::text_changes(old, new, &mut fresh);
+                        fresh = fresh.intersect(&covered);
+                    }
+                    _ => fresh = covered.clone(),
+                }
+                self.live.tiles = covered;
                 self.live.last = Some(m.clone());
             }
         }
@@ -1158,6 +1236,35 @@ impl CanvasTex {
     }
 }
 
+/// Text worth placing: typed text with something visible in it. Anything else is dropped.
+fn placeable(m: Option<Mark>) -> Option<Mark> {
+    match m {
+        Some(Mark::Text(t)) if !t.text.trim().is_empty() => Some(Mark::Text(t)),
+        _ => None,
+    }
+}
+
+/// Applies this frame's typing to `text`, taking those events so nothing else reacts to them.
+/// True when Enter (without Shift) asks to place the text.
+fn type_into(ctx: &egui::Context, text: &mut String) -> bool {
+    let mut place = false;
+    ctx.input_mut(|i| {
+        i.events.retain(|e| {
+            match e {
+                Event::Text(s) => text.push_str(s),
+                Event::Paste(s) => text.push_str(&s.replace("\r\n", "\n")),
+                Event::Key { key: Key::Backspace, pressed: true, .. } => {
+                    text.pop();
+                }
+                Event::Key { key: Key::Enter, pressed: true, modifiers, .. } if modifiers.shift => text.push('\n'),
+                Event::Key { key: Key::Enter, pressed: true, .. } => place = true,
+                _ => return true,
+            }
+            false
+        });
+    });
+    place
+}
 /// Where the canvas's scroll area is scrolled to, as of its last frame. Call from the `Ui` that holds it.
 fn scroll_offset(ui: &egui::Ui) -> Vec2 {
     let id = ui.make_persistent_id(egui::IdSalt::new(SCROLL_ID));
@@ -1394,15 +1501,15 @@ mod tests {
         assert_eq!(edit_window_size(vec2(5000.0, 5000.0), wide), wide * 0.85);
     }
 
-    /// Group widths as laid out by `Editor::toolbar`: New button 80, output 133, markup with crop buttons 390.
+    /// Group widths as laid out by `Editor::toolbar`: New button 80, output 133, markup with crop buttons 430.
     const NEW_END: f32 = 12.0 + 80.0;
     const OUT_W: f32 = 133.0;
-    const MARKUP_W: f32 = 390.0;
+    const MARKUP_W: f32 = 430.0;
 
     #[test]
     fn markup_width_matches_the_measured_toolbar() {
         let mut snip = Snip::new(white(4, 4), Tools::default());
-        assert_eq!(snip.markup_width(), 7.0 * BTN.x + 2.0 * DIVIDER_W + 8.0 * GAP);
+        assert_eq!(snip.markup_width(), 8.0 * BTN.x + 2.0 * DIVIDER_W + 9.0 * GAP);
         snip.crop = Some(Rect::from_min_max(Pos2::ZERO, pos2(2.0, 2.0)));
         assert_eq!(snip.markup_width(), MARKUP_W);
         const { assert!(NEW_END + GROUP_GAP + MARKUP_W + GROUP_GAP + OUT_W + 12.0 <= MIN_EDIT_W, "MIN_EDIT_W fits all three groups") };
@@ -1719,6 +1826,87 @@ Arc::ptr_eq(&snip.flattened(), &shown), "a current canvas is reused, not re-burn
         assert!(*snip.flattened() == snip.doc.flatten());
     }
 
+    fn key(key: Key, modifiers: Modifiers) -> Event {
+        Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers }
+    }
+
+    #[test]
+    fn typed_text_shows_exactly_what_is_saved_and_enter_places_it() {
+        let ctx = egui::Context::default();
+        let mut snip = Snip::new(gradient(300, 200), Tools { tool: Tool::Text, ..Tools::default() });
+        let mut screen = Screen { image: None };
+        canvas_frame(&ctx, &mut snip, &mut screen, vec![]);
+        let at = pos2(520.0, 360.0);
+        canvas_frame(&ctx, &mut snip, &mut screen, vec![Event::PointerMoved(at), pointer(at, true)]);
+        canvas_frame(&ctx, &mut snip, &mut screen, vec![pointer(at, false)]);
+        assert!(snip.typing(), "a click starts typing");
+        let live_matches = |snip: &Snip, screen: &Screen| {
+            let mut want = snip.doc.flatten();
+            markup::burn(&mut want, snip.drawing.as_ref().unwrap());
+            screen.pixels() == want.pixels
+        };
+        for events in [
+            vec![Event::Text("Hey".into())],
+            vec![key(Key::Backspace, Modifiers::NONE), Event::Text("llo".into())],
+            vec![key(Key::Enter, Modifiers::SHIFT), Event::Text("2nd".into())],
+        ] {
+            canvas_frame(&ctx, &mut snip, &mut screen, events);
+            assert!(live_matches(&snip, &screen), "the text on screen is the text that will be saved");
+        }
+        canvas_frame(&ctx, &mut snip, &mut screen, vec![key(Key::Enter, Modifiers::NONE)]);
+        canvas_frame(&ctx, &mut snip, &mut screen, vec![]);
+        assert!(!snip.typing());
+        assert!(matches!(&*snip.doc.marks[0], Mark::Text(t) if t.text == "Hello\n2nd" && t.outline), "{:?}", snip.doc.marks);
+        assert!(screen.pixels() == snip.doc.flatten().pixels);
+        assert!(*snip.flattened() == snip.doc.flatten());
+    }
+
+    #[test]
+    fn esc_drops_the_draft_empty_text_is_never_placed_and_a_crop_places_it_first() {
+        let ctx = egui::Context::default();
+        let fresh = Snip::new(white(300, 200), Tools { tool: Tool::Text, ..Tools::default() });
+        let mut ed = Editor::new(Content::Snip(Box::new(fresh)), "t".into(), ViewportId::ROOT, 0, None, String::new(), MIN_EDIT_W);
+        let mut screen = Screen { image: None };
+        fn snip(ed: &mut Editor) -> &mut Snip {
+            match &mut ed.content {
+                Content::Snip(s) => s,
+                Content::Video(_) => panic!("a snip"),
+            }
+        }
+        let canvas = |ed: &mut Editor, screen: &mut Screen, events: Vec<Event>| canvas_frame(&ctx, snip(ed), screen, events);
+        // Keys go through the editor's own shortcut handling, as in its window.
+        let esc = |ed: &mut Editor| {
+            let input = egui::RawInput { events: vec![key(Key::Escape, Modifiers::NONE)], ..Default::default() };
+            let mut out = ctx.run_ui(input, |ui| ed.shortcuts(ui.ctx()));
+            out.textures_delta.clear();
+        };
+        let click = |ed: &mut Editor, screen: &mut Screen| {
+            let at = pos2(640.0, 400.0);
+            canvas(ed, screen, vec![Event::PointerMoved(at), pointer(at, true)]);
+            canvas(ed, screen, vec![pointer(at, false)]);
+        };
+        let state = |ed: &mut Editor| {
+            let s = snip(ed);
+            (s.typing(), s.doc.marks.len(), s.crop.is_some())
+        };
+        canvas(&mut ed, &mut screen, vec![]);
+        click(&mut ed, &mut screen);
+        canvas(&mut ed, &mut screen, vec![Event::Text("draft".into())]);
+        assert_eq!(state(&mut ed), (true, 0, false));
+        esc(&mut ed);
+        assert_eq!(state(&mut ed), (false, 0, false), "Esc throws the draft away");
+        click(&mut ed, &mut screen);
+        click(&mut ed, &mut screen);
+        assert_eq!(state(&mut ed), (true, 0, false), "clicking away from empty text places nothing");
+        canvas(&mut ed, &mut screen, vec![Event::Text("kept".into())]);
+        snip(&mut ed).toggle_crop();
+        assert_eq!(state(&mut ed), (false, 1, true), "starting a crop places the text first");
+        esc(&mut ed);
+        assert_eq!(state(&mut ed), (false, 1, false), "with nothing typed, Esc cancels the crop as usual");
+        canvas(&mut ed, &mut screen, vec![]);
+        assert!(screen.pixels() == snip(&mut ed).doc.flatten().pixels);
+    }
+
     #[test]
     fn a_click_with_the_shape_tool_draws_nothing() {
         let ctx = egui::Context::default();
@@ -1731,7 +1919,6 @@ Arc::ptr_eq(&snip.flattened(), &shown), "a current canvas is reused, not re-burn
         assert!(snip.doc.marks.is_empty() && snip.drawing.is_none());
         assert!(screen.pixels() == snip.doc.image.pixels);
     }
-
 
     #[test]
     fn a_cancelled_stroke_leaves_the_picture_as_it_was() {
@@ -1803,7 +1990,10 @@ Arc::ptr_eq(&snip.flattened(), &shown), "a current canvas is reused, not re-burn
             highlighter: (HIGHLIGHT_COLORS[2], 30.0),
             shape_kind: ShapeKind::Ellipse,
             shape: (PEN_COLORS[4], 12.0),
+            text: (PEN_COLORS[1], 40.0),
+            text_outline: false,
         };
+
         editors.with(a, |e| {
             let Content::Snip(s) = &mut e.content else { panic!("a snip") };
             s.tools = picked;

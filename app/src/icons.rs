@@ -21,6 +21,8 @@ pub enum Icon {
     Line,
     RectOutline,
     Ellipse,
+    /// A "T", with a dot of the text's ink.
+    Text,
     Crop,
     Check,
     Close,
@@ -138,7 +140,15 @@ pub fn paint(p: &Painter, rect: Rect, icon: Icon, color: Color32, ink: Option<Co
                 p.circle(at(16.0, 16.0), 2.6 * s, ink, Stroke::new(1.0 * s, color));
             }
         }
+        Icon::Text => {
+            line(&[(3.5, 4.0), (14.5, 4.0)], 1.6, color);
+            line(&[(9.0, 4.0), (9.0, 16.0)], 1.6, color);
+            if let Some(ink) = ink {
+                p.circle(at(16.0, 16.0), 2.6 * s, ink, Stroke::new(1.0 * s, color));
+            }
+        }
         Icon::Crop => {
+
 
             line(&[(6.0, 2.5), (6.0, 14.0), (17.5, 14.0)], w, color);
             line(&[(2.5, 6.0), (14.0, 6.0), (14.0, 17.5)], w, color);
