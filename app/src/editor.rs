@@ -23,8 +23,9 @@ use crate::widgets::{
 };
 use crate::win;
 
-/// Measured: New button 80 + markup with crop buttons 430 + output group 133 + 2 gaps + 24 toolbar margin = 699.
-pub const MIN_EDIT_W: f32 = 710.0;
+/// Measured: bar padding 8 + New button 72 + markup with crop buttons 382 + output group 117 + 2 group gaps
+/// + padding 8 + caption buttons 138 = 757.
+pub const MIN_EDIT_W: f32 = 760.0;
 const MIN_ZOOM: f32 = 0.05;
 const MAX_ZOOM: f32 = 8.0;
 /// Snip zoom change per Ctrl+Plus / Ctrl+Minus press.
@@ -254,6 +255,9 @@ pub struct Editor {
     root_hwnd: isize,
     /// This editor's own window, looked up by its (unique) title.
     hwnd: Option<isize>,
+    /// The toolbar doubles as the window's title bar once it is attached to `hwnd`.
+    bar: win::TitleBar,
+    bar_tried: bool,
     /// Screen corner to move the new window to on its first frame.
     place: Option<[i32; 2]>,
     /// Frames left in which to keep the new window on screen.
@@ -615,6 +619,8 @@ impl Editor {
             viewport,
             root_hwnd,
             hwnd: None,
+            bar: win::TitleBar::default(),
+            bar_tried: false,
             place,
             settle: SETTLE_FRAMES,
             min_width,
@@ -655,6 +661,7 @@ impl Editor {
         while let Ok(msg) = self.note_rx.try_recv() {
             self.say(msg);
         }
+        self.attach_title_bar(&ctx);
         self.settle_window(&ctx);
         self.popup_guard.begin_frame(&ctx);
         self.shortcuts(&ctx);
@@ -679,6 +686,20 @@ impl Editor {
             self.hwnd = win::find_window(&self.title).map(|h| h as isize);
         }
         self.hwnd.map(|h| h as HWND)
+    }
+
+    /// Takes over the window's caption on the first frame its handle can be found.
+    fn attach_title_bar(&mut self, ctx: &egui::Context) {
+        if self.bar_tried {
+            return;
+        }
+        let Some(hwnd) = self.own_hwnd() else { return };
+        self.bar_tried = true;
+        let (wake, id) = (ctx.clone(), self.viewport);
+        if let Err(e) = self.bar.attach(hwnd, move || wake.request_repaint_of(id)) {
+            self.say(e);
+        }
+        ctx.request_repaint();
     }
 
     /// Owner for dialogs: this window, or the shell's until this one is found.
@@ -756,32 +777,32 @@ impl Editor {
 
     fn toolbar(&mut self, ui: &mut egui::Ui) {
         self.sync_min_width(&ui.ctx().clone());
-        egui::Panel::top("editor_toolbar")
-            .frame(egui::Frame::new().fill(TOOLBAR_BG).inner_margin(egui::Margin::symmetric(12, 6)))
-            .show(ui, |ui| {
-                ui.spacing_mut().item_spacing = vec2(GAP, 0.0);
-                let row = Rect::from_min_size(ui.available_rect_before_wrap().min, vec2(ui.available_width(), BTN.y));
-                ui.allocate_rect(row, Sense::hover());
-                let layout = |l| egui::UiBuilder::new().max_rect(row).layout(l);
+        let bar = self.bar.clone();
+        widgets::title_bar(ui, "editor_toolbar", &bar, |ui, row| {
+            let layout = |l| egui::UiBuilder::new().max_rect(row).layout(l);
 
-                let mut left = ui.new_child(layout(Layout::left_to_right(Align::Center)));
-                if widgets::new_button(&mut left, &self.new_tip).clicked() {
-                    self.request_new(&left.ctx().clone());
-                }
-                let left_end = left.min_rect().max.x;
+            let mut left = ui.new_child(layout(Layout::left_to_right(Align::Center)));
+            if widgets::new_button(&mut left, &self.new_tip).clicked() {
+                self.request_new(&left.ctx().clone());
+            }
+            let left_end = left.min_rect().max.x;
 
-                let mut right = ui.new_child(layout(Layout::right_to_left(Align::Center)));
-                self.output_controls(&mut right);
-                let right_start = right.min_rect().min.x;
+            let mut right = ui.new_child(layout(Layout::right_to_left(Align::Center)));
+            self.output_controls(&mut right);
+            let right_start = right.min_rect().min.x;
+            let mut groups = vec![left.min_rect(), right.min_rect()];
 
-                if let Content::Snip(snip) = &mut self.content {
-                    let width = snip.markup_width();
-                    let x = markup_x(row.center().x, width, left_end, right_start);
-                    let mid_rect = Rect::from_min_size(pos2(x, row.min.y), vec2(width + 1.0, BTN.y));
-                    let mut mid = ui.new_child(egui::UiBuilder::new().max_rect(mid_rect).layout(Layout::left_to_right(Align::Center)));
-                    snip.markup_controls(&mut mid);
-                }
-            });
+            if let Content::Snip(snip) = &mut self.content {
+                let width = snip.markup_width();
+                // Centred on the window, as the original centres its tools, unless the groups beside push it.
+                let x = markup_x(ui.max_rect().center().x, width, left_end, right_start);
+                let mid_rect = Rect::from_min_size(pos2(x, row.min.y), vec2(width + 1.0, BTN.y));
+                let mut mid = ui.new_child(egui::UiBuilder::new().max_rect(mid_rect).layout(Layout::left_to_right(Align::Center)));
+                snip.markup_controls(&mut mid);
+                groups.push(mid.min_rect());
+            }
+            groups
+        });
     }
 
     fn output_controls(&mut self, ui: &mut egui::Ui) {
@@ -1373,6 +1394,7 @@ fn read_keys(i: &mut egui::InputState, popup_open: bool, focused: bool) -> Keys 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::widgets::{BAR_PAD, CAPTION_W};
 
     fn white(w: usize, h: usize) -> ColorImage {
         ColorImage::new([w, h], vec![Color32::WHITE; w * h])
@@ -1502,9 +1524,11 @@ mod tests {
     }
 
     /// Group widths as laid out by `Editor::toolbar`: New button 80, output 133, markup with crop buttons 430.
-    const NEW_END: f32 = 12.0 + 80.0;
-    const OUT_W: f32 = 133.0;
-    const MARKUP_W: f32 = 430.0;
+    const NEW_END: f32 = BAR_PAD + 72.0;
+    const OUT_W: f32 = 117.0;
+    const MARKUP_W: f32 = 382.0;
+    /// Right end of the controls row: the caption buttons and the padding before them.
+    const ROW_END_GAP: f32 = BAR_PAD + 3.0 * CAPTION_W;
 
     #[test]
     fn markup_width_matches_the_measured_toolbar() {
@@ -1512,15 +1536,15 @@ mod tests {
         assert_eq!(snip.markup_width(), 8.0 * BTN.x + 2.0 * DIVIDER_W + 9.0 * GAP);
         snip.crop = Some(Rect::from_min_max(Pos2::ZERO, pos2(2.0, 2.0)));
         assert_eq!(snip.markup_width(), MARKUP_W);
-        const { assert!(NEW_END + GROUP_GAP + MARKUP_W + GROUP_GAP + OUT_W + 12.0 <= MIN_EDIT_W, "MIN_EDIT_W fits all three groups") };
+        const { assert!(NEW_END + GROUP_GAP + MARKUP_W + GROUP_GAP + OUT_W + ROW_END_GAP <= MIN_EDIT_W, "MIN_EDIT_W fits all three groups") };
     }
 
     #[test]
     fn markup_group_never_overlaps_its_neighbours() {
         for window in [MIN_EDIT_W as i32, 900, 1200, 2000] {
-            let row_end = window as f32 - 12.0;
+            let row_end = window as f32 - ROW_END_GAP;
             let right_start = row_end - OUT_W;
-            let x = markup_x((12.0 + row_end) / 2.0, MARKUP_W, NEW_END, right_start);
+            let x = markup_x(window as f32 / 2.0, MARKUP_W, NEW_END, right_start);
             assert!(x >= NEW_END + GROUP_GAP, "overlaps the New button at {window}");
             assert!(x + MARKUP_W <= right_start - GROUP_GAP, "overlaps output group at {window}");
         }
@@ -1536,8 +1560,8 @@ mod tests {
     #[test]
     fn markup_group_survives_a_window_narrower_than_the_toolbar() {
         for window in [520.0_f32, 560.0, 600.0] {
-            let row_end = window - 12.0;
-            let x = markup_x((12.0 + row_end) / 2.0, MARKUP_W, NEW_END, row_end - OUT_W);
+            let row_end = window - ROW_END_GAP;
+            let x = markup_x(window / 2.0, MARKUP_W, NEW_END, row_end - OUT_W);
             assert!(x.is_finite() && x >= NEW_END + GROUP_GAP, "packs against the New button at {window}");
         }
     }
