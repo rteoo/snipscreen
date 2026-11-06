@@ -10,20 +10,22 @@ use std::mem::{size_of, zeroed};
 use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::sync::mpsc::channel;
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
-use windows_sys::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS, ERROR_CLASS_ALREADY_EXISTS, HANDLE, HMODULE, HWND, LPARAM, LRESULT, WPARAM};
+use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, ERROR_CLASS_ALREADY_EXISTS, HANDLE, HMODULE, HWND, LPARAM, LRESULT, WPARAM};
 use windows_sys::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, RegisterHotKey, UnregisterHotKey, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT, MOD_WIN, VK_CONTROL, VK_ESCAPE, VK_LCONTROL, VK_LMENU,
-    VK_LSHIFT, VK_LWIN, VK_MENU, VK_RCONTROL, VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SHIFT, VK_SNAPSHOT,
+    VK_LSHIFT, VK_LWIN, VK_MENU, VK_RCONTROL, VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SHIFT,
 };
 use windows_sys::Win32::UI::Shell::{
     Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_SETVERSION, NIN_SELECT, NOTIFYICONDATAW, NOTIFYICON_VERSION_4,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AllowSetForegroundWindow, AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyMenu, DestroyWindow, DispatchMessageW, FindWindowW,
-    GetMessageW, GetSystemMetrics, GetWindowLongPtrW, GetWindowThreadProcessId, KillTimer, LoadImageW, PostMessageW, PostQuitMessage, RegisterClassExW,
+    GetForegroundWindow, GetMessageW, GetSystemMetrics, GetWindowLongPtrW, GetWindowThreadProcessId, KillTimer, LoadImageW, PostMessageW, PostQuitMessage, RegisterClassExW,
     RegisterWindowMessageW, SendMessageTimeoutW, SetForegroundWindow, SetMenuDefaultItem, SetTimer, SetWindowLongPtrW, TrackPopupMenuEx, TranslateMessage,
     GWLP_USERDATA, HICON, IMAGE_ICON, LR_DEFAULTCOLOR, MF_SEPARATOR, MF_STRING, MSG, SMTO_ABORTIFHUNG, SM_CXSMICON, SM_CYSMICON, TPM_BOTTOMALIGN, TPM_RETURNCMD,
     TPM_RIGHTBUTTON, CallNextHookEx, SetWindowsHookExW, UnhookWindowsHookEx, HHOOK, KBDLLHOOKSTRUCT, WH_KEYBOARD_LL, WM_KEYDOWN, WM_SYSKEYDOWN, WM_APP, WM_CLOSE, WM_CONTEXTMENU, WM_COPYDATA, WM_DESTROY, WM_ENDSESSION, WM_HOTKEY, WM_LBUTTONDBLCLK, WM_NULL, WM_QUERYENDSESSION, WM_TIMER,
@@ -49,6 +51,17 @@ const MSG_SET_HOTKEY: u32 = WM_APP + 3;
 const MSG_RECORD: u32 = WM_APP + 4;
 /// Posted by the keyboard hook: wParam the `MOD_*` flags, lParam the key, or -1 for Esc.
 const MSG_RECORDED: u32 = WM_APP + 5;
+/// Posted by `Agent::drop`; the only thing that destroys the window. A `WM_CLOSE` from outside
+/// (`taskkill` without /f) is a request to quit, which the shell carries out.
+const MSG_DESTROY: u32 = WM_APP + 6;
+/// Posted by the keyboard hook when the foreground left SnipScreen while recording.
+const MSG_RECORD_LOST: u32 = WM_APP + 7;
+/// How long signing out waits for the shell to finish (a recording to be finalised, settings to be written).
+const END_SESSION_WAIT: Duration = Duration::from_secs(5);
+
+/// `WM_COPYDATA` answers: taken, or refused because this copy is closing.
+const COPYDATA_TAKEN: usize = 1;
+const COPYDATA_CLOSING: usize = 2;
 /// The tray icon's callback message.
 const MSG_TRAY: u32 = WM_APP + 10;
 /// Enter or Space on the focused tray icon (`NIN_SELECT | NINF_KEY`).
@@ -144,13 +157,26 @@ pub fn claim_single_instance() -> bool {
     unsafe {
         let handle = CreateMutexW(null(), 0, name.as_ptr());
         // Without a mutex there is no way to tell; running is better than refusing to start.
-        handle.is_null() || GetLastError() != ERROR_ALREADY_EXISTS
+        if handle.is_null() || GetLastError() != ERROR_ALREADY_EXISTS {
+            return true;
+        }
+        // Ours would keep the mutex alive after the running copy has gone.
+        CloseHandle(handle);
+        false
     }
+}
+
+/// What the running copy said to a forwarded launch.
+#[derive(Debug, PartialEq)]
+pub enum Forwarded {
+    Taken,
+    /// It is quitting; this launch should wait for it to go and then run itself.
+    Closing,
 }
 
 /// Hands `intent` to the copy that is already running, waiting up to ~3 s for its window (it may
 /// still be starting) and letting it take the foreground, which this launch was given.
-pub fn forward(intent: &Intent) -> Result<(), String> {
+pub fn forward(intent: &Intent) -> Result<Forwarded, String> {
     let class = wide(CLASS);
     let text: Vec<u16> = intent.encode().encode_utf16().collect();
     for _ in 0..150 {
@@ -166,7 +192,11 @@ pub fn forward(intent: &Intent) -> Result<(), String> {
             let data = COPYDATASTRUCT { dwData: COPYDATA_TAG, cbData: (text.len() * 2) as u32, lpData: text.as_ptr() as *mut c_void };
             let mut answer = 0usize;
             let sent = SendMessageTimeoutW(hwnd, WM_COPYDATA, 0, &data as *const _ as LPARAM, SMTO_ABORTIFHUNG, 3000, &mut answer);
-            return if sent != 0 && answer == 1 { Ok(()) } else { Err("SnipScreen is already running but didn't answer".into()) };
+            return match (sent != 0, answer) {
+                (true, COPYDATA_TAKEN) => Ok(Forwarded::Taken),
+                (true, COPYDATA_CLOSING) => Ok(Forwarded::Closing),
+                _ => Err("SnipScreen is already running but didn't answer".into()),
+            };
         }
     }
     Err("SnipScreen is already starting but its window never appeared".into())
@@ -198,6 +228,16 @@ pub struct Agent {
     /// The hidden window; `HWND` itself is not `Send`.
     hwnd: isize,
     thread: Option<JoinHandle<()>>,
+    exit: Arc<ExitGate>,
+}
+
+/// How the shell's exit reaches the agent thread: `closing` once it has begun (later launches are
+/// turned away), `done` once it has finished (signing out may go on).
+#[derive(Default)]
+struct ExitGate {
+    closing: AtomicBool,
+    done: Mutex<bool>,
+    finished: Condvar,
 }
 
 /// The agent and how its first registration went.
@@ -222,6 +262,7 @@ struct State {
     taskbar_created: u32,
     /// The keyboard hook while a shortcut is being recorded.
     hook: HHOOK,
+    exit: Arc<ExitGate>,
 }
 
 /// The agent window, for the keyboard hook to post to (a hook procedure gets no context of its own).
@@ -231,20 +272,46 @@ static RECORD_WIN: AtomicBool = AtomicBool::new(false);
 /// A combination was posted; later keys pass untouched until the hook is removed.
 static RECORD_DONE: AtomicBool = AtomicBool::new(false);
 
+/// Tests call the hook directly, with some other app in front.
+#[cfg(test)]
+static TEST_IN_FRONT: AtomicBool = AtomicBool::new(false);
+
+/// Whether the window in front belongs to this process (the Settings window, while recording).
+unsafe fn ours_in_front() -> bool {
+    #[cfg(test)]
+    if TEST_IN_FRONT.load(Ordering::Relaxed) {
+        return true;
+    }
+    let mut pid = 0;
+    GetWindowThreadProcessId(GetForegroundWindow(), &mut pid);
+    pid == std::process::id()
+}
+
 fn is_modifier(vk: u16) -> bool {
     matches!(vk, VK_SHIFT | VK_LSHIFT | VK_RSHIFT | VK_CONTROL | VK_LCONTROL | VK_RCONTROL | VK_MENU | VK_LMENU | VK_RMENU)
 }
 
 /// Low-level keyboard hook, live only while recording: notes the first non-modifier key pressed
-/// with the modifiers held at the time. Ctrl, Alt, Shift and ordinary keys still reach the focused
-/// window (the Settings window, which ignores them); Win and Print Screen don't reach the system.
+/// with the modifiers held at the time. Ctrl, Alt and Shift still reach the focused window (the
+/// Settings window, which ignores them); Win doesn't reach the system, and the recorded key
+/// reaches nothing, so Win+Shift+S doesn't open Windows' snipping bar and Alt+F4 or Alt+Space
+/// don't act on the Settings window. Once another app is in front it lets every key through and
+/// has itself taken off: it must never eat keys meant for something else.
 unsafe extern "system" fn record_hook(code: i32, w: WPARAM, l: LPARAM) -> LRESULT {
     if code < 0 {
+        return CallNextHookEx(null_mut(), code, w, l);
+    }
+    if !ours_in_front() {
+        RECORD_WIN.store(false, Ordering::Relaxed);
+        if !RECORD_DONE.swap(true, Ordering::Relaxed) {
+            PostMessageW(RECORD_TO.load(Ordering::Relaxed) as HWND, MSG_RECORD_LOST, 0, 0);
+        }
         return CallNextHookEx(null_mut(), code, w, l);
     }
     let key = &*(l as *const KBDLLHOOKSTRUCT);
     let vk = key.vkCode as u16;
     let down = matches!(w as u32, WM_KEYDOWN | WM_SYSKEYDOWN);
+    // Up and down alike, until the hook is off: a lone Win release would open Start.
     if vk == VK_LWIN || vk == VK_RWIN {
         RECORD_WIN.store(down, Ordering::Relaxed);
         return 1;
@@ -265,10 +332,7 @@ unsafe extern "system" fn record_hook(code: i32, w: WPARAM, l: LPARAM) -> LRESUL
     let result = if vk == VK_ESCAPE && mods == 0 { -1 } else { vk as isize };
     RECORD_DONE.store(true, Ordering::Relaxed);
     PostMessageW(RECORD_TO.load(Ordering::Relaxed) as HWND, MSG_RECORDED, mods as WPARAM, result);
-    if vk == VK_SNAPSHOT || mods & MOD_WIN != 0 {
-        return 1;
-    }
-    CallNextHookEx(null_mut(), code, w, l)
+    1
 }
 
 /// Takes the hook off and gives the snip shortcut back.
@@ -291,6 +355,8 @@ impl Agent {
     /// Fails only if the window can't be made.
     pub fn start(hotkey: Hotkey, tray: bool, on_event: impl Fn(Event) + Send + 'static) -> Result<Started, String> {
         let (ready_tx, ready_rx) = channel();
+        let exit = Arc::new(ExitGate::default());
+        let exit_for_thread = exit.clone();
         let thread = std::thread::spawn(move || unsafe {
             let hwnd = match create_window() {
                 Ok(h) => h,
@@ -312,6 +378,7 @@ impl Agent {
                 tray_retries: 0,
                 taskbar_created,
                 hook: null_mut(),
+                exit: exit_for_thread,
             });
             let state = Box::into_raw(state);
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, state as isize);
@@ -326,7 +393,7 @@ impl Agent {
             }
         });
         match ready_rx.recv() {
-            Ok(Ok((hwnd, hotkey))) => Ok(Started { agent: Agent { hwnd, thread: Some(thread) }, hotkey }),
+            Ok(Ok((hwnd, hotkey))) => Ok(Started { agent: Agent { hwnd, thread: Some(thread), exit }, hotkey }),
             Ok(Err(e)) => Err(e),
             Err(_) => Err("the shortcut thread stopped while starting".into()),
         }
@@ -354,11 +421,25 @@ impl Agent {
     pub fn record(&self, on: bool) {
         self.post(MSG_RECORD, on as WPARAM, 0);
     }
+
+    /// The shell has begun to exit: later launches are refused (`Forwarded::Closing`), so they
+    /// start once this copy is gone instead of being lost.
+    pub fn closing(&self) {
+        self.exit.closing.store(true, Ordering::Relaxed);
+    }
+
+    /// The shell has finished exiting (recording finalised, settings written): a sign-out held
+    /// back in `WM_ENDSESSION` may go on.
+    pub fn exited(&self) {
+        *self.exit.done.lock().unwrap_or_else(PoisonError::into_inner) = true;
+        self.exit.finished.notify_all();
+    }
 }
 
 impl Drop for Agent {
     fn drop(&mut self) {
-        self.post(WM_CLOSE, 0, 0);
+        self.exited();
+        self.post(MSG_DESTROY, 0, 0);
         if let Some(t) = self.thread.take() {
             let _ = t.join();
         }
@@ -496,16 +577,26 @@ unsafe extern "system" fn agent_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM)
                 (st.on_event)(Event::Recorded(caught));
             }
         }
+        // The person went to another app while the recorder listened: cancelled.
+        MSG_RECORD_LOST => {
+            if !st.hook.is_null() {
+                stop_recording(hwnd, st);
+                (st.on_event)(Event::Recorded(None));
+            }
+        }
         WM_COPYDATA => {
             let data = &*(l as *const COPYDATASTRUCT);
             if data.dwData != COPYDATA_TAG || data.lpData.is_null() {
                 return 0;
             }
+            if st.exit.closing.load(Ordering::Relaxed) {
+                return COPYDATA_CLOSING as LRESULT;
+            }
             let text = String::from_utf16_lossy(std::slice::from_raw_parts(data.lpData as *const u16, data.cbData as usize / 2));
             return match Intent::decode(&text) {
                 Some(intent) => {
                     (st.on_event)(Event::Intent(intent));
-                    1
+                    COPYDATA_TAKEN as LRESULT
                 }
                 None => 0,
             };
@@ -517,7 +608,12 @@ unsafe extern "system" fn agent_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM)
                 NIN_SELECT | NIN_KEYSELECT | WM_LBUTTONDBLCLK => (st.on_event)(Event::Intent(Intent::Show)),
                 WM_CONTEXTMENU => {
                     let chosen = tray_menu(hwnd, st.hotkey.map(Hotkey::label), x, y);
-                    // The menu's loop ran this procedure again; borrow the state afresh.
+                    // The menu's loop ran this procedure again, and may have destroyed the window
+                    // (and freed the state) on the way: look the state up afresh.
+                    let state = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut State;
+                    if state.is_null() {
+                        return 0;
+                    }
                     let st = &mut *state;
                     match chosen {
                         MENU_NEW => (st.on_event)(Event::Snip),
@@ -545,8 +641,18 @@ unsafe extern "system" fn agent_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM)
         }
         WM_QUERYENDSESSION => return 1,
         // Windows is signing out, or the installer's Restart Manager wants the file: leave cleanly.
-        WM_ENDSESSION if w != 0 => (st.on_event)(Event::Intent(Intent::Quit)),
-        WM_CLOSE => {
+        // The session may end as soon as this returns, so it waits (a while) for the shell to
+        // stop a recording, finalise its file and write the settings.
+        WM_ENDSESSION if w != 0 => {
+            (st.on_event)(Event::Intent(Intent::Quit));
+            let exit = st.exit.clone();
+            let done = exit.done.lock().unwrap_or_else(PoisonError::into_inner);
+            drop(exit.finished.wait_timeout_while(done, END_SESSION_WAIT, |done| !*done));
+        }
+        // From outside: `taskkill` without /f, or a tool closing windows. The shell quits as from
+        // the tray menu; the window stays until then.
+        WM_CLOSE => (st.on_event)(Event::Intent(Intent::Quit)),
+        MSG_DESTROY => {
             DestroyWindow(hwnd);
         }
         WM_DESTROY => {
@@ -650,6 +756,7 @@ mod tests {
     #[test]
     fn recording_sets_the_shortcut_aside_and_reports_the_key() {
         use windows_sys::Win32::UI::Input::KeyboardAndMouse::{MOD_ALT, MOD_CONTROL, MOD_SHIFT, MOD_WIN, VK_F1};
+        let _front = HOOK_TESTS.lock().unwrap_or_else(PoisonError::into_inner);
         let (tx, rx) = channel();
         let first = Hotkey { mods: MOD_CONTROL | MOD_ALT | MOD_SHIFT | MOD_WIN, vk: VK_F1 as u32 + 20 };
         let Started { agent, .. } = Agent::start(first, false, move |e| tx.send(e).unwrap()).expect("agent window");
@@ -668,7 +775,10 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         let key = KBDLLHOOKSTRUCT { vkCode: VK_F1 as u32 + 6, ..unsafe { zeroed() } };
-        unsafe { record_hook(0, WM_KEYDOWN as WPARAM, &key as *const _ as LPARAM) };
+        TEST_IN_FRONT.store(true, Ordering::Relaxed);
+        let swallowed = unsafe { record_hook(0, WM_KEYDOWN as WPARAM, &key as *const _ as LPARAM) };
+        TEST_IN_FRONT.store(false, Ordering::Relaxed);
+        assert_eq!(swallowed, 1, "the recorded key reaches nothing (Alt+F4 must not close Settings)");
         match next(&rx) {
             Event::Recorded(Some(h)) => assert_eq!(h.vk, VK_F1 as u32 + 6),
             other => panic!("expected the F7 press, got {other:?}"),
@@ -684,5 +794,92 @@ mod tests {
         std::thread::sleep(Duration::from_millis(300));
         assert!(!free(), "turning recording off puts the shortcut back");
         assert!(rx.try_recv().is_err(), "a cancelled recording reports nothing");
+    }
+
+    /// The hook tests change `TEST_IN_FRONT`, which the hook reads; one at a time.
+    static HOOK_TESTS: Mutex<()> = Mutex::new(());
+
+    fn obscure(vk_offset: u32) -> Hotkey {
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_F1;
+        Hotkey { mods: MOD_CONTROL | MOD_ALT | MOD_SHIFT | MOD_WIN, vk: VK_F1 as u32 + vk_offset }
+    }
+
+    fn send(hwnd: isize, msg: u32, w: WPARAM, l: LPARAM) -> usize {
+        let mut answer = 0usize;
+        unsafe { SendMessageTimeoutW(hwnd as HWND, msg, w, l, SMTO_ABORTIFHUNG, 10_000, &mut answer) };
+        answer
+    }
+
+    fn send_intent(hwnd: isize, intent: &Intent) -> usize {
+        let text: Vec<u16> = intent.encode().encode_utf16().collect();
+        let data = COPYDATASTRUCT { dwData: COPYDATA_TAG, cbData: (text.len() * 2) as u32, lpData: text.as_ptr() as *mut c_void };
+        send(hwnd, WM_COPYDATA, 0, &data as *const _ as LPARAM)
+    }
+
+    /// `taskkill` without /f sends WM_CLOSE: the shell is asked to quit and the window lives on
+    /// until it does; once the shell is closing, later launches are told so and not lost.
+    #[test]
+    fn an_outside_close_is_a_quit_request() {
+        use windows_sys::Win32::UI::WindowsAndMessaging::IsWindow;
+        let (tx, rx) = channel();
+        let Started { agent, .. } = Agent::start(obscure(19), false, move |e| tx.send(e).unwrap()).expect("agent window");
+        let hwnd = agent.hwnd;
+        send(hwnd, WM_CLOSE, 0, 0);
+        assert_eq!(next(&rx), Event::Intent(Intent::Quit));
+        assert_ne!(unsafe { IsWindow(hwnd as HWND) }, 0, "the window, the tray icon and the shortcuts are still there");
+        assert_eq!(send_intent(hwnd, &Intent::Show), COPYDATA_TAKEN);
+        assert_eq!(next(&rx), Event::Intent(Intent::Show));
+        agent.closing();
+        assert_eq!(send_intent(hwnd, &Intent::Show), COPYDATA_CLOSING, "a launch while closing is turned away");
+        assert!(rx.recv_timeout(Duration::from_millis(200)).is_err(), "and not passed on");
+        drop(agent);
+        assert_eq!(unsafe { IsWindow(hwnd as HWND) }, 0, "dropping the agent destroys it");
+    }
+
+    /// Signing out holds `WM_ENDSESSION` until the shell has finished exiting, so a recording can
+    /// be finalised first.
+    #[test]
+    fn signing_out_waits_for_the_shell() {
+        let (tx, rx) = channel();
+        let Started { agent, .. } = Agent::start(obscure(18), false, move |e| tx.send(e).unwrap()).expect("agent window");
+        let hwnd = agent.hwnd;
+        let t0 = std::time::Instant::now();
+        let session = std::thread::spawn(move || {
+            send(hwnd, WM_ENDSESSION, 1, 0);
+            t0.elapsed()
+        });
+        assert_eq!(next(&rx), Event::Intent(Intent::Quit));
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!session.is_finished(), "still waiting for the shell");
+        agent.exited();
+        let took = session.join().unwrap();
+        assert!(took >= Duration::from_millis(300) && took < END_SESSION_WAIT, "{took:?}");
+    }
+
+    /// The recorder lets go as soon as another app is in front, passing the key on.
+    #[test]
+    fn the_recorder_gives_up_when_another_app_is_in_front() {
+        let _front = HOOK_TESTS.lock().unwrap_or_else(PoisonError::into_inner);
+        let (tx, rx) = channel();
+        let first = obscure(17);
+        let Started { agent, .. } = Agent::start(first, false, move |e| tx.send(e).unwrap()).expect("agent window");
+        let free = || unsafe {
+            let ok = RegisterHotKey(null_mut(), 80, first.mods, first.vk) != 0;
+            if ok {
+                UnregisterHotKey(null_mut(), 80);
+            }
+            ok
+        };
+        agent.record(true);
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while !free() {
+            assert!(std::time::Instant::now() < deadline, "recording should set the shortcut aside");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_LWIN;
+        let win = KBDLLHOOKSTRUCT { vkCode: VK_LWIN as u32, ..unsafe { zeroed() } };
+        assert_eq!(unsafe { record_hook(0, WM_KEYDOWN as WPARAM, &win as *const _ as LPARAM) }, 0, "Win reaches the app in front");
+        assert_eq!(next(&rx), Event::Recorded(None), "reported as cancelled");
+        assert!(!free(), "the shortcut is back");
     }
 }

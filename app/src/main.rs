@@ -787,6 +787,9 @@ impl App {
     /// their snips already copied and saved as the settings asked.
     fn quit(&mut self, ctx: &egui::Context) {
         self.quitting = true;
+        if let Some(agent) = &self.agent {
+            agent.closing();
+        }
         if let Stage::Recording(bar) = &mut self.stage {
             if let Some(rec) = &mut bar.rec {
                 rec.stop();
@@ -900,12 +903,16 @@ impl App {
 impl eframe::App for App {
     /// Lets go of the shortcuts and writes pending settings before the process ends.
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        if let Some(agent) = &self.agent {
+            agent.closing();
+        }
         for w in self.workers.drain(..) {
             let _ = w.join();
         }
         self.persist();
         self.saver = settings::Saver::new(None, |_| {});
         self.startup = None;
+        // Dropping the agent also tells a sign-out waiting in `WM_ENDSESSION` that all is written.
         self.agent = None;
     }
 
@@ -1768,11 +1775,22 @@ impl Boot {
 /// Claims the single-instance slot and starts the agent. `None` means this launch is done: its intent
 /// went to the copy already running, or it was `--quit` with nothing to quit.
 fn start_resident(intent: tray::Intent, hotkey: Hotkey) -> Option<Boot> {
-    if !tray::claim_single_instance() {
-        if let Err(e) = tray::forward(&intent) {
-            if intent != tray::Intent::Quit {
-                win::error_box(&e);
+    // A copy that is quitting turns launches away; this one then waits for it to go (it may be
+    // saving a recording) and runs itself.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !tray::claim_single_instance() {
+        let failed = match tray::forward(&intent) {
+            Ok(tray::Forwarded::Taken) => return None,
+            Ok(tray::Forwarded::Closing) if intent == tray::Intent::Quit => return None,
+            Ok(tray::Forwarded::Closing) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(100));
+                continue;
             }
+            Ok(tray::Forwarded::Closing) => "SnipScreen is still closing. Try again in a moment.".to_string(),
+            Err(e) => e,
+        };
+        if intent != tray::Intent::Quit {
+            win::error_box(&failed);
         }
         return None;
     }
