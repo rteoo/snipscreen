@@ -10,11 +10,13 @@
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use eframe::egui::{Color32, ColorImage};
 use windows::core::HSTRING;
 use windows::Data::Xml::Dom::XmlDocument;
-use windows::UI::Notifications::{NotificationSetting, ToastNotification, ToastNotificationManager};
+use windows::Foundation::TypedEventHandler;
+use windows::UI::Notifications::{NotificationSetting, ToastDismissalReason, ToastDismissedEventArgs, ToastNotification, ToastNotificationManager};
 
 use crate::win;
 
@@ -93,7 +95,13 @@ pub struct Toast {
     pub image: Option<PathBuf>,
     /// The `snipscreen:` link opened by a click.
     pub launch: String,
+    /// Names the notification: showing another with the same tag replaces it in place.
+    pub tag: String,
 }
+
+/// A notification Windows has up, kept by the shell while it may still be dismissed: dropping the
+/// last reference would also drop its dismissal handler.
+pub struct Shown(#[allow(dead_code)] ToastNotification);
 
 impl Toast {
     pub fn xml(&self) -> String {
@@ -109,12 +117,23 @@ impl Toast {
         )
     }
 
-    /// Hands the toast to Windows. Blocks for a few milliseconds; call it off the UI thread.
-    pub fn show(&self) -> Result<(), String> {
+    /// Hands the toast to Windows, replacing any up with the same tag. Blocks for a few
+    /// milliseconds; call it off the UI thread. `gone` runs, on a Windows thread, once the toast
+    /// has left the screen (timed out into the notification centre, or dismissed); not when it was
+    /// clicked or replaced.
+    pub fn show(&self, gone: impl Fn() + Send + 'static) -> Result<Shown, String> {
         let fail = |what: &str, e: windows::core::Error| format!("couldn't {what}: {}", e.message());
         let doc = XmlDocument::new().map_err(|e| fail("prepare the notification", e))?;
         doc.LoadXml(&HSTRING::from(self.xml())).map_err(|e| fail("prepare the notification", e))?;
         let toast = ToastNotification::CreateToastNotification(&doc).map_err(|e| fail("create the notification", e))?;
+        toast.SetTag(&HSTRING::from(&self.tag)).and_then(|_| toast.SetGroup(&HSTRING::from("snips"))).map_err(|e| fail("create the notification", e))?;
+        let on_dismissed = TypedEventHandler::<ToastNotification, ToastDismissedEventArgs>::new(move |_, args| {
+            if args.ok().and_then(|a| a.Reason()).is_ok_and(|r| r != ToastDismissalReason::ApplicationHidden) {
+                gone();
+            }
+            Ok(())
+        });
+        toast.Dismissed(&on_dismissed).map_err(|e| fail("create the notification", e))?;
         let notifier = ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from(AUMID)).map_err(|e| fail("reach Windows notifications", e))?;
         // `Show` succeeds even when the person turned SnipScreen's notifications off, and then nothing
         // appears. Asking first catches that. Windows only knows an unpackaged app's setting after
@@ -124,7 +143,8 @@ impl Toast {
             Ok(NotificationSetting::DisabledForUser) => return Err("notifications are turned off in Windows Settings".into()),
             Ok(_) => return Err("notifications are turned off for SnipScreen in Windows Settings".into()),
         }
-        notifier.Show(&toast).map_err(|e| fail("show the notification", e))
+        notifier.Show(&toast).map_err(|e| fail("show the notification", e))?;
+        Ok(Shown(toast))
     }
 }
 
@@ -209,31 +229,32 @@ pub fn may_open(path: &Path, folders: &[PathBuf]) -> bool {
     png && plain && folders.iter().any(|f| parent.as_deref() == Some(norm(f).as_str()))
 }
 
-/// The newest snips by id, kept in memory so a click on their notification opens them at once.
-/// Bounded by count and by bytes; older ones are opened from their PNG instead.
-// ceiling: a byte budget, not a smarter policy (e.g. dropping when the toast leaves the notification
-// centre); revisit if people routinely click notifications for big, older snips and find them slow.
+/// The newest snips by id, kept in memory so a click on their notification opens them at once,
+/// while the notification is on screen: the shell drops one when its notification leaves the
+/// screen, and every one after `max_age` in any case. Also bounded by count and by bytes. A click
+/// later on, from the notification centre, opens the PNG instead.
 pub struct Recent {
-    items: VecDeque<(u64, Arc<ColorImage>)>,
+    items: VecDeque<(u64, Instant, Arc<ColorImage>)>,
     max_items: usize,
     max_bytes: usize,
+    max_age: Duration,
 }
 
 impl Recent {
-    pub fn new(max_items: usize, max_bytes: usize) -> Self {
-        Self { items: VecDeque::new(), max_items, max_bytes }
+    pub fn new(max_items: usize, max_bytes: usize, max_age: Duration) -> Self {
+        Self { items: VecDeque::new(), max_items, max_bytes, max_age }
     }
 
     fn bytes(img: &ColorImage) -> usize {
         img.pixels.len() * 4
     }
 
-    pub fn insert(&mut self, id: u64, img: Arc<ColorImage>) {
-        self.items.push_back((id, img));
-        let mut total: usize = self.items.iter().map(|(_, i)| Self::bytes(i)).sum();
+    pub fn insert(&mut self, id: u64, img: Arc<ColorImage>, now: Instant) {
+        self.items.push_back((id, now, img));
+        let mut total: usize = self.items.iter().map(|(_, _, i)| Self::bytes(i)).sum();
         // The newest one stays even when it alone is over budget: its notification is up right now.
         while self.items.len() > 1 && (self.items.len() > self.max_items || total > self.max_bytes) {
-            if let Some((_, old)) = self.items.pop_front() {
+            if let Some((_, _, old)) = self.items.pop_front() {
                 total -= Self::bytes(&old);
             }
         }
@@ -241,8 +262,18 @@ impl Recent {
 
     /// Hands the snip over (the editor keeps it from here on).
     pub fn take(&mut self, id: u64) -> Option<Arc<ColorImage>> {
-        let at = self.items.iter().position(|(i, _)| *i == id)?;
-        self.items.remove(at).map(|(_, img)| img)
+        let at = self.items.iter().position(|(i, _, _)| *i == id)?;
+        self.items.remove(at).map(|(_, _, img)| img)
+    }
+
+    pub fn contains(&self, id: u64) -> bool {
+        self.items.iter().any(|(i, _, _)| *i == id)
+    }
+
+    /// Drops the snips older than `max_age`; returns when the next one is due to go.
+    pub fn expire(&mut self, now: Instant) -> Option<Instant> {
+        self.items.retain(|(_, at, _)| now.saturating_duration_since(*at) < self.max_age);
+        self.items.iter().map(|(_, at, _)| *at + self.max_age).min()
     }
 }
 
@@ -343,6 +374,7 @@ mod tests {
             lines: vec!["Saved as <Snip> & \"more\"".into(), "Select to mark it up".into(), "dropped".into()],
             image: Some(PathBuf::from(r"C:\Users\A B\AppData\Local\SnipScreen\recent\preview-7.png")),
             launch: "snipscreen:open?id=7&path=C%3A".into(),
+            tag: "7".into(),
         };
         let xml = t.xml();
         assert!(xml.starts_with("<toast activationType=\"protocol\" launch=\"snipscreen:open?id=7&amp;path=C%3A\">"), "{xml}");
@@ -401,21 +433,35 @@ mod tests {
 
     #[test]
     fn recent_snips_are_bounded_by_count_and_bytes() {
-        let mut r = Recent::new(3, 1000);
+        let mut r = Recent::new(3, 1000, Duration::from_secs(60));
+        let now = Instant::now();
         for id in 1..=4 {
-            r.insert(id, img(5, 5)); // 100 bytes each
+            r.insert(id, img(5, 5), now); // 100 bytes each
         }
         assert!(r.take(1).is_none(), "the oldest went past the count");
         assert!(r.take(4).is_some());
         assert!(r.take(4).is_none(), "taken once");
-        r.insert(5, img(10, 10)); // 400 bytes
-        r.insert(6, img(10, 10));
-        r.insert(8, img(15, 15)); // 900 bytes: 5 and 6 must go to stay under 1000
+        r.insert(5, img(10, 10), now); // 400 bytes
+        r.insert(6, img(10, 10), now);
+        r.insert(8, img(15, 15), now); // 900 bytes: 5 and 6 must go to stay under 1000
         assert!(r.take(5).is_none() && r.take(6).is_none(), "pushed out by bytes");
         assert!(r.take(8).is_some());
-        r.insert(7, img(100, 100)); // 40 000 bytes, alone over budget
+        r.insert(7, img(100, 100), now); // 40 000 bytes, alone over budget
         assert!(r.take(6).is_none());
         assert!(r.take(7).is_some(), "the newest stays even over budget");
+    }
+
+    #[test]
+    fn recent_snips_expire() {
+        let (t0, age) = (Instant::now(), Duration::from_secs(180));
+        let mut r = Recent::new(10, 1 << 30, age);
+        r.insert(1, img(4000, 2000), t0); // over any budget alone: it still goes with age
+        r.insert(2, img(5, 5), t0 + Duration::from_secs(60));
+        assert_eq!(r.expire(t0 + Duration::from_secs(1)), Some(t0 + age), "the first is due first");
+        assert_eq!(r.expire(t0 + age), Some(t0 + Duration::from_secs(60) + age));
+        assert!(r.take(1).is_none(), "expired");
+        assert_eq!(r.expire(t0 + Duration::from_secs(60) + age), None);
+        assert!(r.take(2).is_none());
     }
 
     #[test]
