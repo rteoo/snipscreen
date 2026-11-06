@@ -1070,7 +1070,7 @@ impl App {
                     Some(s) => {
                         let shown = Rect::from_min_max(to_pt(s.min), to_pt(s.max));
                         dim_outside(painter, rect, shown);
-                        painter.rect_stroke(shown, 0.0, (1.0, Color32::WHITE), StrokeKind::Outside);
+                        widgets::dashed_outline(painter, shown);
                         size_tag(painter, shown, s.size());
                         if resp.drag_stopped() {
                             pk.start = None;
@@ -1817,15 +1817,8 @@ fn area_outline(ctx: &egui::Context, [x, y, w, h]: [i32; 4]) {
             win::exclude_from_capture(hwnd, true);
             win::fit_client(hwnd, x - PAD, y - PAD, w + 2 * PAD, h + 2 * PAD);
         }
-        let r = ui.max_rect().shrink(1.5);
-        let p = ui.painter();
-        let dash = |a: Pos2, b: Pos2| {
-            p.add(Shape::dashed_line(&[a, b], (2.0, Color32::from_white_alpha(230)), 7.0, 5.0));
-        };
-        dash(r.left_top(), r.right_top());
-        dash(r.right_top(), r.right_bottom());
-        dash(r.right_bottom(), r.left_bottom());
-        dash(r.left_bottom(), r.left_top());
+        // The window reaches PAD pixels past the area on every side; the dashes go just outside it.
+        widgets::dashed_outline(ui.painter(), ui.max_rect().shrink(PAD as f32 / ui.ctx().pixels_per_point()));
     });
 }
 

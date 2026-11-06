@@ -43,6 +43,10 @@ pub const GROUP_GAP: f32 = 16.0;
 /// Smallest window: the home toolbar, or an editor showing a video.
 pub const MIN_WINDOW_W: f32 = 520.0;
 pub const MIN_WINDOW_H: f32 = 240.0;
+/// Dashes around an area being picked or recorded: (on, off) in points.
+pub const DASH: (f32, f32) = (7.0, 5.0);
+pub const DASH_STROKE: f32 = 2.0;
+pub const DASH_COLOR: Color32 = Color32::from_rgba_premultiplied(230, 230, 230, 230);
 /// How long a message stays up once something is drawing it.
 pub const NOTE_SECS: f64 = 4.0;
 
@@ -323,6 +327,15 @@ fn caption_buttons(ui: &mut egui::Ui, bar: Rect, title_bar: &win::TitleBar) -> [
         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
     }
     [min, max, close]
+}
+
+/// A dashed outline just outside `rect`, as around an area being picked or recorded. Each side
+/// starts on a dash, so the corners always read.
+pub fn dashed_outline(p: &egui::Painter, rect: Rect) {
+    let r = rect.expand(DASH_STROKE / 2.0);
+    for side in [[r.left_top(), r.right_top()], [r.right_top(), r.right_bottom()], [r.right_bottom(), r.left_bottom()], [r.left_bottom(), r.left_top()]] {
+        p.add(egui::Shape::dashed_line(&side, (DASH_STROKE, DASH_COLOR), DASH.0, DASH.1));
+    }
 }
 
 pub fn dim_outside(painter: &egui::Painter, all: Rect, keep: Rect) {
