@@ -677,9 +677,12 @@ impl Snip {
                 // A copy started for a press that drew nothing (it only closed a popup) isn't kept.
                 canvas.copying = None;
             }
+            // The tiles of the snip inside the scroll area's view this frame.
+            let mut visible = Tiles::new(doc.size());
+            visible.add(Rect::from_min_max(to_px(ui.clip_rect().min), to_px(ui.clip_rect().max)).expand(1.0));
             match drawing {
-                Some(Mark::Text(t)) if !draft.preedit.is_empty() => canvas.show_live(&Mark::Text(with_preedit(t, &draft.preedit))),
-                Some(m) => canvas.show_live(m),
+                Some(Mark::Text(t)) if !draft.preedit.is_empty() => canvas.show_live(&Mark::Text(with_preedit(t, &draft.preedit)), &visible),
+                Some(m) => canvas.show_live(m, &visible),
                 None => canvas.clear_live(),
             }
         });
@@ -1340,13 +1343,27 @@ struct Live {
     /// The pixels the texture shows in each live tile (by tile index), so a commit burns them into
     /// `shown` as they are instead of painting the mark again.
     patches: HashMap<usize, Vec<Color32>>,
+    /// Tiles out of view whose texture is behind: they should show the text being typed (those in
+    /// `tiles`) or the picture (the rest). Brought up to date as they come into view, a few at a
+    /// time on frames where the text doesn't change, and by a commit.
+    pending: Tiles,
 }
 
 impl Live {
     fn new(size: [usize; 2]) -> Self {
-        Self { tiles: Tiles::new(size), done: 0, last: None, text: None, patches: HashMap::new() }
+        Self { tiles: Tiles::new(size), done: 0, last: None, text: None, patches: HashMap::new(), pending: Tiles::new(size) }
+    }
+
+    /// Every tile whose texture differs from the picture or is behind.
+    fn touched(&self) -> Tiles {
+        let mut t = self.tiles.clone();
+        t.union(&self.pending);
+        t
     }
 }
+
+/// Time a frame on which the text being typed didn't change spends on its tiles out of view.
+const PENDING_BUDGET: std::time::Duration = std::time::Duration::from_millis(4);
 
 impl CanvasTex {
     /// The canvas for `doc`, flattened in full.
@@ -1406,7 +1423,7 @@ impl CanvasTex {
         }
         if self.rev.0 == rev.0 {
             let mut tiles = doc.changed_tiles(&self.burned);
-            tiles.union(&self.live.tiles);
+            tiles.union(&self.live.touched());
             let shown = Arc::make_mut(&mut self.shown);
             for (r, patch) in doc.render_runs(&tiles) {
                 markup::paste(shown, &patch, r.pos());
@@ -1494,8 +1511,8 @@ impl CanvasTex {
                 markup::paste(shown, &patch, r.pos());
                 self.tex.set_partial(r.pos(), patch);
             }
-            // Live tiles the mark no longer reaches go back to the picture.
-            let stale = self.live.tiles.minus(&tiles);
+            // Live tiles the mark no longer reaches go back to the picture, as do tiles left behind.
+            let stale = self.live.touched().minus(&tiles);
             self.upload(&stale, None);
         }
         match raster.into_text() {
@@ -1513,7 +1530,7 @@ impl CanvasTex {
     /// reach are repainted; text is repainted where its changed letters are; a shape is repainted
     /// where it is now; and the tiles a mark has left go back to the picture. Nothing is redone while
     /// the mark stays the same.
-    fn show_live(&mut self, m: &Mark) {
+    fn show_live(&mut self, m: &Mark, visible: &Tiles) {
         let size = self.shown.size;
         let mut fresh = Tiles::new(size);
         let mut covered = Tiles::new(size);
@@ -1533,24 +1550,32 @@ impl CanvasTex {
                 return;
             }
             Mark::Text(t) => {
-                let text = match self.live.text.take() {
-                    Some(text) if text.text() == t => {
-                        self.live.text = Some(text);
-                        return;
-                    }
+                let (text, changed) = match self.live.text.take() {
+                    Some(text) if text.text() == t => (text, false),
                     // Typing changes a letter at a time: only the changed letters' tiles are repainted.
                     Some(mut text) => {
                         text.retext(t, &mut fresh);
-                        text
+                        (text, true)
                     }
                     None => {
                         let text = TextRaster::new(t, size);
                         fresh.add(text.bounds());
-                        text
+                        (text, true)
                     }
                 };
                 covered.add(text.bounds());
-                markup::Raster::of_text(m, text)
+                let mut raster = markup::Raster::of_text(m, text);
+                // Only the tiles in view are painted now (a size change redoes the whole text, which
+                // on a big block is far more than one frame can paint); the rest wait, out of sight.
+                if changed {
+                    let mut stale = self.live.tiles.minus(&covered);
+                    stale.union(&fresh.intersect(&covered));
+                    self.live.pending.union(&stale);
+                    self.live.tiles = covered;
+                }
+                self.catch_up(&mut raster, visible, !changed);
+                self.live.text = raster.into_text();
+                return;
             }
             Mark::Shape(_) => {
                 if self.live.last.as_ref() == Some(m) {
@@ -1569,10 +1594,47 @@ impl CanvasTex {
         self.live.text = raster.into_text();
     }
 
+    /// Brings the pending tiles in view up to date, and with `idle` some out of view as well, a
+    /// row at a time within `PENDING_BUDGET`; asks for another frame while any are left.
+    fn catch_up(&mut self, raster: &mut markup::Raster, visible: &Tiles, idle: bool) {
+        if self.live.pending.is_empty() {
+            return;
+        }
+        let started = std::time::Instant::now();
+        let now = self.live.pending.intersect(visible);
+        self.refresh(&now, raster);
+        self.live.pending = self.live.pending.minus(&now);
+        if idle {
+            for run in self.live.pending.runs() {
+                if started.elapsed() >= PENDING_BUDGET {
+                    break;
+                }
+                let mut row = Tiles::new(self.shown.size);
+                row.add(run.rect());
+                self.refresh(&row, raster);
+                self.live.pending = self.live.pending.minus(&row);
+            }
+        }
+        // What a pending tile shows is behind, so a commit must not take it as shown.
+        let behind: Vec<usize> = self.live.pending.indices().collect();
+        for idx in behind {
+            self.live.patches.remove(&idx);
+        }
+        if !self.live.pending.is_empty() {
+            self.tex.ctx.request_repaint();
+        }
+    }
+
+    /// Uploads `tiles` as they should be: the live text over the picture where it reaches, the picture elsewhere.
+    fn refresh(&mut self, tiles: &Tiles, raster: &mut markup::Raster) {
+        self.upload(&tiles.minus(&self.live.tiles), None);
+        self.upload(&tiles.intersect(&self.live.tiles), Some(raster));
+    }
+
     /// Puts back the committed picture wherever a cancelled mark was showing.
     fn clear_live(&mut self) {
-        if !self.live.tiles.is_empty() {
-            let tiles = std::mem::replace(&mut self.live.tiles, Tiles::new([0, 0]));
+        let tiles = self.live.touched();
+        if !tiles.is_empty() {
             self.upload(&tiles, None);
         }
         self.live = Live::new(self.shown.size);
@@ -2538,6 +2600,66 @@ Arc::ptr_eq(&snip.flattened(), &shown), "a current canvas is reused, not re-burn
     }
 
     #[test]
+    fn a_text_size_change_paints_what_is_in_view_and_the_rest_before_it_is_seen() {
+        let ctx = egui::Context::default();
+        let mut snip = Snip::new(gradient(2400, 1600), Tools { tool: Tool::Text, text: (PEN_COLORS[2], 96.0), ..Tools::default() });
+        snip.zoom = Some(1.0);
+        let mut screen = Screen { image: None };
+        canvas_frame(&ctx, &mut snip, &mut screen, vec![]);
+        let at = pos2(60.0, 110.0);
+        canvas_frame(&ctx, &mut snip, &mut screen, vec![Event::PointerMoved(at), pointer(at, true)]);
+        canvas_frame(&ctx, &mut snip, &mut screen, vec![pointer(at, false)]);
+        for line in 0..10 {
+            if line > 0 {
+                canvas_frame(&ctx, &mut snip, &mut screen, vec![key(Key::Enter, Modifiers::SHIFT)]);
+            }
+            canvas_frame(&ctx, &mut snip, &mut screen, vec![Event::Text("A wide line of text".into())]);
+        }
+        let live = |snip: &Snip| {
+            let mut want = snip.doc.flatten();
+            markup::burn(&mut want, snip.drawing.as_ref().expect("typing"));
+            want
+        };
+        let pending = |snip: &Snip| snip.texture.as_ref().unwrap().live.pending.clone();
+        // The 1280x800 view shows the picture from (-16, -16), inside the canvas margin.
+        let in_view = |a: &ColorImage, b: &[Color32]| (0..760).all(|y| a.pixels[y * 2400..y * 2400 + 1240] == b[y * 2400..y * 2400 + 1240]);
+        assert!(in_view(&live(&snip), screen.pixels()), "typing shows exactly what will be placed");
+        let settle = |snip: &mut Snip, screen: &mut Screen| {
+            let mut frames = 0;
+            while !pending(snip).is_empty() {
+                frames += 1;
+                assert!(frames < 500, "frames where the text doesn't change catch up");
+                canvas_frame(&ctx, snip, screen, vec![]);
+            }
+        };
+        settle(&mut snip, &mut screen);
+        assert!(screen.pixels() == live(&snip).pixels, "lines typed out of view too, once typing stops");
+        snip.tools.text.1 = 120.0;
+        canvas_frame(&ctx, &mut snip, &mut screen, vec![]);
+        assert!(!pending(&snip).is_empty(), "the block reaches past the view; that part waits");
+        assert!(in_view(&live(&snip), screen.pixels()), "what is in view is exact at once");
+        settle(&mut snip, &mut screen);
+        assert!(screen.pixels() == live(&snip).pixels, "and then all of it is exact");
+        // Placed right after a size change, with tiles still behind: exactly as saved.
+        snip.tools.text.1 = 80.0;
+        canvas_frame(&ctx, &mut snip, &mut screen, vec![]);
+        assert!(!pending(&snip).is_empty());
+        canvas_frame(&ctx, &mut snip, &mut screen, vec![key(Key::Enter, Modifiers::NONE)]);
+        assert!(snip.drawing.is_none() && snip.doc.marks.len() == 1);
+        assert!(screen.pixels() == snip.doc.flatten().pixels);
+        // A size change, then zooming out to see it all: everything shows as it will be placed.
+        canvas_frame(&ctx, &mut snip, &mut screen, vec![Event::PointerMoved(at), pointer(at, true)]);
+        canvas_frame(&ctx, &mut snip, &mut screen, vec![pointer(at, false)]);
+        canvas_frame(&ctx, &mut snip, &mut screen, vec![Event::Text("Another\nblock of text that runs well past the view on the right".into())]);
+        snip.tools.text.1 = 160.0;
+        canvas_frame(&ctx, &mut snip, &mut screen, vec![]);
+        snip.zoom = None;
+        canvas_frame(&ctx, &mut snip, &mut screen, vec![]);
+        assert!(pending(&snip).is_empty(), "in view now, so painted now");
+        assert!(screen.pixels() == live(&snip).pixels);
+    }
+
+    #[test]
     fn a_click_dot_takes_the_copy_started_at_the_press() {
         let ctx = egui::Context::default();
         let mut snip = Snip::new(gradient(300, 200), Tools::default());
@@ -2916,6 +3038,12 @@ Arc::ptr_eq(&snip.flattened(), &shown), "a current canvas is reused, not re-burn
             slider.push(bench_frame(&ctx, &mut snip, vec![]));
         }
         stats("type: size slider frame (12 lines)", &slider);
+        // The tiles out of view catch up on the frames after the slider stops, before Enter.
+        let mut catch_up = Vec::new();
+        while !snip.texture.as_ref().is_some_and(|c| c.live.pending.is_empty()) {
+            catch_up.push(bench_frame(&ctx, &mut snip, vec![]));
+        }
+        stats("type: catch-up frame after the slider", &catch_up);
         let commit = bench_frame(&ctx, &mut snip, vec![key(Key::Enter, Modifiers::NONE)]);
         stats("type: Enter places the 12-line block", &[commit]);
 

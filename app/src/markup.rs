@@ -648,8 +648,10 @@ impl TextRaster {
     /// Turns this into the raster of `new`, adding to `dirty` the tiles whose pixels can differ. While
     /// only letters at the end change (typing), only the tiles those letters reach are redone.
     pub fn retext(&mut self, new: &Text, dirty: &mut Tiles) {
-        // ceiling: a new size redoes the whole text (~45 ms per size-slider frame for a 12-line 160 px
-        // block on 4K, release); render the visible tiles first if the slider drags on big text.
+        // ceiling: a new size redoes every tile of the text. The editor paints only those in view at
+        // once (~13 ms per slider frame for a 12-line 160 px block at 100% in a 1280x800 view,
+        // release), but at fit zoom all of a big block is in view (~45 ms); show a scaled preview
+        // while the slider moves if dragging it there feels sticky.
         if (self.text.size, self.text.outline, self.text.pos) != (new.size, new.outline, new.pos) {
             dirty.add(self.bounds);
             *self = TextRaster::new(new, self.size);
