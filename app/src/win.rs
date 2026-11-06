@@ -836,14 +836,15 @@ impl TitleBar {
 
     /// Where the bar and its controls are this frame, in points; `max_button` is the maximise
     /// button, `None` on a window that can't be maximised. With `drag` false (a menu is open) the
-    /// empty bar is left to egui, so a click there closes the menu instead of moving the window.
+    /// empty bar and the maximise button are left to egui, so a click there closes the menu
+    /// instead of moving or maximising the window.
     pub fn publish(&self, ppp: f32, bar: egui::Rect, controls: &[egui::Rect], max_button: Option<egui::Rect>, drag: bool) {
         let px = |r: egui::Rect| [(r.min.x * ppp).round() as i32, (r.min.y * ppp).round() as i32, (r.max.x * ppp).round() as i32, (r.max.y * ppp).round() as i32];
         let mut s = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         s.bar = if drag { px(bar) } else { [0; 4] };
         s.controls.clear();
         s.controls.extend(controls.iter().map(|&r| px(r)));
-        s.max_button = max_button.map(px);
+        s.max_button = if drag { max_button.map(px) } else { None };
     }
 
     /// The size to put in `ViewportCommand::InnerSize` for a client area of `want` points: winit
@@ -1071,6 +1072,17 @@ mod tests {
         assert_eq!(bar_hit(&s, 300, 2, 600, false, false), HTCAPTION, "nor does one that can't be resized");
         let menu_open = BarState { bar: [0; 4], ..s };
         assert_eq!(bar_hit(&menu_open, 300, 20, 600, false, true), HTCLIENT, "with a menu open the bar is egui's");
+    }
+
+    #[test]
+    fn with_a_menu_open_a_click_on_maximise_only_closes_the_menu() {
+        let bar = TitleBar::default();
+        let r = |x0: f32, x1: f32| egui::Rect::from_min_max(egui::pos2(x0, 0.0), egui::pos2(x1, 40.0));
+        let hit = |bar: &TitleBar| bar_hit(&bar.0.lock().unwrap(), 530, 20, 600, false, true);
+        bar.publish(1.0, r(0.0, 600.0), &[r(554.0, 600.0)], Some(r(508.0, 554.0)), true);
+        assert_eq!(hit(&bar), HTMAXBUTTON);
+        bar.publish(1.0, r(0.0, 600.0), &[r(554.0, 600.0)], Some(r(508.0, 554.0)), false);
+        assert_eq!(hit(&bar), HTCLIENT);
     }
 
     #[test]
