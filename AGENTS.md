@@ -29,6 +29,7 @@ Run from `app/`.
 |---|---|
 | Build (dev, opt-level 2) | `cargo build` |
 | Release build | `cargo build --release` → `target/release/snipscreen.exe` |
+| Windows installer (from the repo root, after the release build) | `build_installer.bat` → `installer/Output/SnipscreenSetup-<version>.exe` (Inno Setup 6, per-user; set `SNIPSCREEN_BUILD_NONINTERACTIVE=1` to skip the pauses). Keep `MyAppVersion` in `installer/snipscreen.iss` equal to the `Cargo.toml` version. |
 | Run | `cargo run` |
 | Tests | `cargo test` |
 | Device-dependent tests (sound hardware) | `cargo test -- --ignored` |
