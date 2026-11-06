@@ -15,9 +15,11 @@
 </p>
 
 Press Alt+Shift+S, pick an area, and the snip is on the clipboard and in
-`Pictures\Screenshots` before you let go. Mark it up with pen, highlighter,
-eraser, and crop, then copy or save it again. Switch to video to record an area
-of the screen to MP4, with the computer's sound, your microphone, or both.
+`Pictures\Screenshots`, with a Windows notification showing its preview. Click
+the notification to open it in the editor, mark it up with pen, highlighter,
+shapes, text, eraser, and crop, then copy or save it again. Switch to video to
+record an area of the screen to MP4, with the computer's sound, your microphone,
+or both. SnipScreen waits in the notification area and can start with Windows.
 
 SnipScreen follows the Windows Snipping Tool's workflow in a single executable,
 installed per user or run portable. It is a sibling of [SnipType](https://github.com/rteoo/sniptype) and
@@ -27,7 +29,11 @@ installed per user or run portable. It is a sibling of [SnipType](https://github
 
 - Rectangle, window, full-screen, and freeform snips.
 - Delay timer (3, 5, or 10 seconds) with a visible countdown that Esc cancels.
-- Pen (6 colours), highlighter (4 colours), eraser, crop, and 50-step undo/redo.
+- A notification with a preview after each snip; clicking it opens the snip in the editor, even after a restart.
+- Lives in the notification area, optionally starts with Windows, and keeps one copy running.
+- A small Settings window: the snip shortcut, what happens after a snip, auto-copy, auto-save, and start with Windows.
+- Pen (6 colours), a highlighter that blends into the picture (4 colours), shapes (arrow, line, rectangle, ellipse), text in Geist with a size slider and a contrasting outline, eraser, crop with a frame and handles, and 50-step undo/redo.
+- Each snip opens in its own editor window, so several can be open at once.
 - What you see is what you save: the screen and the saved PNG use the same rasteriser.
 - Zoom with Ctrl+wheel (anchored on the cursor) or Ctrl+Plus, Ctrl+Minus, and Ctrl+0.
 - Automatic copy and auto-save, each with a toast that reports what really happened.
@@ -77,21 +83,24 @@ installed; the result is in `installer\Output\`.
 
 ## First use
 
-1. Start SnipScreen. It opens straight into area picking; press Esc to get the main window.
+1. Start SnipScreen. The main window opens; closing it leaves SnipScreen in the notification area.
 2. Choose the photo or video mode, a shape (rectangle, window, full screen, freeform), and an optional delay.
 3. Click **New**, press Ctrl+N, or press Alt+Shift+S from any app.
 4. Drag over an area, or click a window in window mode.
-5. The snip opens in the editor, already copied and saved to `Pictures\Screenshots`.
-6. Mark it up, then press Ctrl+C to copy it again or Ctrl+S to save a copy elsewhere.
+5. A notification shows the snip, already copied and saved to `Pictures\Screenshots`.
+6. Click the notification to open the editor, mark it up, then press Ctrl+C to copy it again or Ctrl+S to save a copy elsewhere.
 
-Auto-copy and auto-save can be turned off from the **…** menu. Settings last for
-the session; each launch starts from the defaults.
+Open **Settings…** from the tray icon or the **…** menu to change the shortcut,
+open the editor straight after a snip instead of the notification, turn
+auto-copy or auto-save off, or start SnipScreen with Windows (it then starts
+hidden in the tray). Choose **Quit** from the tray icon's menu to close it
+completely.
 
 ## Shortcuts
 
 | Keys | Action |
 | --- | --- |
-| Alt+Shift+S | New snip, from anywhere in Windows |
+| Alt+Shift+S | New snip, from anywhere in Windows (change it in Settings) |
 | Ctrl+N | New snip |
 | Ctrl+C | Copy the snip with markup |
 | Ctrl+S | Save as PNG, or save the recording as MP4 |
@@ -100,11 +109,14 @@ the session; each launch starts from the defaults.
 | Ctrl+wheel | Zoom around the cursor |
 | Ctrl+Plus / Ctrl+Minus | Zoom in or out |
 | Ctrl+0 | Fit the snip to the window |
-| Enter | Apply the crop |
-| Esc | Close a menu, or cancel the countdown, crop, picking, or recording bar |
+| Shift (while drawing a shape) | Keep lines at 45° and boxes square |
+| Enter | Place the text, or apply the crop |
+| Shift+Enter | New line in the text |
+| Esc | Close a menu, or cancel the text, crop, countdown, picking, or recording bar |
 
-Alt+Shift+S is used because Win+Shift+S and Print Screen belong to the system
-Snipping Tool. If another app already holds it, the **New** tooltip says so.
+Alt+Shift+S is the default because Win+Shift+S and Print Screen belong to the
+system Snipping Tool. If another app already holds the shortcut, Settings says
+so and keeps the one you had.
 
 ## Screen recording
 
@@ -129,7 +141,13 @@ SnipScreen writes only the files you create:
 - Recordings go to `Videos\Screen Recordings\Screen Recording <timestamp>.mp4`.
 - Two files from the same second get ` (2)`, ` (3)`, and so on instead of overwriting each other.
 
-It keeps no settings file, history, or logs, and it makes no network requests.
+Besides those, it keeps:
+
+- Your choices in `%APPDATA%\SnipScreen\settings.ini`.
+- Notification previews and snips you didn't auto-save in `%LOCALAPPDATA%\SnipScreen\recent`, pruned to the newest 20.
+- Per-user registry entries for start with Windows, notifications, and the `snipscreen:` link a notification opens. The uninstaller removes them.
+
+It keeps no history or logs, and it makes no network requests.
 The window hides before each snip, and the recording bar and outline exclude
 themselves from capture, so none of them appear in your snips or videos.
 
@@ -155,16 +173,22 @@ cargo clippy --all-targets
 cargo run -- --screenshot out.png
 ```
 
-`--screenshot` renders the UI headlessly, writes a PNG, and exits, which is how
-UI changes are checked without driving the desktop.
+`--screenshot`, `--screenshot-editor`, and `--screenshot-settings` render a
+window headlessly, write a PNG, and exit, which is how UI changes are checked
+without driving the desktop.
 
 | Path | What it is |
 | --- | --- |
-| `app/src/main.rs` | UI, state machine, picker, recording bar, CLI |
-| `app/src/markup.rs` | Snip document: strokes, crop, undo, and the ink rasteriser |
+| `app/src/main.rs` | Home window, state machine, picker, recording bar, CLI |
+| `app/src/editor.rs` | Editor windows: toolbar, canvas, copy and save |
+| `app/src/markup.rs` | Snip document: marks (strokes, shapes, text), crop, undo, and the rasteriser |
+| `app/src/tray.rs` | Tray icon, single instance, global shortcut, start with Windows |
+| `app/src/notify.rs` | Windows notifications with a preview, and the `snipscreen:` link |
+| `app/src/settings.rs`, `settings_window.rs` | Saved settings and the Settings window |
+| `app/src/widgets.rs` | Shared look: colours, title bar, buttons, toasts |
 | `app/src/recorder.rs` | MP4 recording through DXGI Desktop Duplication and Media Foundation |
 | `app/src/audio.rs` | WASAPI loopback and microphone capture |
-| `app/src/win.rs` | Win32: screen grab, clipboard, dialogs, hotkeys |
+| `app/src/win.rs` | Win32: screen grab, clipboard, dialogs, title bar |
 | `app/src/icons.rs` | Vector toolbar icons |
 | `app/assets/` | App icon sources (`.svg`), renders (`.png`), and `snipscreen.ico`, which `app/build.rs` embeds in the `.exe` |
 
