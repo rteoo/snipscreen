@@ -33,6 +33,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 use crate::settings::Hotkey;
 
 const CLASS: &str = "SnipScreen.Agent";
+/// Comes first on the command line Windows runs for a `snipscreen:` link; the link follows it.
+pub const OPEN_LINK_FLAG: &str = "--open-link";
 const MUTEX: &str = "Local\\SnipScreen.Instance";
 /// Tags our `WM_COPYDATA` so a stray one from another program is ignored ("SNIP").
 const COPYDATA_TAG: usize = 0x534e_4950;
@@ -80,7 +82,7 @@ pub enum Intent {
     Tray,
     /// `--quit`: the running copy should exit (the installer uses this).
     Quit,
-    /// A `snipscreen:` link, from a click on a notification.
+    /// A `snipscreen:` link, from a click on a notification (`--open-link <link>`, see `main::parse_args`).
     Open(String),
 }
 
@@ -90,7 +92,7 @@ impl Intent {
             match a {
                 "--tray" => return Intent::Tray,
                 "--quit" => return Intent::Quit,
-                _ if a.len() > 11 && a[..11].eq_ignore_ascii_case("snipscreen:") => return Intent::Open(a.to_string()),
+
                 _ => {}
             }
         }
@@ -579,8 +581,7 @@ mod tests {
         assert_eq!(Intent::from_args::<&str>(&[]), Intent::Show);
         assert_eq!(Intent::from_args(&["--tray"]), Intent::Tray);
         assert_eq!(Intent::from_args(&["--quit"]), Intent::Quit);
-        assert_eq!(Intent::from_args(&["SnipScreen:open?id=4"]), Intent::Open("SnipScreen:open?id=4".into()));
-        assert_eq!(Intent::from_args(&["snipscreen:"]), Intent::Show, "a bare scheme opens nothing");
+        assert_eq!(Intent::from_args(&["snipscreen:open?id=4&path=x"]), Intent::Show, "a link counts only after --open-link");
         assert_eq!(Intent::from_args(&["--unknown", "--tray"]), Intent::Tray);
     }
 

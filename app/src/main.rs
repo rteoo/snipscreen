@@ -1492,30 +1492,45 @@ fn window_hwnd(cc: &eframe::CreationContext<'_>) -> isize {
     }
 }
 
-fn main() -> eframe::Result {
-    let mut args = std::env::args().skip(1);
+/// What the command line asks for. `--open-link <link>` (what Windows runs for a `snipscreen:` link,
+/// see `notify::register`) carries text from outside, so after it nothing is read as a flag: a crafted
+/// link can't smuggle in `--screenshot <path>` or anything else.
+fn parse_args(args: &[String]) -> Result<(Option<Shot>, tray::Intent), String> {
+    if args.first().map(String::as_str) == Some(tray::OPEN_LINK_FLAG) {
+        return Ok((None, tray::Intent::Open(args.get(1).cloned().unwrap_or_default())));
+    }
     let mut shot = None;
-    while let Some(a) = args.next() {
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
         let make = match a.as_str() {
             "--screenshot" => Shot::Home,
             "--screenshot-editor" => Shot::Editor,
             "--screenshot-settings" => Shot::Settings,
             _ => continue,
         };
-        match args.next() {
+        match it.next() {
             Some(p) => shot = Some(make(PathBuf::from(p))),
-            None => {
-                eprintln!("{a} needs a file name, e.g. {a} shot.png");
-                std::process::exit(2);
-            }
+            None => return Err(format!("{a} needs a file name, e.g. {a} shot.png")),
         }
     }
+    Ok((shot, tray::Intent::from_args(args)))
+}
+
+fn main() -> eframe::Result {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let (shot, intent) = match parse_args(&args) {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(2);
+        }
+    };
     win::become_dpi_aware();
     let loaded = settings::load();
     // A screenshot run must not take the shortcut or the single-instance slot from a running copy.
     // This comes first so a launch that only forwards to the running copy exits without more work.
     let boot = if shot.is_none() {
-        match start_resident(tray::Intent::from_args(&std::env::args().skip(1).collect::<Vec<_>>()), loaded.settings.shortcut) {
+        match start_resident(intent, loaded.settings.shortcut) {
             Some(b) => Some(b),
             None => return Ok(()),
         }
@@ -1920,6 +1935,23 @@ mod tests {
             ("Snip copied to clipboard".into(), vec!["Couldn't auto-save: disk full".into(), hint.clone()])
         );
         assert_eq!(toast_text(&Some(Err("busy".into())), &Some(Err("disk full".into()))).0, "Snip taken");
+    }
+
+    #[test]
+    fn a_link_never_turns_into_flags() {
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let (shot, intent) = parse_args(&args(&["--open-link", "snipscreen:open?id=1&path=x", "--screenshot", "C:\\evil.png", "--quit"])).unwrap();
+        assert!(shot.is_none(), "--screenshot after a link is part of nothing");
+        assert_eq!(intent, tray::Intent::Open("snipscreen:open?id=1&path=x".into()));
+        let (shot, intent) = parse_args(&args(&["--open-link"])).unwrap();
+        assert!(shot.is_none());
+        assert_eq!(intent, tray::Intent::Open(String::new()), "an empty link opens nothing later");
+        // Only in first place does it mean anything; a bare link is never opened.
+        let (_, intent) = parse_args(&args(&["--tray", "--open-link", "snipscreen:open?id=1&path=x"])).unwrap();
+        assert_eq!(intent, tray::Intent::Tray);
+        assert_eq!(parse_args(&args(&["snipscreen:open?id=1&path=x"])).unwrap().1, tray::Intent::Show);
+        assert!(matches!(parse_args(&args(&["--screenshot", "a.png"])), Ok((Some(Shot::Home(_)), tray::Intent::Show))));
+        assert!(parse_args(&args(&["--screenshot"])).is_err());
     }
 
     #[test]

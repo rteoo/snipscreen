@@ -4,7 +4,7 @@
 //! An unpackaged app can raise toasts once its AppUserModelID is registered under
 //! `HKCU\Software\Classes\AppUserModelId`. The toast's click is a `snipscreen:` link (protocol
 //! activation), so it works while the toast is up and later from the notification centre, even
-//! after SnipScreen was closed: Windows starts `snipscreen.exe "snipscreen:open?..."`, which hands
+//! after SnipScreen was closed: Windows starts `snipscreen.exe --open-link "snipscreen:open?..."`, which hands
 //! the link to the running copy (`tray::forward`) or opens the snip itself.
 
 use std::collections::VecDeque;
@@ -68,7 +68,7 @@ pub fn register(exe: &Path) -> Result<(), String> {
         (PROTOCOL_KEY.to_string(), "", "URL:SnipScreen".to_string()),
         (PROTOCOL_KEY.to_string(), "URL Protocol", String::new()),
         (format!("{PROTOCOL_KEY}\\DefaultIcon"), "", format!("\"{exe}\",0")),
-        (format!("{PROTOCOL_KEY}\\shell\\open\\command"), "", format!("\"{exe}\" \"%1\"")),
+        (format!("{PROTOCOL_KEY}\\shell\\open\\command"), "", open_command(&exe.to_string())),
     ];
     for (key, name, value) in &wanted {
         if win::reg_get(key, name).as_deref() != Some(value.as_str()) {
@@ -76,6 +76,12 @@ pub fn register(exe: &Path) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// The command Windows runs for a `snipscreen:` link. The link goes last, after a flag that tells
+/// `main` to read nothing after it as a flag, since not every launcher escapes quotes in it.
+fn open_command(exe: &str) -> String {
+    format!("\"{exe}\" {} \"%1\"", crate::tray::OPEN_LINK_FLAG)
 }
 
 /// One notification.
@@ -176,6 +182,10 @@ pub fn open_link(id: u64, path: &Path) -> String {
 
 /// Reads a link made by `open_link`.
 pub fn parse_open_link(link: &str) -> Option<(u64, PathBuf)> {
+    // `open_link` percent-encodes everything; a raw quote or space means someone else made this.
+    if link.chars().any(|c| c == '"' || c.is_whitespace()) {
+        return None;
+    }
     let rest = link.get(..SCHEME.len()).filter(|s| s.eq_ignore_ascii_case(SCHEME)).map(|_| &link[SCHEME.len()..])?;
     let query = rest.strip_prefix("open?")?;
     let (mut id, mut path) = (None, None);
@@ -342,6 +352,24 @@ mod tests {
         for bad in ["snipscreen:open?id=x&path=C%3A", "snipscreen:open?id=1", "snipscreen:close?id=1&path=a", "http:open?id=1&path=a", "snipscreen:open?id=1&path=%E", "s"] {
             assert_eq!(parse_open_link(bad), None, "{bad}");
         }
+    }
+
+    #[test]
+    fn links_with_quotes_or_spaces_are_refused() {
+        for bad in [
+            "snipscreen:open?id=1&path=C%3A%5Cx.png\" --screenshot \"C:\\evil.png",
+            "snipscreen:open?id=1&path=C%3A%5Cx.png --tray",
+            "snipscreen:open?id=1&path=C%3A%5Cx.png\t",
+            "snipscreen:open?id=1\"&path=C%3A%5Cx.png",
+        ] {
+            assert_eq!(parse_open_link(bad), None, "{bad}");
+        }
+        assert!(parse_open_link("snipscreen:open?id=1&path=C%3A%5Cx.png").is_some());
+    }
+
+    #[test]
+    fn the_link_handler_passes_the_link_after_open_link() {
+        assert_eq!(open_command(r"C:\Program Files\SnipScreen\snipscreen.exe"), r#""C:\Program Files\SnipScreen\snipscreen.exe" --open-link "%1""#);
     }
 
     #[test]
