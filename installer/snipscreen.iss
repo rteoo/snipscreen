@@ -10,7 +10,8 @@
 ; snips that were not auto-saved).
 ; What SnipScreen registers for itself while it runs (the Run entry for "Start
 ; with Windows", its notification identity and the snipscreen: link handler,
-; all under HKCU) is removed on uninstall.
+; all under HKCU) is removed on uninstall, with what Windows keeps about it
+; (its notification settings and the Startup apps switch).
 
 #define MyAppName "SnipScreen"
 #define MyAppVersion "0.1.1"
@@ -119,5 +120,9 @@ begin
     RegDeleteValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Run', 'SnipScreen');
     RegDeleteKeyIncludingSubkeys(HKCU, 'Software\Classes\AppUserModelId\{#MyAppId}');
     RegDeleteKeyIncludingSubkeys(HKCU, 'Software\Classes\snipscreen');
+    // Written by Windows, not by SnipScreen: its notification settings for the
+    // app, and the Startup apps switch in Settings / Task Manager.
+    RegDeleteKeyIncludingSubkeys(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Notifications\Settings\{#MyAppId}');
+    RegDeleteValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run', 'SnipScreen');
   end;
 end;
