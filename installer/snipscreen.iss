@@ -63,6 +63,8 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; Flags: unchecked
 Source: "{#MyBuildDir}\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\README.md"; DestDir: "{app}"; Flags: ignoreversion
+; The embedded Geist font's licence (SIL OFL 1.1 asks for it to travel with the font).
+Source: "..\app\assets\fonts\OFL.txt"; DestDir: "{app}\licenses"; DestName: "Geist-OFL.txt"; Flags: ignoreversion
 
 [Icons]
 ; The same AppUserModelID the app sets on itself (notify.rs), so the running

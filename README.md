@@ -173,3 +173,8 @@ Contributor and agent conventions are in [AGENTS.md](AGENTS.md).
 ## License
 
 SnipScreen is released under the [MIT License](LICENSE).
+
+## Third-party notices
+
+- **Geist** (Geist SemiBold, embedded for text marks) is © The Geist Project Authors and licensed under the [SIL Open Font License 1.1](app/assets/fonts/OFL.txt). The installer ships that licence as `licenses\Geist-OFL.txt` in the install folder.
+- The Rust crates SnipScreen is built from (among them egui/eframe, skrifa and vello_cpu) are licensed under MIT and/or Apache-2.0; their notices are in each crate's source.
