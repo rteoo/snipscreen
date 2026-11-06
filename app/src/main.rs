@@ -238,6 +238,7 @@ impl App {
         let (grab_tx, grab_rx) = channel();
         let (bg_tx, bg_rx) = channel();
         let shot_run = shot.is_some();
+        let unreadable = loaded.unreadable();
         // A screenshot run renders the defaults and never writes the person's file.
         let save_to = if shot_run { None } else { loaded.path.clone() };
         let bg = Notifier::new(bg_tx, cc.egui_ctx.clone(), ViewportId::ROOT);
@@ -322,9 +323,12 @@ impl App {
         }
         app.resident = app.agent.is_some();
         if !shot_run {
-            // Every start: the exe may have moved since the entry was written.
+            // Every start: the exe may have moved since the entry was written. Not from the defaults
+            // standing in for a file that couldn't be read, which may have said "off".
             let startup = StartupEntry::new(app.bg.clone(), tray::sync_run_at_startup);
-            startup.set(app.settings.start_with_windows);
+            if !unreadable {
+                startup.set(app.settings.start_with_windows);
+            }
             app.startup = Some(startup);
             app.register_notifications();
         }
