@@ -128,7 +128,9 @@ impl Toast {
         let toast = ToastNotification::CreateToastNotification(&doc).map_err(|e| fail("create the notification", e))?;
         toast.SetTag(&HSTRING::from(&self.tag)).and_then(|_| toast.SetGroup(&HSTRING::from("snips"))).map_err(|e| fail("create the notification", e))?;
         let on_dismissed = TypedEventHandler::<ToastNotification, ToastDismissedEventArgs>::new(move |_, args| {
-            if args.ok().and_then(|a| a.Reason()).is_ok_and(|r| r != ToastDismissalReason::ApplicationHidden) {
+            // Only the person or the timeout take a toast off the screen; a replacement (same tag) or
+            // the app hiding it says nothing about whether the snip is still wanted.
+            if args.ok().and_then(|a| a.Reason()).is_ok_and(|r| r == ToastDismissalReason::UserCanceled || r == ToastDismissalReason::TimedOut) {
                 gone();
             }
             Ok(())
@@ -232,9 +234,10 @@ pub fn may_open(path: &Path, folders: &[PathBuf]) -> bool {
 /// The newest snips by id, kept in memory so a click on their notification opens them at once,
 /// while the notification is on screen: the shell drops one when its notification leaves the
 /// screen, and every one after `max_age` in any case. Also bounded by count and by bytes. A click
-/// later on, from the notification centre, opens the PNG instead.
+/// later on, from the notification centre, opens the PNG instead, so a snip whose file isn't
+/// `written` yet is never let go: its link names a file that is still empty.
 pub struct Recent {
-    items: VecDeque<(u64, Instant, Arc<ColorImage>)>,
+    items: VecDeque<RecentSnip>,
     max_items: usize,
     max_bytes: usize,
     max_age: Duration,
@@ -250,31 +253,46 @@ impl Recent {
     }
 
     pub fn insert(&mut self, id: u64, img: Arc<ColorImage>, now: Instant) {
-        self.items.push_back((id, now, img));
-        let mut total: usize = self.items.iter().map(|(_, _, i)| Self::bytes(i)).sum();
+        self.items.push_back(RecentSnip { id, at: now, img, written: false });
+        let mut total: usize = self.items.iter().map(|s| Self::bytes(&s.img)).sum();
         // The newest one stays even when it alone is over budget: its notification is up right now.
-        while self.items.len() > 1 && (self.items.len() > self.max_items || total > self.max_bytes) {
-            if let Some((_, _, old)) = self.items.pop_front() {
-                total -= Self::bytes(&old);
+        while self.items.len() > self.max_items || total > self.max_bytes {
+            let Some(at) = self.items.iter().take(self.items.len() - 1).position(|s| s.written) else { break };
+            if let Some(old) = self.items.remove(at) {
+                total -= Self::bytes(&old.img);
             }
+        }
+    }
+
+    /// Snip `id`'s file is written (or failed for good): from now on a click can do without the copy here.
+    pub fn written(&mut self, id: u64) {
+        if let Some(s) = self.items.iter_mut().find(|s| s.id == id) {
+            s.written = true;
         }
     }
 
     /// Hands the snip over (the editor keeps it from here on).
     pub fn take(&mut self, id: u64) -> Option<Arc<ColorImage>> {
-        let at = self.items.iter().position(|(i, _, _)| *i == id)?;
-        self.items.remove(at).map(|(_, _, img)| img)
+        let at = self.items.iter().position(|s| s.id == id)?;
+        self.items.remove(at).map(|s| s.img)
     }
 
     pub fn contains(&self, id: u64) -> bool {
-        self.items.iter().any(|(i, _, _)| *i == id)
+        self.items.iter().any(|s| s.id == id)
     }
 
-    /// Drops the snips older than `max_age`; returns when the next one is due to go.
+    /// Drops the written snips older than `max_age`; returns when the next one is due to go.
     pub fn expire(&mut self, now: Instant) -> Option<Instant> {
-        self.items.retain(|(_, at, _)| now.saturating_duration_since(*at) < self.max_age);
-        self.items.iter().map(|(_, at, _)| *at + self.max_age).min()
+        self.items.retain(|s| !s.written || now.saturating_duration_since(s.at) < self.max_age);
+        self.items.iter().filter(|s| s.written).map(|s| s.at + self.max_age).min()
     }
+}
+
+struct RecentSnip {
+    id: u64,
+    at: Instant,
+    img: Arc<ColorImage>,
+    written: bool,
 }
 
 /// `img` shrunk (box filter) so its longer side is at most `max`; small images are copied as they are.
@@ -435,20 +453,41 @@ mod tests {
     fn recent_snips_are_bounded_by_count_and_bytes() {
         let mut r = Recent::new(3, 1000, Duration::from_secs(60));
         let now = Instant::now();
+        let put = |r: &mut Recent, id, i| {
+            r.insert(id, i, now);
+            r.written(id);
+        };
         for id in 1..=4 {
-            r.insert(id, img(5, 5), now); // 100 bytes each
+            put(&mut r, id, img(5, 5)); // 100 bytes each
         }
         assert!(r.take(1).is_none(), "the oldest went past the count");
         assert!(r.take(4).is_some());
         assert!(r.take(4).is_none(), "taken once");
-        r.insert(5, img(10, 10), now); // 400 bytes
-        r.insert(6, img(10, 10), now);
-        r.insert(8, img(15, 15), now); // 900 bytes: 5 and 6 must go to stay under 1000
+        put(&mut r, 5, img(10, 10)); // 400 bytes
+        put(&mut r, 6, img(10, 10));
+        put(&mut r, 8, img(15, 15)); // 900 bytes: 5 and 6 must go to stay under 1000
         assert!(r.take(5).is_none() && r.take(6).is_none(), "pushed out by bytes");
         assert!(r.take(8).is_some());
-        r.insert(7, img(100, 100), now); // 40 000 bytes, alone over budget
+        put(&mut r, 7, img(100, 100)); // 40 000 bytes, alone over budget
         assert!(r.take(6).is_none());
         assert!(r.take(7).is_some(), "the newest stays even over budget");
+    }
+
+    #[test]
+    fn a_snip_stays_until_its_file_is_written() {
+        let (now, age) = (Instant::now(), Duration::from_secs(180));
+        let mut r = Recent::new(1, 100, age);
+        r.insert(1, img(5, 5), now); // 100 bytes, still being encoded
+        r.insert(2, img(5, 5), now);
+        assert!(r.contains(1), "over count and bytes, but its file is still empty");
+        r.written(1);
+        r.insert(3, img(5, 5), now);
+        assert!(!r.contains(1) && r.contains(2) && r.contains(3), "written, it goes; 2 isn't written yet");
+        assert_eq!(r.expire(now + age), None, "nor does age take an unwritten one");
+        assert!(r.contains(2) && r.contains(3));
+        r.written(2);
+        assert_eq!(r.expire(now + age), None);
+        assert!(!r.contains(2) && r.contains(3));
     }
 
     #[test]
@@ -457,6 +496,8 @@ mod tests {
         let mut r = Recent::new(10, 1 << 30, age);
         r.insert(1, img(4000, 2000), t0); // over any budget alone: it still goes with age
         r.insert(2, img(5, 5), t0 + Duration::from_secs(60));
+        r.written(1);
+        r.written(2);
         assert_eq!(r.expire(t0 + Duration::from_secs(1)), Some(t0 + age), "the first is due first");
         assert_eq!(r.expire(t0 + age), Some(t0 + Duration::from_secs(60) + age));
         assert!(r.take(1).is_none(), "expired");

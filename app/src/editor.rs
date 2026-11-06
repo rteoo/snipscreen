@@ -1048,6 +1048,11 @@ impl Editors {
         self.slots.is_empty()
     }
 
+    /// Whether window `id` is still open.
+    pub fn contains(&self, id: ViewportId) -> bool {
+        self.slots.iter().any(|s| s.id == id)
+    }
+
     #[cfg(test)]
     pub fn ids(&self) -> Vec<ViewportId> {
         self.slots.iter().map(|s| s.id).collect()
