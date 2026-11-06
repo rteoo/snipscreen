@@ -164,6 +164,8 @@ struct App {
     /// `settings` as last handed to `saver`; any difference is saved at the end of the pass.
     saved: Settings,
     saver: settings::Saver,
+    /// Keeps the sign-in entry in step with `settings.start_with_windows`. `None` in a screenshot run.
+    startup: Option<StartupEntry>,
     /// Messages from background work that has no window of its own (settings saver, startup entry).
     bg: Notifier,
     bg_rx: Receiver<String>,
@@ -254,6 +256,7 @@ impl App {
             settings,
             saved,
             saver,
+            startup: None,
             bg,
             bg_rx,
             stage: Stage::Idle,
@@ -292,7 +295,9 @@ impl App {
         app.resident = app.agent.is_some();
         if !shot_run {
             // Every start: the exe may have moved since the entry was written.
-            app.sync_startup();
+            let startup = StartupEntry::new(app.bg.clone(), tray::sync_run_at_startup);
+            startup.set(app.settings.start_with_windows);
+            app.startup = Some(startup);
             app.register_notifications();
         }
         if let Some(intent) = intent {
@@ -705,16 +710,6 @@ impl App {
         }
     }
 
-    /// Brings the sign-in entry in line with "Start SnipScreen with Windows", off the UI thread.
-    fn sync_startup(&self) {
-        let (on, report) = (self.settings.start_with_windows, self.bg.clone());
-        std::thread::spawn(move || {
-            if let Err(e) = tray::sync_run_at_startup(on) {
-                report.send(format!("Couldn't update starting with Windows: {e}"));
-            }
-        });
-    }
-
     /// Registers SnipScreen for notifications and its `snipscreen:` links, off the UI thread.
     fn register_notifications(&self) {
         let report = self.bg.clone();
@@ -728,8 +723,8 @@ impl App {
     /// Hands changed settings to the saver; a few field compares per pass when nothing changed.
     fn persist(&mut self) {
         if self.settings != self.saved {
-            if self.settings.start_with_windows != self.saved.start_with_windows {
-                self.sync_startup();
+            if let (true, Some(startup)) = (self.settings.start_with_windows != self.saved.start_with_windows, &self.startup) {
+                startup.set(self.settings.start_with_windows);
             }
             self.saved = self.settings.clone();
             self.saver.save(&self.settings);
@@ -775,6 +770,7 @@ impl eframe::App for App {
         }
         self.persist();
         self.saver = settings::Saver::new(None, |_| {});
+        self.startup = None;
         self.agent = None;
     }
 
@@ -1417,6 +1413,46 @@ impl App {
     }
 }
 
+/// Brings the sign-in entry in line with "Start SnipScreen with Windows" on one worker, so quick
+/// toggles are applied in order (and only the newest of a burst at all) and the entry ends up as the
+/// setting says. Dropping it applies what is still queued, then stops.
+struct StartupEntry {
+    tx: Option<Sender<bool>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl StartupEntry {
+    fn new(report: Notifier, apply: impl Fn(bool) -> Result<(), String> + Send + 'static) -> Self {
+        let (tx, rx) = channel::<bool>();
+        let thread = std::thread::spawn(move || {
+            while let Ok(mut on) = rx.recv() {
+                while let Ok(newer) = rx.try_recv() {
+                    on = newer;
+                }
+                if let Err(e) = apply(on) {
+                    report.send(format!("Couldn't update starting with Windows: {e}"));
+                }
+            }
+        });
+        Self { tx: Some(tx), thread: Some(thread) }
+    }
+
+    fn set(&self, on: bool) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(on);
+        }
+    }
+}
+
+impl Drop for StartupEntry {
+    fn drop(&mut self) {
+        self.tx = None;
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
 /// Wakes the shell from another thread. `request_repaint` would target whichever viewport is in a
 /// pass right now (an editor or Settings, whose passes share the context), leaving the event unread
 /// until something else repaints the root.
@@ -1878,6 +1914,27 @@ mod tests {
         out.textures_delta.clear();
         assert_eq!(plain_went_to, [editor], "the trap: a bare request_repaint goes to the window in its pass");
         assert!(woken.lock().unwrap().starts_with(&[ViewportId::ROOT]), "{:?}", woken.lock().unwrap());
+    }
+
+    #[test]
+    fn quick_startup_toggles_end_as_the_setting_says() {
+        let applied = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = applied.clone();
+        let (tx, rx) = channel();
+        let report = Notifier::new(tx, egui::Context::default(), ViewportId::ROOT);
+        let entry = StartupEntry::new(report, move |on| {
+            std::thread::sleep(Duration::from_millis(20));
+            log.lock().unwrap().push(on);
+            if on { Ok(()) } else { Err("access denied".into()) }
+        });
+        for on in [true, false, true, false, true] {
+            entry.set(on);
+        }
+        drop(entry);
+        let applied = applied.lock().unwrap();
+        assert_eq!(applied.last(), Some(&true), "the newest choice is applied last: {applied:?}");
+        assert!(applied.len() < 5, "a burst collapses: {applied:?}");
+        assert!(rx.try_iter().all(|m| m == "Couldn't update starting with Windows: access denied"));
     }
 
     #[test]
