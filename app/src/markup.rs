@@ -444,10 +444,14 @@ fn placed_bounds(glyphs: &[Placed]) -> Rect {
     glyphs.iter().fold(Rect::NOTHING, |b, g| b.union(g.rect()))
 }
 
-/// Exact antialiased coverage of closed outlines (nonzero winding) over the pixels of `r`. Each
-/// edge adds whole-number cover and area to the pixel cells it crosses, worked out from its own
-/// end points alone; so a pixel's value never depends on which rectangle is being filled or in
-/// what order edges arrive, and any tile can be rendered on its own, bit for bit as in a whole render.
+/// Antialiased coverage of closed outlines over the pixels of `r`: the area each pixel's signed
+/// winding covers, clamped to full. That is exact nonzero filling wherever no two loops overlap
+/// inside a pixel, as with a glyph's own outline. A stroked halo's loops do overlap (at joins and
+/// tight curves), and a pixel only partly covered there counts the overlap twice, so it can come
+/// out a little more opaque than true nonzero; fully covered pixels are still exact. Each edge adds
+/// whole-number cover and area to the pixel cells it crosses, worked out from its own end points
+/// alone; so a pixel's value never depends on which rectangle is being filled or in what order
+/// edges arrive, and any tile can be rendered on its own, bit for bit as in a whole render.
 struct Coverage {
     r: PxRect,
     /// `[cover, area]` per pixel of `r`, FreeType style.
