@@ -21,14 +21,14 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     VK_LSHIFT, VK_LWIN, VK_MENU, VK_RCONTROL, VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SHIFT,
 };
 use windows_sys::Win32::UI::Shell::{
-    Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_SETVERSION, NIN_SELECT, NOTIFYICONDATAW, NOTIFYICON_VERSION_4,
+    Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NIM_SETVERSION, NIN_SELECT, NOTIFYICONDATAW, NOTIFYICON_VERSION_4,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AllowSetForegroundWindow, AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyMenu, DestroyWindow, DispatchMessageW, FindWindowW,
-    GetForegroundWindow, GetMessageW, GetSystemMetrics, GetWindowLongPtrW, GetWindowThreadProcessId, KillTimer, LoadImageW, PostMessageW, PostQuitMessage, RegisterClassExW,
+    GetForegroundWindow, GetMessageW, GetWindowLongPtrW, GetWindowThreadProcessId, KillTimer, LoadImageW, PostMessageW, PostQuitMessage, RegisterClassExW,
     RegisterWindowMessageW, SendMessageTimeoutW, SetForegroundWindow, SetMenuDefaultItem, SetTimer, SetWindowLongPtrW, TrackPopupMenuEx, TranslateMessage,
     GWLP_USERDATA, HICON, IMAGE_ICON, LR_DEFAULTCOLOR, MF_SEPARATOR, MF_STRING, MSG, SMTO_ABORTIFHUNG, SM_CXSMICON, SM_CYSMICON, TPM_BOTTOMALIGN, TPM_RETURNCMD,
-    TPM_RIGHTBUTTON, CallNextHookEx, SetWindowsHookExW, UnhookWindowsHookEx, HHOOK, KBDLLHOOKSTRUCT, WH_KEYBOARD_LL, WM_KEYDOWN, WM_SYSKEYDOWN, WM_APP, WM_CLOSE, WM_CONTEXTMENU, WM_COPYDATA, WM_DESTROY, WM_ENDSESSION, WM_HOTKEY, WM_LBUTTONDBLCLK, WM_NULL, WM_QUERYENDSESSION, WM_TIMER,
+    TPM_RIGHTBUTTON, CallNextHookEx, SetWindowsHookExW, UnhookWindowsHookEx, HHOOK, KBDLLHOOKSTRUCT, WH_KEYBOARD_LL, WM_KEYDOWN, WM_SYSKEYDOWN, WM_APP, WM_CLOSE, WM_CONTEXTMENU, WM_COPYDATA, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ENDSESSION, WM_HOTKEY, WM_LBUTTONDBLCLK, WM_NULL, WM_QUERYENDSESSION, WM_TIMER,
     WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_POPUP,
 };
 
@@ -81,6 +81,12 @@ const MENU_QUIT: usize = 4;
 extern "system" {
     fn CreateMutexW(attributes: *const c_void, initial_owner: i32, name: *const u16) -> HANDLE;
     fn GetModuleHandleW(name: *const u16) -> HMODULE;
+}
+
+#[link(name = "user32")]
+extern "system" {
+    fn GetDpiForWindow(hwnd: HWND) -> u32;
+    fn GetSystemMetricsForDpi(index: i32, dpi: u32) -> i32;
 }
 
 /// The exe's icon resource; `winresource` embeds `assets/snipscreen.ico` under id 1.
@@ -147,6 +153,9 @@ pub enum Event {
     Recorded(Option<Hotkey>),
     /// Settings… in the tray menu.
     Settings,
+    /// The shortcut was set aside while recording and couldn't be taken back (another app has it
+    /// now): no snip shortcut is registered any more, for the reason given.
+    HotkeyLost(String),
     /// Explorer (re)started and rebuilt the taskbar.
     TaskbarCreated,
 }
@@ -272,15 +281,19 @@ static RECORD_WIN: AtomicBool = AtomicBool::new(false);
 /// A combination was posted; later keys pass untouched until the hook is removed.
 static RECORD_DONE: AtomicBool = AtomicBool::new(false);
 
-/// Tests call the hook directly, with some other app in front.
+// Tests call the hook directly with made-up keys (`tests::press`) and say whether SnipScreen is
+// in front. The real hook, live meanwhile on the agent thread, ignores the person's own typing
+// then, or a key pressed in another app during `cargo test` would break the test.
 #[cfg(test)]
-static TEST_IN_FRONT: AtomicBool = AtomicBool::new(false);
+thread_local! {
+    static TEST_KEY: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
 
 /// Whether the window in front belongs to this process (the Settings window, while recording).
 unsafe fn ours_in_front() -> bool {
     #[cfg(test)]
-    if TEST_IN_FRONT.load(Ordering::Relaxed) {
-        return true;
+    if let Some(front) = TEST_KEY.with(|k| k.get()) {
+        return front;
     }
     let mut pid = 0;
     GetWindowThreadProcessId(GetForegroundWindow(), &mut pid);
@@ -298,6 +311,10 @@ fn is_modifier(vk: u16) -> bool {
 /// don't act on the Settings window. Once another app is in front it lets every key through and
 /// has itself taken off: it must never eat keys meant for something else.
 unsafe extern "system" fn record_hook(code: i32, w: WPARAM, l: LPARAM) -> LRESULT {
+    #[cfg(test)]
+    if TEST_KEY.with(|k| k.get()).is_none() {
+        return CallNextHookEx(null_mut(), code, w, l);
+    }
     if code < 0 {
         return CallNextHookEx(null_mut(), code, w, l);
     }
@@ -335,7 +352,7 @@ unsafe extern "system" fn record_hook(code: i32, w: WPARAM, l: LPARAM) -> LRESUL
     1
 }
 
-/// Takes the hook off and gives the snip shortcut back.
+/// Takes the hook off and gives the snip shortcut back, telling the shell if it can't be.
 unsafe fn stop_recording(hwnd: HWND, st: &mut State) {
     if st.hook.is_null() {
         return;
@@ -344,8 +361,9 @@ unsafe fn stop_recording(hwnd: HWND, st: &mut State) {
     st.hook = null_mut();
     RECORD_WIN.store(false, Ordering::Relaxed);
     if let Some(h) = st.hotkey {
-        if register(hwnd, HOTKEY_SNIP[st.slot], h).is_err() {
+        if let Err(e) = register(hwnd, HOTKEY_SNIP[st.slot], h) {
             st.hotkey = None;
+            (st.on_event)(Event::HotkeyLost(format!("{e}: it was taken while you were choosing a new shortcut")));
         }
     }
 }
@@ -366,8 +384,7 @@ impl Agent {
                 }
             };
             let first = register(hwnd, HOTKEY_SNIP[0], hotkey);
-            let instance = GetModuleHandleW(null());
-            let icon = LoadImageW(instance, ICON_RESOURCE as *const u16, IMAGE_ICON, GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_DEFAULTCOLOR) as HICON;
+            let icon = load_tray_icon(GetDpiForWindow(hwnd));
             let taskbar_created = RegisterWindowMessageW(wide("TaskbarCreated").as_ptr());
             let state = Box::new(State {
                 on_event: Box::new(on_event),
@@ -466,9 +483,37 @@ fn tray_data(hwnd: HWND) -> NOTIFYICONDATAW {
     NOTIFYICONDATAW { cbSize: size_of::<NOTIFYICONDATAW>() as u32, hWnd: hwnd, uID: 1, ..Default::default() }
 }
 
+/// The exe's icon at the small-icon size for `dpi`.
+unsafe fn load_tray_icon(dpi: u32) -> HICON {
+    let dpi = if dpi == 0 { 96 } else { dpi };
+    let (w, h) = (GetSystemMetricsForDpi(SM_CXSMICON, dpi), GetSystemMetricsForDpi(SM_CYSMICON, dpi));
+    LoadImageW(GetModuleHandleW(null()), ICON_RESOURCE as *const u16, IMAGE_ICON, w, h, LR_DEFAULTCOLOR) as HICON
+}
+
+/// Swaps in the icon for the current scale (the display or its scaling changed).
+unsafe fn reload_tray_icon(hwnd: HWND, st: &mut State, dpi: u32) {
+    let icon = load_tray_icon(dpi);
+    if icon.is_null() {
+        return;
+    }
+    if st.tray_added {
+        let mut nid = tray_data(hwnd);
+        nid.uFlags = NIF_ICON;
+        nid.hIcon = icon;
+        Shell_NotifyIconW(NIM_MODIFY, &nid);
+    }
+    if !st.icon.is_null() {
+        DestroyIcon(st.icon);
+    }
+    st.icon = icon;
+}
+
 /// Puts the icon in the notification area. Right after sign-in the taskbar may not exist yet, so a
-/// failure is retried on a timer for a while; Explorer's `TaskbarCreated` also re-adds it.
+/// failure is retried on a timer for a while; Explorer's `TaskbarCreated` also re-adds it. An icon
+/// still there (the broadcast also comes when only the taskbar's settings changed) is taken off
+/// first, or the add would fail and leave a ghost.
 unsafe fn add_tray_icon(hwnd: HWND, st: &mut State) {
+    Shell_NotifyIconW(NIM_DELETE, &tray_data(hwnd));
     let mut nid = tray_data(hwnd);
     nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP | NIF_SHOWTIP;
     nid.uCallbackMessage = MSG_TRAY;
@@ -631,6 +676,8 @@ unsafe extern "system" fn agent_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM)
                 add_tray_icon(hwnd, st);
             }
         }
+        WM_DPICHANGED => reload_tray_icon(hwnd, st, ((w >> 16) & 0xffff) as u32),
+        WM_DISPLAYCHANGE => reload_tray_icon(hwnd, st, GetDpiForWindow(hwnd)),
         _ if msg == st.taskbar_created && st.taskbar_created != 0 => {
             // Only when an icon was asked for: one that was added, or one still being retried.
             if st.tray_added || st.tray_retries > 0 {
@@ -774,11 +821,7 @@ mod tests {
             assert!(std::time::Instant::now() < deadline, "recording should set the shortcut aside");
             std::thread::sleep(Duration::from_millis(5));
         }
-        let key = KBDLLHOOKSTRUCT { vkCode: VK_F1 as u32 + 6, ..unsafe { zeroed() } };
-        TEST_IN_FRONT.store(true, Ordering::Relaxed);
-        let swallowed = unsafe { record_hook(0, WM_KEYDOWN as WPARAM, &key as *const _ as LPARAM) };
-        TEST_IN_FRONT.store(false, Ordering::Relaxed);
-        assert_eq!(swallowed, 1, "the recorded key reaches nothing (Alt+F4 must not close Settings)");
+        assert_eq!(press(VK_F1 as u32 + 6, true), 1, "the recorded key reaches nothing (Alt+F4 must not close Settings)");
         match next(&rx) {
             Event::Recorded(Some(h)) => assert_eq!(h.vk, VK_F1 as u32 + 6),
             other => panic!("expected the F7 press, got {other:?}"),
@@ -796,8 +839,17 @@ mod tests {
         assert!(rx.try_recv().is_err(), "a cancelled recording reports nothing");
     }
 
-    /// The hook tests change `TEST_IN_FRONT`, which the hook reads; one at a time.
+    /// The hook reports to the last agent that started recording (`RECORD_TO`); one test at a time.
     static HOOK_TESTS: Mutex<()> = Mutex::new(());
+
+    /// Calls the hook as Windows would for a key going down, with SnipScreen in front or not.
+    fn press(vk: u32, ours_in_front: bool) -> LRESULT {
+        let key = KBDLLHOOKSTRUCT { vkCode: vk, ..unsafe { zeroed() } };
+        TEST_KEY.with(|k| k.set(Some(ours_in_front)));
+        let r = unsafe { record_hook(0, WM_KEYDOWN as WPARAM, &key as *const _ as LPARAM) };
+        TEST_KEY.with(|k| k.set(None));
+        r
+    }
 
     fn obscure(vk_offset: u32) -> Hotkey {
         use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_F1;
@@ -877,8 +929,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_LWIN;
-        let win = KBDLLHOOKSTRUCT { vkCode: VK_LWIN as u32, ..unsafe { zeroed() } };
-        assert_eq!(unsafe { record_hook(0, WM_KEYDOWN as WPARAM, &win as *const _ as LPARAM) }, 0, "Win reaches the app in front");
+        assert_eq!(press(VK_LWIN as u32, false), 0, "Win reaches the app in front");
         assert_eq!(next(&rx), Event::Recorded(None), "reported as cancelled");
         assert!(!free(), "the shortcut is back");
     }

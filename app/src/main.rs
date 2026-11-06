@@ -848,6 +848,14 @@ impl App {
         }
     }
 
+    /// The agent couldn't take the shortcut back after recording: none is in force now.
+    fn on_hotkey_lost(&mut self, ctx: &egui::Context, why: String) {
+        (self.hotkey, self.hotkey_note) = (None, Some(why.clone()));
+        if let Some(w) = &self.settings_window {
+            w.hotkey_result(ctx, &Err(why), None);
+        }
+    }
+
     /// Registers SnipScreen for notifications and its `snipscreen:` links, off the UI thread.
     fn register_notifications(&self) {
         let report = self.bg.clone();
@@ -940,6 +948,7 @@ impl eframe::App for App {
                 tray::Event::Recorded(caught) => self.on_recorded(ctx, caught),
                 tray::Event::Settings => self.open_settings(ctx),
                 tray::Event::TaskbarCreated => self.on_taskbar_created(ctx),
+                tray::Event::HotkeyLost(why) => self.on_hotkey_lost(ctx, why),
             }
         }
         self.poll_settings_window(ctx);
