@@ -7,6 +7,9 @@ edition = "2021"
 eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts"] }
 png = "0.18"
 raw-window-handle = "0.6"
+# Text marks: glyph outlines and their rasteriser, pinned to the versions epaint 0.37 already builds.
+skrifa = { version = "=0.44.0", default-features = false, features = ["std"] }
+vello_cpu = { version = "=0.2.0", default-features = false, features = ["std", "u8_pipeline"] }
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Media_MediaFoundation",
@@ -21,6 +24,8 @@ windows = { version = "0.62", features = [
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
     "Win32_Graphics_Gdi",
+    "UI_Notifications",
+    "Data_Xml_Dom",
 ] }
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
@@ -35,6 +40,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Ole",
     "Win32_System_Com",
     "Win32_System_SystemInformation",
+    "Win32_System_Registry",
 ] }
 
 [build-dependencies]

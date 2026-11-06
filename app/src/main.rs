@@ -1,67 +1,37 @@
 #![windows_subsystem = "windows"]
 
 mod audio;
+mod editor;
 mod icons;
 mod markup;
+mod notify;
 mod recorder;
+mod settings;
+mod settings_window;
+mod tray;
+mod widgets;
 mod win;
 
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
+use editor::{Editors, VideoResult};
 use eframe::egui::{
-    self, pos2, vec2, Align, Align2, Color32, ColorImage, CornerRadius, CursorIcon, Event, FontId,
-    Key, KeyboardShortcut, Layout, Modifiers, Pos2, Rect, RichText, Sense, Shape, StrokeKind,
-    TextureHandle, TextureOptions, Vec2, ViewportCommand, WindowLevel,
+    self, pos2, vec2, Align, Align2, Color32, ColorImage, CursorIcon, FontId, Key, KeyboardShortcut, Layout, Modifiers, Pos2, Rect, RichText, Sense, Shape,
+    StrokeKind, TextureHandle, TextureOptions, Vec2, ViewportCommand, ViewportId, WindowLevel,
 };
 use icons::Icon;
-use markup::{Doc, Ink, PxRect, Stroke};
+use settings::{AfterCapture, Hotkey, Mode, Settings, Shape as Shape_, DELAYS};
+use widgets::{
+    dim_outside, divider, dropdown, icon_button, style, take_escape, Note, Notifier, PopupClickGuard, ACCENT, BTN, BUTTON_BG, BUTTON_HOVER, DIM, DIVIDER_W,
+    GAP, GLYPH, ICON, ICON_OFF, MIN_WINDOW_H, MIN_WINDOW_W, OUTLINE, RADIUS, TOOLBAR_BG,
+};
 use windows_sys::Win32::Foundation::HWND;
 
-const ACCENT: Color32 = Color32::from_rgb(0xff, 0xb6, 0x34);
-const TOOLBAR_BG: Color32 = Color32::from_rgb(0x20, 0x20, 0x20);
-const CANVAS_BG: Color32 = Color32::from_rgb(0x2c, 0x2c, 0x2c);
-const BUTTON_BG: Color32 = Color32::from_rgb(0x2d, 0x2d, 0x2d);
-const BUTTON_HOVER: Color32 = Color32::from_rgb(0x34, 0x34, 0x34);
-const OUTLINE: Color32 = Color32::from_rgb(0x45, 0x45, 0x45);
-const DIVIDER: Color32 = Color32::from_rgb(0x31, 0x31, 0x31);
-const ICON: Color32 = Color32::from_rgb(0xe8, 0xe8, 0xe8);
-const ICON_OFF: Color32 = Color32::from_rgb(0x6b, 0x6b, 0x6b);
-const BTN: Vec2 = vec2(36.0, 34.0);
-const GAP: f32 = 4.0;
-const DIVIDER_W: f32 = 13.0;
-/// Narrowest window that fits the capture, markup (with the crop buttons) and output groups side by side.
-const MIN_WINDOW_W: f32 = 520.0;
-const MIN_WINDOW_H: f32 = 240.0;
-/// Measured: capture group ~298 + markup with crop buttons 350 + output group 133 + 2 gaps + 24 toolbar margin = 837.
-const MIN_EDIT_W: f32 = 850.0;
-/// Clear space kept between the toolbar groups.
-const GROUP_GAP: f32 = 16.0;
-const MIN_ZOOM: f32 = 0.05;
-const MAX_ZOOM: f32 = 8.0;
-/// Snip zoom change per Ctrl+Plus / Ctrl+Minus press.
-const ZOOM_STEP: f32 = 1.25;
-/// Empty space kept around the snip inside the scrolling canvas, in points.
-const CANVAS_MARGIN: Vec2 = vec2(32.0, 32.0);
-const DIM: Color32 = Color32::from_black_alpha(120);
-/// Time for the window's hide animation to finish before the screen is copied.
-const HIDE_SETTLE: Duration = Duration::from_millis(250);
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Mode {
-    Photo,
-    Video,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Shape_ {
-    Rectangle,
-    Window,
-    FullScreen,
-    Freeform,
-}
+/// The home window: a toolbar to start a capture over an empty canvas.
+const HOME_SIZE: Vec2 = vec2(620.0, 330.0);
 
 impl Shape_ {
     const ALL: [Shape_; 4] = [Shape_::Rectangle, Shape_::Window, Shape_::FullScreen, Shape_::Freeform];
@@ -93,8 +63,6 @@ impl Shape_ {
     }
 }
 
-const DELAYS: [u64; 4] = [0, 3, 5, 10];
-
 /// Whole seconds to show for a delay with `left` still to run, counting
 /// 3, 2, 1; `None` once it has run out.
 fn countdown_secs(left: Duration) -> Option<u64> {
@@ -105,29 +73,6 @@ fn delay_label(s: u64) -> String {
     if s == 0 { "No delay".into() } else { format!("{s} seconds") }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Tool {
-    Pen,
-    Highlighter,
-    Eraser,
-    Crop,
-}
-
-const PEN_COLORS: [Color32; 6] = [
-    Color32::from_rgb(0x1f, 0x1f, 0x1f),
-    Color32::WHITE,
-    Color32::from_rgb(0xe8, 0x1c, 0x24),
-    Color32::from_rgb(0x00, 0x78, 0xd4),
-    Color32::from_rgb(0x10, 0x9c, 0x3c),
-    Color32::from_rgb(0xff, 0x8c, 0x00),
-];
-const HIGHLIGHT_COLORS: [Color32; 4] = [
-    Color32::from_rgb(0xff, 0xe6, 0x00),
-    Color32::from_rgb(0x5c, 0xf0, 0x5c),
-    Color32::from_rgb(0xff, 0x6e, 0xc7),
-    Color32::from_rgb(0x5c, 0xd6, 0xff),
-];
-
 struct Picker {
     grab: win::Grab,
     texture: TextureHandle,
@@ -137,6 +82,8 @@ struct Picker {
     outline: Vec<Pos2>,
     /// Screen pixels the window's drawing area must cover: x, y, w, h.
     target: [i32; 4],
+    /// The window covered `target` when a pass began, so what it painted is the picker.
+    fitted: bool,
     shown: bool,
     tries: u8,
     /// Monitor under the mouse when picking began, in image pixels; the
@@ -153,13 +100,6 @@ struct RecBar {
     notes: Vec<String>,
 }
 
-struct VideoResult {
-    path: PathBuf,
-    seconds: f64,
-    size: [u32; 2],
-    thumb: Option<TextureHandle>,
-}
-
 enum Stage {
     Idle,
     /// Delay running with the window still visible, so it can show the countdown.
@@ -169,7 +109,6 @@ enum Stage {
     Picking(Box<Picker>),
     Recording(Box<RecBar>),
 }
-
 
 // Recording bar controls, left to right: Start, clock, mic, mic menu, system sound, divider, close, and the "!" warning (shown only when there are notes, but always budgeted for).
 const REC_START_W: f32 = 104.0;
@@ -198,173 +137,224 @@ const fn row_width(items: &[f32]) -> f32 {
 }
 /// Extra bar height while a message is showing under the controls.
 const BAR_NOTE_H: f32 = 28.0;
-/// How long a message stays up once something is drawing it.
-const NOTE_SECS: f64 = 4.0;
 const FRAME_TITLE: &str = "Snipscreen recording area";
 
-/// A message for the user. Its clock starts the first time a view draws it, so
-/// one raised while the picker or the recording bar owns the window (nothing
-/// draws it there) is still on screen when the normal window comes back.
-struct Note {
-    msg: String,
-    until: Option<f64>,
-}
-
-impl Note {
-    fn new(msg: String) -> Self {
-        Self { msg, until: None }
-    }
-
-    /// Starts the clock on the first call; false once it has run out.
-    fn visible(&mut self, now: f64) -> bool {
-        now <= *self.until.get_or_insert(now + NOTE_SECS)
-    }
-}
-
+/// A `--screenshot` run: render this window for a while, write it to `path`, exit.
 struct ScreenshotJob {
     path: PathBuf,
+    /// The home window, or the editor opened on the sample snip.
+    target: ViewportId,
     frames: u32,
     rx: Option<Receiver<Arc<ColorImage>>>,
 }
 
+/// What to render headlessly instead of running normally.
+enum Shot {
+    Home(PathBuf),
+    Editor(PathBuf),
+    Settings(PathBuf),
+}
+
+/// The shell: the home window (which the picker and the recording bar take over while a capture
+/// runs), the capture settings, the global hotkeys, and the open editor windows.
 struct App {
     hwnd: isize,
-    mode: Mode,
-    shape: Shape_,
-    delay: u64,
+    /// The home window's toolbar doubles as its title bar.
+    bar: win::TitleBar,
+    /// Everything the person chose, including the capture mode, shape, delay and sound choices.
+    settings: Settings,
+    /// `settings` as last handed to `saver`; any difference is saved at the end of the pass.
+    saved: Settings,
+    saver: settings::Saver,
+    /// Keeps the sign-in entry in step with `settings.start_with_windows`. `None` in a screenshot run.
+    startup: Option<StartupEntry>,
+    /// Messages from background work that has no window of its own (settings saver, startup entry).
+    bg: Notifier,
+    bg_rx: Receiver<String>,
     stage: Stage,
     grab_tx: Sender<Result<win::Grab, String>>,
     grab_rx: Receiver<Result<win::Grab, String>>,
-    hotkey_rx: Option<Receiver<()>>,
+    /// The resident thread: global shortcuts and later launches. `None` in a screenshot run.
+    agent: Option<tray::Agent>,
+    agent_rx: Option<Receiver<tray::Event>>,
+    /// The snip shortcut in force; `None` when it isn't registered (`hotkey_note` says why).
+    hotkey: Option<Hotkey>,
     hotkey_note: Option<String>,
     /// Presses of the global Esc hotkey, which is registered only during a countdown.
-    esc_rx: Option<Receiver<()>>,
-    esc_hotkey: Option<win::EscapeHotkey>,
+    /// The global Esc fired since the countdown last looked.
+    global_esc: bool,
     esc_armed: bool,
-    note_tx: Sender<String>,
-    note_rx: Receiver<String>,
+    /// Quit was asked for; the app closes once a running recording is saved.
+    quitting: bool,
+    /// The agent is running, so the app lives in the tray: closing the home window only hides it.
+    resident: bool,
+    /// Started out of sight (`--tray`): eframe shows the root window once its first frame is painted,
+    /// which puts its taskbar button back; see `HiddenStart`.
+    hidden_start: HiddenStart,
+    /// The root window is out of sight: cloaked and off the taskbar, but still shown as far as
+    /// eframe knows, so events reach `logic` at once (eframe holds back a hidden window's repaints
+    /// by 100 ms or more, and its timers with them). See `conceal`.
+    concealed: bool,
+    /// Passes left before an uncloak that waits for the window's new shape to be painted.
+    reveal_in: u8,
+    /// When to take the taskbar button off again after Explorer restarted (it re-adds buttons).
+    retab_at: Option<Instant>,
     note: Option<Note>,
     /// Window corner before the picker took over the screen, in pixels.
     restore_corner: Option<[i32; 2]>,
     /// Frames left in which to put the returning window back on screen.
     settle: u8,
-
-    doc: Option<Doc>,
-    texture: Option<CanvasTex>,
-    tool: Tool,
-    pen: (Color32, f32),
-    highlighter: (Color32, f32),
-    drawing: Option<Stroke>,
-    erase_marked: bool,
-    crop: Option<(Pos2, Pos2)>,
-    /// `None` fits the snip to the window; otherwise 1.0 is one screen pixel per pixel.
-    zoom: Option<f32>,
-    /// Minimum window width last sent to the OS, so the command goes out only on change.
-    min_width: f32,
+    /// Whether the home window belongs on screen when no capture is using it. Closing it while
+    /// editors are open only hides it.
+    home_visible: bool,
     popup_guard: PopupClickGuard,
-    /// Zoom factor requested from the keyboard this frame; `canvas` applies it.
-    key_zoom: f32,
 
-    auto_copy: bool,
-    auto_save: bool,
     screenshot: Option<ScreenshotJob>,
-    /// Open straight into picking, like the original does.
-    pick_on_launch: bool,
 
-    record_system: bool,
-    record_mic: bool,
-    /// `None` is the Windows default microphone.
-    mic_choice: Option<String>,
     mics: Vec<audio::Mic>,
     rec_tx: Sender<recorder::Event>,
     rec_rx: Receiver<recorder::Event>,
-    video: Option<VideoResult>,
+    /// Snips announced by a notification, kept for an instant open when it is clicked.
+    recent: notify::Recent,
+    /// Their notifications while still up, so Windows can say when one leaves the screen.
+    toasts: Vec<(u64, notify::Shown)>,
+    last_snip_id: u64,
+    snip_tx: Sender<SnipEvent>,
+    snip_rx: Receiver<SnipEvent>,
+    /// Copy/save/notify workers still running; joined on exit so a snip is never half-written.
+    workers: Vec<std::thread::JoinHandle<()>>,
+    editors: Editors,
+    settings_window: Option<settings_window::SettingsWindow>,
+    icon: Option<Arc<egui::IconData>>,
 }
 
 impl App {
-    fn new(cc: &eframe::CreationContext<'_>, screenshot: Option<PathBuf>) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>, shot: Option<Shot>, icon: Option<Arc<egui::IconData>>, loaded: settings::Loaded, boot: Option<Boot>) -> Self {
         style(&cc.egui_ctx);
         let hwnd = window_hwnd(cc);
         let (grab_tx, grab_rx) = channel();
-        let (note_tx, note_rx) = channel();
-        let (rec_tx, rec_rx) = channel();
-        let (mut hotkey_rx, mut hotkey_note, mut esc_rx, mut esc_hotkey) = (None, None, None, None);
-        // A screenshot run must not steal the shortcut from a running copy.
-        if screenshot.is_none() {
-            let (tx, rx) = channel();
-            let (esc_tx, erx) = channel();
-            let (ctx, esc_ctx) = (cc.egui_ctx.clone(), cc.egui_ctx.clone());
-            match win::listen_hotkey(
-                move || {
-                    let _ = tx.send(());
-                    ctx.request_repaint();
-                },
-                move || {
-                    let _ = esc_tx.send(());
-                    esc_ctx.request_repaint();
-                },
-            ) {
-                Ok(esc) => (hotkey_rx, esc_rx, esc_hotkey) = (Some(rx), Some(erx), Some(esc)),
-                Err(e) => hotkey_note = Some(e),
-            }
+        let (bg_tx, bg_rx) = channel();
+        let shot_run = shot.is_some();
+        // A screenshot run renders the defaults and never writes the person's file.
+        let save_to = if shot_run { None } else { loaded.path.clone() };
+        let bg = Notifier::new(bg_tx, cc.egui_ctx.clone(), ViewportId::ROOT);
+        let report = bg.clone();
+        let saver = settings::Saver::new(save_to, move |e| report.send(e));
+        let settings = if shot_run { Settings::default() } else { loaded.settings };
+        if !loaded.existed {
+            saver.save(&settings);
         }
-        Self {
+        let saved = settings.clone();
+        let (rec_tx, rec_rx) = channel();
+        let (snip_tx, snip_rx) = channel();
+        let hidden = boot.as_ref().is_some_and(|b| b.starts_hidden());
+        if hidden {
+            // Before eframe's show after the first frame; `HiddenStart` takes the taskbar button off.
+            win::cloak(hwnd as HWND, true);
+        }
+        let (agent, agent_rx, hotkey, hotkey_note, intent) = match boot {
+            Some(b) => {
+                // Events sent before this point are waiting in the channel and handled on the first pass.
+                let _ = b.waker.set(cc.egui_ctx.clone());
+                let (hotkey, note) = match b.hotkey {
+                    Ok(h) => (Some(h), None),
+                    Err(e) => (None, Some(e)),
+                };
+                (b.agent, Some(b.events), hotkey, note, Some(b.intent))
+            }
+            None => (None, None, None, None, None),
+        };
+        let bar = win::TitleBar::default();
+        let wake = cc.egui_ctx.clone();
+        let bar_failed = bar.attach(hwnd as HWND, move || wake.request_repaint_of(ViewportId::ROOT)).err();
+        let mut app = Self {
             hwnd,
-            mode: Mode::Photo,
-            shape: Shape_::Rectangle,
-            delay: 0,
+            bar,
+            settings,
+            saved,
+            saver,
+            startup: None,
+            bg,
+            bg_rx,
             stage: Stage::Idle,
             grab_tx,
             grab_rx,
-            hotkey_rx,
+            agent,
+            agent_rx,
+            hotkey,
             hotkey_note,
-            esc_rx,
-            esc_hotkey,
+            global_esc: false,
             esc_armed: false,
-            note_tx,
-            note_rx,
+            quitting: false,
+            resident: false,
+            hidden_start: if hidden { HiddenStart::FirstFrame } else { HiddenStart::Done },
+            concealed: hidden,
+            reveal_in: 0,
+            retab_at: None,
             note: None,
             restore_corner: None,
             settle: 0,
-            doc: None,
-            texture: None,
-            tool: Tool::Pen,
-            pen: (PEN_COLORS[2], 4.0),
-            highlighter: (HIGHLIGHT_COLORS[0], 18.0),
-            drawing: None,
-            erase_marked: false,
-            crop: None,
-            zoom: None,
-            min_width: MIN_WINDOW_W,
+            home_visible: !hidden,
             popup_guard: PopupClickGuard::default(),
-            key_zoom: 1.0,
-            auto_copy: true,
-            auto_save: true,
-            pick_on_launch: screenshot.is_none(),
-            screenshot: screenshot.map(|path| ScreenshotJob { path, frames: 0, rx: None }),
-            record_system: true,
-            record_mic: false,
-            mic_choice: None,
+            screenshot: None,
             mics: Vec::new(),
             rec_tx,
             rec_rx,
-            video: None,
+            recent: notify::Recent::new(RECENT_SNIPS, RECENT_BYTES, RECENT_AGE),
+            toasts: Vec::new(),
+            last_snip_id: if shot_run { 0 } else { notify::recent_dir().map_or(0, |d| notify::newest_id(&d)) },
+            snip_tx,
+            snip_rx,
+            workers: Vec::new(),
+            editors: Editors::new(icon.clone()),
+            settings_window: None,
+            icon,
+        };
+        if let Some(e) = bar_failed {
+            app.say(&cc.egui_ctx, e);
         }
+        if !loaded.problems.is_empty() && !shot_run {
+            app.say(&cc.egui_ctx, format!("Some settings couldn't be read and were reset: {}", loaded.problems.join(", ")));
+        }
+        app.resident = app.agent.is_some();
+        if !shot_run {
+            // Every start: the exe may have moved since the entry was written.
+            let startup = StartupEntry::new(app.bg.clone(), tray::sync_run_at_startup);
+            startup.set(app.settings.start_with_windows);
+            app.startup = Some(startup);
+            app.register_notifications();
+        }
+        if let Some(intent) = intent {
+            app.on_intent(&cc.egui_ctx, intent);
+        }
+        app.screenshot = shot.map(|shot| match shot {
+            Shot::Home(path) => ScreenshotJob { path, target: ViewportId::ROOT, frames: 0, rx: None },
+            Shot::Settings(path) => {
+                app.open_settings(&cc.egui_ctx);
+                let target = app.settings_window.as_ref().map_or(ViewportId::ROOT, |w| w.id());
+                ScreenshotJob { path, target, frames: 0, rx: None }
+            }
+            Shot::Editor(path) => {
+                let target = app.open_sample_editor(&cc.egui_ctx);
+                ScreenshotJob { path, target, frames: 0, rx: None }
+            }
+        });
+        app
     }
 
     fn start_snip(&mut self, ctx: &egui::Context) {
         if !matches!(self.stage, Stage::Idle | Stage::Counting { .. }) {
             return;
         }
-        // A half-drawn stroke belongs to the snip being replaced.
-        self.drawing = None;
-        let delay = if self.mode == Mode::Photo { self.delay } else { 0 };
+        let delay = if self.settings.mode == Mode::Photo { self.settings.delay } else { 0 };
         if delay == 0 {
             self.hide_and_grab(ctx);
             return;
         }
         // Pressing New / Ctrl+N / the hotkey during the countdown starts it over.
         self.stage = Stage::Counting { end: Instant::now() + Duration::from_secs(delay) };
+        // The countdown shows in the home window, even when it had been closed.
+        self.reveal();
         // On top and un-minimized without taking focus, so a hotkey snip from
         // another app still shows the countdown without disturbing what is on screen.
         win::restore_inactive(self.hwnd as HWND);
@@ -379,30 +369,39 @@ impl App {
         let want = wants_escape_hotkey(&self.stage);
         if want != self.esc_armed {
             self.esc_armed = want;
-            if let Some(esc) = &self.esc_hotkey {
-                esc.set(want);
+            if let Some(agent) = &self.agent {
+                agent.set_escape(want);
             }
         }
     }
 
-    /// Hides the window, waits for its hide animation, then copies the screen.
+    /// Conceals the window, then copies the screen.
     fn hide_and_grab(&mut self, ctx: &egui::Context) {
         self.restore_corner = win::window_corner(self.hwnd as HWND);
-        ctx.send_viewport_cmd(ViewportCommand::Visible(false));
+        // Cloaking has no animation: once DWM has composed the screen without the window, it is out
+        // of the copy. A snip from the tray has no window to wait for.
+        let on_screen = !self.concealed;
+        self.conceal();
         self.stage = Stage::Waiting;
         self.sync_escape_hotkey();
         let (tx, ctx) = (self.grab_tx.clone(), ctx.clone());
         std::thread::spawn(move || {
-            std::thread::sleep(HIDE_SETTLE);
+            if on_screen {
+                win::wait_for_composition();
+            }
+            // ceiling: one GDI copy of the whole virtual screen, most of a shortcut snip's wait:
+            // ~80-110 ms at 6400x1447, and on a hybrid-GPU laptop DWM then holds our next frame
+            // ~100 ms more. A per-monitor Windows.Graphics.Capture copy (DXGI duplication hands
+            // over nothing on a still screen) if shortcut-to-picker has to get under 100 ms.
             let _ = tx.send(win::grab_screen());
-            ctx.request_repaint();
+            wake_root(&ctx);
         });
     }
 
     /// Advances the delay countdown: Esc cancels, the last second hides the window.
     fn tick_countdown(&mut self, ctx: &egui::Context) {
-        // Always drained, so a press that arrives just as the countdown ends is not kept for the next one.
-        let global_esc = self.esc_rx.as_ref().is_some_and(drain);
+        // Always taken, so a press that arrives just as the countdown ends is not kept for the next one.
+        let global_esc = std::mem::take(&mut self.global_esc);
         let Stage::Counting { end } = self.stage else { return };
         if take_escape(ctx) || global_esc {
             self.cancel_countdown(ctx);
@@ -419,7 +418,7 @@ impl App {
     fn cancel_countdown(&mut self, ctx: &egui::Context) {
         self.stage = Stage::Idle;
         self.sync_escape_hotkey();
-        self.show_window(ctx);
+        self.return_home(ctx);
     }
 
     fn on_grab(&mut self, ctx: &egui::Context, grab: Result<win::Grab, String>) {
@@ -427,18 +426,14 @@ impl App {
             Ok(g) => g,
             Err(e) => {
                 self.stage = Stage::Idle;
-                self.show_window(ctx);
+                self.return_home(ctx);
                 self.say(ctx, format!("Couldn't take the snip: {e}"));
                 return;
             }
         };
-        if self.shape == Shape_::FullScreen {
-            match self.mode {
-                Mode::Photo => {
-                    self.stage = Stage::Idle;
-                    self.show_window(ctx);
-                    self.finish(ctx, grab.image);
-                }
+        if self.settings.shape == Shape_::FullScreen {
+            match self.settings.mode {
+                Mode::Photo => self.finish(ctx, grab.image),
                 Mode::Video => self.open_rec_bar(ctx, win::monitor_at_cursor()),
             }
             return;
@@ -457,16 +452,7 @@ impl App {
         let target = [grab.origin[0], grab.origin[1], grab.image.size[0] as i32, grab.image.size[1] as i32];
         let [mx, my, mw, mh] = win::monitor_at_cursor();
         let home = [mx - grab.origin[0], my - grab.origin[1], mw, mh];
-        self.stage = Stage::Picking(Box::new(Picker {
-            home,
-            grab,
-            texture,
-            start: None,
-            outline: Vec::new(),
-            target,
-            shown: false,
-            tries: 0,
-        }));
+        self.stage = Stage::Picking(Box::new(Picker { home, grab, texture, start: None, outline: Vec::new(), target, fitted: false, shown: false, tries: 0 }));
         ctx.request_repaint();
     }
 
@@ -478,8 +464,16 @@ impl App {
         }
         let [x, y, w, h] = pk.target;
         if win::fit_client(self.hwnd as HWND, x, y, w, h) || pk.tries > 30 {
+            // Uncloaked one pass later: the pass that starts fitted paints the frozen screen at its
+            // real size, so the uncloak never shows the home window stretched over the screen.
+            if !pk.fitted {
+                pk.fitted = true;
+                ctx.request_repaint();
+                return;
+            }
             pk.shown = true;
-            for cmd in [ViewportCommand::Minimized(false), ViewportCommand::Visible(true), ViewportCommand::Focus] {
+            self.reveal();
+            for cmd in [ViewportCommand::Minimized(false), ViewportCommand::Focus] {
                 ctx.send_viewport_cmd(cmd);
             }
         } else {
@@ -488,22 +482,121 @@ impl App {
         }
     }
 
-    /// Back from the picker (or from hiding) to a normal window.
-    fn show_window(&mut self, ctx: &egui::Context) {
-        for cmd in [
-            ViewportCommand::WindowLevel(WindowLevel::Normal),
-            ViewportCommand::Decorations(true),
-            ViewportCommand::Resizable(true),
-            ViewportCommand::Minimized(false),
-            ViewportCommand::Visible(true),
-            ViewportCommand::Focus,
-        ] {
-            ctx.send_viewport_cmd(cmd);
+    /// Takes the root window out of sight without hiding it: cloaked (DWM draws none of it and
+    /// clicks go through), off the taskbar, and, from the next pass, without the foreground.
+    fn conceal(&mut self) {
+        if !self.concealed {
+            self.concealed = true;
+            self.reveal_in = 0;
+            win::cloak(self.hwnd as HWND, true);
+            win::set_taskbar_button(self.hwnd as HWND, false);
         }
     }
 
-    fn place_window(&mut self, ctx: &egui::Context, size: Vec2) {
-        ctx.send_viewport_cmd(ViewportCommand::InnerSize(size));
+    /// Puts a concealed root window back on screen and on the taskbar, as it was last painted.
+    fn reveal(&mut self) {
+        if self.concealed {
+            self.concealed = false;
+            self.reveal_in = 0;
+            win::set_taskbar_button(self.hwnd as HWND, true);
+            win::cloak(self.hwnd as HWND, false);
+        }
+    }
+
+    /// Once per pass: what a concealed window needs that `conceal` alone can't give it.
+    fn keep_concealed(&mut self, ctx: &egui::Context) {
+        let hwnd = self.hwnd as HWND;
+        if self.hidden_start == HiddenStart::Painted {
+            self.hidden_start = HiddenStart::Done;
+            if self.concealed {
+                win::set_taskbar_button(hwnd, false);
+            }
+        }
+        if self.reveal_in > 0 {
+            self.reveal_in -= 1;
+            if self.reveal_in == 0 {
+                self.reveal();
+            } else {
+                ctx.request_repaint();
+            }
+        }
+        if let Some(at) = self.retab_at {
+            let now = Instant::now();
+            if now >= at {
+                self.retab_at = None;
+                if self.concealed {
+                    win::set_taskbar_button(hwnd, false);
+                }
+            } else {
+                ctx.request_repaint_after(at - now);
+            }
+        }
+        // A hidden window would have handed the foreground on; a cloaked one keeps it (after the
+        // picker, the close button, or Windows activating it when another window closes), and the
+        // person's keys would go to a window they can't see. Checked after eframe has applied this
+        // window's commands, some of which re-show (and can re-activate) it. While a capture is
+        // under way the window is about to come back, and takes focus itself when it does.
+        if self.concealed && matches!(self.stage, Stage::Idle) && win::is_foreground(hwnd) {
+            win::activate_next(hwnd);
+        }
+    }
+
+    /// Explorer restarted: it, and winit, put a taskbar button back on every window. Taken off now,
+    /// and again a moment later in case winit's own re-add lands after this.
+    fn on_taskbar_created(&mut self, ctx: &egui::Context) {
+        if self.concealed {
+            win::set_taskbar_button(self.hwnd as HWND, false);
+            self.retab_at = Some(Instant::now() + Duration::from_secs(2));
+            ctx.request_repaint_after(Duration::from_secs(2));
+        }
+    }
+
+    /// Back from the countdown, the picker or the recording bar to the home window, or out of
+    /// sight again if the person had closed it.
+    fn return_home(&mut self, ctx: &egui::Context) {
+        for cmd in [ViewportCommand::WindowLevel(WindowLevel::Normal), ViewportCommand::Decorations(true), ViewportCommand::Resizable(true)] {
+            ctx.send_viewport_cmd(cmd);
+        }
+        if self.home_visible {
+            self.reveal();
+            for cmd in [ViewportCommand::Minimized(false), ViewportCommand::Focus] {
+                ctx.send_viewport_cmd(cmd);
+            }
+        } else {
+            self.conceal();
+        }
+    }
+
+    /// The home window's close button. In the tray, or with editors open, it only hides the home
+    /// window; otherwise the app ends when the last window is gone (see `close_when_no_window_is_left`).
+    fn on_home_close(&mut self, ctx: &egui::Context) {
+        if !ctx.input(|i| i.viewport().close_requested()) || self.quitting || self.screenshot.is_some() || (!self.resident && self.editors.is_empty()) {
+            return;
+        }
+        ctx.send_viewport_cmd(ViewportCommand::CancelClose);
+        match self.stage {
+            Stage::Idle => {
+                self.home_visible = false;
+                self.conceal();
+            }
+            Stage::Counting { .. } => {
+                self.home_visible = false;
+                self.cancel_countdown(ctx);
+            }
+            // The picker and the recording bar have no close button; they end on their own first.
+            Stage::Waiting | Stage::Picking(_) | Stage::Recording(_) => {}
+        }
+    }
+
+    fn close_when_no_window_is_left(&self, ctx: &egui::Context) {
+        if no_window_left(self.resident, self.home_visible, self.editors.is_empty(), matches!(self.stage, Stage::Idle)) {
+            ctx.send_viewport_cmd(ViewportCommand::Close);
+        }
+    }
+
+    /// Puts the home window back to its size; `settle_window` then returns it to its old corner.
+    fn place_window(&mut self, ctx: &egui::Context) {
+        ctx.send_viewport_cmd(ViewportCommand::InnerSize(self.bar.inner_size_for(HOME_SIZE, ctx.pixels_per_point())));
         self.settle = 8;
     }
 
@@ -514,137 +607,359 @@ impl App {
             return;
         }
         self.settle -= 1;
+        // Normally a no-op: corrects the size if Windows rescaled the window on its way back.
+        let px = HOME_SIZE * ctx.pixels_per_point();
+        win::size_client(self.hwnd as HWND, px.x.round() as i32, px.y.round() as i32);
         win::place_on_screen(self.hwnd as HWND, self.restore_corner.take());
         ctx.request_repaint();
     }
 
     fn cancel_pick(&mut self, ctx: &egui::Context) {
         self.stage = Stage::Idle;
-        self.show_window(ctx);
-        self.place_window(ctx, self.window_size_for(ctx));
-    }
-
-    fn window_size_for(&self, ctx: &egui::Context) -> Vec2 {
-        let size = match (&self.doc, &self.video) {
-            (Some(doc), _) => [doc.size()[0] as f32, doc.size()[1] as f32],
-            (None, Some(v)) => [v.size[0] as f32, v.size[1] as f32 + 90.0],
-            (None, None) => return vec2(620.0, 330.0),
-        };
-        let ppp = ctx.pixels_per_point();
-        let monitor = ctx.input(|i| i.viewport().monitor_size).unwrap_or(vec2(1920.0, 1080.0));
-        let snip = vec2(size[0], size[1]) / ppp;
-        edit_window_size(snip, monitor)
+        self.return_home(ctx);
+        self.place_window(ctx);
     }
 
     fn finish(&mut self, ctx: &egui::Context, image: ColorImage) {
         self.stage = Stage::Idle;
-        self.show_window(ctx);
-        self.video = None;
-        self.doc = Some(Doc::new(image));
-        self.texture = None;
-        self.crop = None;
-        self.drawing = None;
-        self.zoom = None;
-        self.key_zoom = 1.0;
-        self.place_window(ctx, self.window_size_for(ctx));
-        let Some(doc) = &self.doc else { return };
-        let image = doc.image.clone();
-        if !self.auto_copy && !self.auto_save {
-            return;
+        self.return_home(ctx);
+        self.place_window(ctx);
+        self.on_captured(ctx, image);
+    }
+
+    /// Every new snip arrives here: it is copied and saved as the settings ask, then announced by a
+    /// notification or opened in an editor.
+    fn on_captured(&mut self, ctx: &egui::Context, image: ColorImage) {
+        match self.settings.after_capture {
+            AfterCapture::Notify => self.notify_snip(ctx, image),
+            AfterCapture::Editor => {
+                let (_, report, image) = self.open_editor(ctx, image);
+                self.auto_copy_save(image, report);
+            }
         }
-        // One worker does both jobs so the toast can report what each really did.
-        let save_path = self.auto_save.then(|| {
+    }
+
+    /// Runs `job` on a thread that `on_exit` waits for.
+    fn spawn_worker(&mut self, job: impl FnOnce() + Send + 'static) {
+        self.workers.retain(|w| !w.is_finished());
+        self.workers.push(std::thread::spawn(job));
+    }
+
+    /// Where an auto-saved snip goes, when auto-save is on.
+    fn save_path(&self) -> Option<Result<PathBuf, String>> {
+        self.settings.auto_save.then(|| {
             win::pictures_dir()
                 .map(|dir| dir.join("Screenshots").join(format!("Snip {}.png", win::timestamp())))
                 .ok_or_else(|| "couldn't find your Pictures folder".to_string())
-        });
-        let (copy, tx, ctx, hwnd) = (self.auto_copy, self.note_tx.clone(), ctx.clone(), self.hwnd);
-        std::thread::spawn(move || {
-            let copied = copy.then(|| win::copy_image(hwnd as HWND, &image));
-            let saved = save_path.map(|path| path.and_then(|p| win::save_png_new(&p, &image).map(|_| ())));
-            if let Some(msg) = auto_note(copied, saved) {
-                let _ = tx.send(msg);
-                ctx.request_repaint();
-            }
+        })
+    }
+
+    /// Shows a Windows notification with the snip's preview as soon as the preview is made, while
+    /// the snip is copied and saved as asked; a click on it opens the snip (`open_link`). All on a
+    /// worker. If the notification can't be shown the snip opens in an editor instead, saying why.
+    fn notify_snip(&mut self, ctx: &egui::Context, image: ColorImage) {
+        let id = next_snip_id(self.last_snip_id, std::time::SystemTime::now());
+        self.last_snip_id = id;
+        let image = Arc::new(image);
+        self.recent.insert(id, image.clone(), Instant::now());
+        ctx.request_repaint_after(RECENT_AGE);
+        let (save_to, copy, hwnd) = (self.save_path(), self.settings.auto_copy, self.hwnd);
+        let (tx, ctx) = (self.snip_tx.clone(), ctx.clone());
+        self.spawn_worker(move || {
+            deliver_by_notification(id, &image, hwnd, copy, save_to, move |event| {
+                let _ = tx.send(event);
+                wake_root(&ctx);
+            });
         });
     }
 
-    fn copy_in_background(&self, ctx: &egui::Context, image: Arc<ColorImage>, announce: bool) {
-        let (tx, ctx, hwnd) = (self.note_tx.clone(), ctx.clone(), self.hwnd);
+    /// A click on a snip's notification: the snip opens in a new editor, from memory or its file.
+    fn open_link(&mut self, ctx: &egui::Context, link: &str) {
+        let Some((id, path)) = notify::parse_open_link(link) else {
+            self.show_home(ctx);
+            self.say(ctx, "That link doesn't name a snip".into());
+            return;
+        };
+        if let Some(image) = self.recent.take(id) {
+            self.open_editor(ctx, Arc::unwrap_or_clone(image));
+            return;
+        }
+        let folders: Vec<PathBuf> = [win::pictures_dir().map(|d| d.join("Screenshots")), notify::recent_dir()].into_iter().flatten().collect();
+        if !notify::may_open(&path, &folders) {
+            self.show_home(ctx);
+            self.say(ctx, format!("SnipScreen only opens its own snips, not {}", path.display()));
+            return;
+        }
+        let (tx, ctx) = (self.snip_tx.clone(), ctx.clone());
         std::thread::spawn(move || {
-            let msg = match win::copy_image(hwnd as HWND, &image) {
-                Ok(()) if announce => Some("Copied to clipboard".to_string()),
-                Ok(()) => None,
-                Err(e) => Some(format!("Couldn't copy: {e}")),
-            };
-            if let Some(m) = msg {
-                let _ = tx.send(m);
-                ctx.request_repaint();
-            }
+            let _ = tx.send(SnipEvent::Loaded(notify::load_png(&path)));
+            wake_root(&ctx);
         });
     }
 
-    fn copy(&self, ctx: &egui::Context) {
-        if let Some(doc) = &self.doc {
-            self.copy_in_background(ctx, Arc::new(doc.flatten()), true);
+    fn on_snip_event(&mut self, ctx: &egui::Context, event: SnipEvent) {
+        match event {
+            SnipEvent::Loaded(Ok(image)) => {
+                self.open_editor(ctx, image);
+            }
+            SnipEvent::Loaded(Err(e)) => {
+                self.show_home(ctx);
+                self.say(ctx, format!("Couldn't open the snip: {e}"));
+            }
+            SnipEvent::Shown { id, toast } => {
+                // A replacement (copy or save went wrong after all) takes the place of the first.
+                self.toasts.retain(|(i, _)| *i != id);
+                self.toasts.push((id, toast));
+            }
+            SnipEvent::Gone(id) => {
+                self.toasts.retain(|(i, _)| *i != id);
+                drop(self.recent.take(id));
+            }
+            SnipEvent::NotShown { id, msg } => match self.recent.take(id) {
+                Some(image) => {
+                    let (_, report, _) = self.open_editor(ctx, Arc::unwrap_or_clone(image));
+                    report.send(msg);
+                }
+                None => self.say(ctx, msg),
+            },
         }
     }
 
-    fn save_as(&mut self, ctx: &egui::Context) {
-        let Some(doc) = &self.doc else { return };
-        let start = win::pictures_dir().map(|d| d.join("Screenshots"));
-        let Some(path) = win::ask_save_path(self.hwnd as HWND, start.as_deref(), &format!("Snip {}", win::timestamp()), ("PNG image", "png"))
-        else {
+    /// Lets go of snips, and their notifications, older than `RECENT_AGE`.
+    fn expire_recent(&mut self, ctx: &egui::Context) {
+        let now = Instant::now();
+        let next = self.recent.expire(now);
+        if self.toasts.is_empty() {
             return;
-        };
-        let msg = match win::save_png(&path, &doc.flatten()) {
-            Ok(()) => format!("Saved {}", path.file_name().map_or_else(String::new, |n| n.to_string_lossy().into())),
-            Err(e) => format!("Couldn't save: {e}"),
-        };
-        self.say(ctx, msg);
+        }
+        // Every notification has its snip in `recent` until one of them goes, so the same age applies.
+        let live: Vec<u64> = self.toasts.iter().map(|(id, _)| *id).filter(|&id| self.recent.contains(id)).collect();
+        self.toasts.retain(|(id, _)| live.contains(id));
+        if let Some(at) = next {
+            ctx.request_repaint_after(at.saturating_duration_since(now));
+        }
     }
 
+    /// Opens `image` in a new editor window near where the home window sits. Returns the window,
+    /// its toast, and the picture as the editor holds it.
+    fn open_editor(&mut self, ctx: &egui::Context, image: ColorImage) -> (ViewportId, Notifier, Arc<ColorImage>) {
+        self.editors.open_snip(ctx, image, self.hwnd, self.restore_corner)
+    }
+
+    /// Copies and/or saves a new snip on a worker, reporting through `report` what each job really did.
+    fn auto_copy_save(&mut self, image: Arc<ColorImage>, report: Notifier) {
+        if !self.settings.auto_copy && !self.settings.auto_save {
+            return;
+        }
+        let (save_to, copy, hwnd) = (self.save_path(), self.settings.auto_copy, self.hwnd);
+        self.spawn_worker(move || {
+            let Delivered { copied, saved } = copy_and_save(hwnd, &image, copy, save_to);
+            if let Some(msg) = auto_note(copied, saved.map(|r| r.map(|_| ()))) {
+                report.send(msg);
+            }
+        });
+    }
+
+    /// The New buttons' tooltip, naming the shortcut only while it is registered.
+    fn new_tip(&self) -> String {
+        new_tooltip(self.settings.mode, self.hotkey.map(Hotkey::label).as_deref(), self.hotkey_note.as_deref())
+    }
+
+    /// A launch of the program: this one, or a later one forwarded by `tray::forward`.
+    fn on_intent(&mut self, ctx: &egui::Context, intent: tray::Intent) {
+        match intent {
+            tray::Intent::Show => self.show_home(ctx),
+            tray::Intent::Open(link) => self.open_link(ctx, &link),
+            tray::Intent::Tray => {}
+            tray::Intent::Quit => self.quit(ctx),
+        }
+    }
+
+    /// Brings the home window up, or, mid-capture, has it come back when the capture ends.
+    fn show_home(&mut self, ctx: &egui::Context) {
+        self.home_visible = true;
+        if matches!(self.stage, Stage::Idle | Stage::Counting { .. }) {
+            self.return_home(ctx);
+        }
+    }
+
+    /// Ends the app. A recording in progress is stopped and saved first; editors close with it,
+    /// their snips already copied and saved as the settings asked.
+    fn quit(&mut self, ctx: &egui::Context) {
+        self.quitting = true;
+        if let Some(agent) = &self.agent {
+            agent.closing();
+        }
+        if let Stage::Recording(bar) = &mut self.stage {
+            if let Some(rec) = &mut bar.rec {
+                rec.stop();
+                bar.saving = true;
+                return;
+            }
+        }
+        ctx.send_viewport_cmd(ViewportCommand::Close);
+    }
+
+    /// Opens the Settings window, or brings it forward if it is open.
+    fn open_settings(&mut self, ctx: &egui::Context) {
+        match &self.settings_window {
+            Some(w) => w.focus(ctx),
+            None => self.settings_window = Some(settings_window::SettingsWindow::new(ctx, &self.settings, self.hotkey, self.hotkey_note.as_deref(), self.icon.clone())),
+        }
+    }
+
+    /// Takes what the Settings window changed: the after-snip and startup choices apply at once, the
+    /// recorder is started or stopped on the agent.
+    fn poll_settings_window(&mut self, ctx: &egui::Context) {
+        let Some(w) = &self.settings_window else { return };
+        let req = w.poll();
+        if let Some(s) = req.settings {
+            (self.settings.after_capture, self.settings.auto_copy, self.settings.auto_save) = (s.after_capture, s.auto_copy, s.auto_save);
+            self.settings.start_with_windows = s.start_with_windows;
+        }
+        match (req.record, &self.agent) {
+            (Some(on), Some(agent)) => agent.record(on),
+            (Some(true), None) => w.recorded(ctx, Some(Err("Global shortcuts are off, so there is nothing to change".into()))),
+            _ => {}
+        }
+        if req.closed {
+            self.settings_window = None;
+        }
+    }
+
+    /// The recorder caught a combination: a usable one goes to the agent to register.
+    fn on_recorded(&mut self, ctx: &egui::Context, caught: Option<Hotkey>) {
+        let verdict = caught.map(Hotkey::check);
+        if let (Some(Ok(h)), Some(agent)) = (&verdict, &self.agent) {
+            agent.set_hotkey(*h);
+        }
+        if let Some(w) = &self.settings_window {
+            w.recorded(ctx, verdict);
+        }
+    }
+
+    /// The agent registered a new shortcut, or refused it and kept the old one.
+    fn on_hotkey_set(&mut self, ctx: &egui::Context, result: Result<Hotkey, String>) {
+        if let Ok(h) = result {
+            (self.hotkey, self.hotkey_note, self.settings.shortcut) = (Some(h), None, h);
+        }
+        if let Some(w) = &self.settings_window {
+            w.hotkey_result(ctx, &result, self.hotkey);
+        }
+    }
+
+    /// The agent couldn't take the shortcut back after recording: none is in force now.
+    fn on_hotkey_lost(&mut self, ctx: &egui::Context, why: String) {
+        (self.hotkey, self.hotkey_note) = (None, Some(why.clone()));
+        if let Some(w) = &self.settings_window {
+            w.hotkey_result(ctx, &Err(why), None);
+        }
+    }
+
+    /// Registers SnipScreen for notifications and its `snipscreen:` links, off the UI thread.
+    fn register_notifications(&self) {
+        let report = self.bg.clone();
+        std::thread::spawn(move || {
+            if let Err(e) = win::exe_path().and_then(|exe| notify::register(&exe)) {
+                report.send(format!("Notifications may not work: {e}"));
+            }
+        });
+    }
+
+    /// Hands changed settings to the saver; a few field compares per pass when nothing changed.
+    fn persist(&mut self) {
+        if self.settings != self.saved {
+            if let (true, Some(startup)) = (self.settings.start_with_windows != self.saved.start_with_windows, &self.startup) {
+                startup.set(self.settings.start_with_windows);
+            }
+            self.saved = self.settings.clone();
+            self.saver.save(&self.settings);
+        }
+    }
+
+    /// Shows `msg` in the home window (or the recording bar), or in the newest editor while the home window is closed.
     fn say(&mut self, ctx: &egui::Context, msg: String) {
+        if !note_goes_home(self.home_visible, matches!(self.stage, Stage::Recording(_))) {
+            if let Some(editor) = self.editors.newest_notifier(ctx) {
+                editor.send(msg);
+                return;
+            }
+        }
         self.note = Some(Note::new(msg));
         ctx.request_repaint();
     }
 
     /// The message to draw right now, if any; the first draw starts its clock.
     fn live_note(&mut self, ctx: &egui::Context) -> Option<String> {
-        let now = ctx.input(|i| i.time);
-        let note = self.note.as_mut()?;
-        let first_draw = note.until.is_none();
-        if !note.visible(now) {
-            self.note = None;
-            return None;
-        }
-        if first_draw {
-            ctx.request_repaint_after(Duration::from_secs_f64(NOTE_SECS + 0.1));
-        }
-        Some(note.msg.clone())
+        widgets::live_note(&mut self.note, ctx)
+    }
+
+    /// The sample snip behind `--screenshot-editor`, with a pen and a highlighter stroke on it.
+    fn open_sample_editor(&mut self, ctx: &egui::Context) -> ViewportId {
+        let (id, _, _) = self.open_editor(ctx, sample_image(960, 600));
+        self.editors.with(id, |e| {
+            if let editor::Content::Snip(snip) = &mut e.content {
+                for s in sample_strokes() {
+                    snip.doc.add_mark(s);
+                }
+            }
+        });
+        id
     }
 }
 
 impl eframe::App for App {
+    /// Lets go of the shortcuts and writes pending settings before the process ends.
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        if let Some(agent) = &self.agent {
+            agent.closing();
+        }
+        for w in self.workers.drain(..) {
+            let _ = w.join();
+        }
+        self.persist();
+        self.saver = settings::Saver::new(None, |_| {});
+        self.startup = None;
+        // Dropping the agent also tells a sign-out waiting in `WM_ENDSESSION` that all is written.
+        self.agent = None;
+    }
+
     /// Transparent so the recording-area outline window shows only its dashes.
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
         [0.0; 4]
     }
 
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if std::mem::take(&mut self.pick_on_launch) {
-            self.start_snip(ctx);
-        }
-        while let Ok(msg) = self.note_rx.try_recv() {
+        self.keep_concealed(ctx);
+        while let Ok(msg) = self.bg_rx.try_recv() {
             self.say(ctx, msg);
         }
         while let Ok(event) = self.rec_rx.try_recv() {
             self.on_record_event(ctx, event);
         }
-        if let Some(rx) = &self.hotkey_rx {
-            if rx.try_iter().count() > 0 {
-                self.start_snip(ctx);
+        let mut hotkey = false;
+        while let Some(event) = self.agent_rx.as_ref().and_then(|rx| rx.try_recv().ok()) {
+            match event {
+                tray::Event::Snip => hotkey = true,
+                tray::Event::Escape => self.global_esc = true,
+                tray::Event::Intent(intent) => self.on_intent(ctx, intent),
+                tray::Event::HotkeySet(result) => self.on_hotkey_set(ctx, result),
+                tray::Event::Recorded(caught) => self.on_recorded(ctx, caught),
+                tray::Event::Settings => self.open_settings(ctx),
+                tray::Event::TaskbarCreated => self.on_taskbar_created(ctx),
+                tray::Event::HotkeyLost(why) => self.on_hotkey_lost(ctx, why),
             }
+        }
+        // After the agent's events: `taskkill` closes the root window and the agent's at once, and a
+        // close cancelled in the same pass as the agent's Quit would cancel the Quit too.
+        self.on_home_close(ctx);
+        self.poll_settings_window(ctx);
+        while let Ok(event) = self.snip_rx.try_recv() {
+            self.on_snip_event(ctx, event);
+        }
+        self.expire_recent(ctx);
+        if self.editors.poll().new_snip || hotkey {
+            self.start_snip(ctx);
         }
         if let Ok(grab) = self.grab_rx.try_recv() {
             self.on_grab(ctx, grab);
@@ -653,180 +968,128 @@ impl eframe::App for App {
         self.reveal_picker(ctx);
         self.settle_window(ctx);
         self.sync_escape_hotkey();
+        self.editors.set_new_tip(self.new_tip());
+        self.close_when_no_window_is_left(ctx);
+        self.persist();
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        if self.hidden_start == HiddenStart::FirstFrame {
+            // eframe shows the window right after this pass; the cloak keeps it off the screen (and
+            // `with_active(false)` keeps it from taking focus).
+            self.hidden_start = HiddenStart::Painted;
+            ctx.request_repaint();
+        }
         if matches!(self.stage, Stage::Picking(_)) {
             self.picker_ui(ui);
         } else if matches!(self.stage, Stage::Recording(_)) {
             self.rec_bar_ui(ui);
         } else {
-            self.popup_guard.begin_frame(&ctx);
-            self.shortcuts(&ctx);
-            self.toolbar(ui);
-            let mut video_top = None;
-            egui::CentralPanel::default()
-                .frame(egui::Frame::new().fill(ui.style().visuals.extreme_bg_color))
-                .show(ui, |ui| {
-                    if let Stage::Counting { end } = self.stage {
-                        self.countdown_view(ui, end);
-                    } else if self.doc.is_some() {
-                        self.canvas(ui);
-                    } else if self.video.is_some() {
-                        video_top = Some(ui.max_rect().top());
-                        self.video_view(ui);
-                    } else {
-                        self.empty_state(ui);
-                    }
-                });
-            // The window is hidden while waiting; a message shown now would be gone before anyone saw it.
-            if !matches!(self.stage, Stage::Waiting) {
-                self.toast(&ctx, video_top);
-            }
+            self.home_ui(ui);
+        }
+        // Every pass, or egui closes the editor and settings windows.
+        self.editors.show(&ctx);
+        if let Some(w) = &self.settings_window {
+            w.show(&ctx);
         }
         self.drive_screenshot(&ctx);
+        self.persist();
+        // After this pass's stage changes, before eframe applies its window commands: the picker and
+        // the recording bar are frameless, and winit lays those out.
+        self.bar.set_active(!matches!(self.stage, Stage::Picking(_) | Stage::Recording(_)));
     }
 }
 
 impl App {
-    fn shortcuts(&mut self, ctx: &egui::Context) {
-        // Popups close themselves on Esc and a focused button activates itself on Enter, so those keys are left to them.
-        let (popup_open, focused) = (egui::Popup::is_any_open(ctx), ctx.memory(|m| m.focused().is_some()));
-        let mut keys = ctx.input_mut(|i| read_keys(i, popup_open, focused));
-        if matches!(self.stage, Stage::Counting { .. }) {
-            keys = keys.during_countdown();
+    fn home_ui(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        if ctx.input_mut(|i| i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::N))) {
+            self.start_snip(&ctx);
         }
-        let Keys { new, save, undo, redo, copy, enter, esc, zoom_in, zoom_out, zoom_fit } = keys;
-        if new {
-            self.start_snip(ctx);
-        }
-        if self.video.is_some() && save {
-            self.save_video_as(ctx);
-        }
-        if self.doc.is_none() {
-            return;
-        }
-        if save {
-            self.save_as(ctx);
-        }
-        if copy {
-            self.copy(ctx);
-        }
-        if let Some(doc) = &mut self.doc {
-            if undo {
-                step_history(doc, &mut self.crop, &mut self.drawing, false);
+        let bar = self.bar.clone();
+        widgets::title_bar(ui, "home_toolbar", &bar, |ui, row| {
+            let layout = |l| egui::UiBuilder::new().max_rect(row).layout(l);
+            let mut left = ui.new_child(layout(Layout::left_to_right(Align::Center)));
+            self.capture_controls(&mut left);
+            let mut right = ui.new_child(layout(Layout::right_to_left(Align::Center)));
+            self.home_menu(&mut right);
+            vec![left.min_rect(), right.min_rect()]
+        });
+        egui::CentralPanel::default().frame(egui::Frame::new().fill(ui.style().visuals.extreme_bg_color)).show(ui, |ui| {
+            if let Stage::Counting { end } = self.stage {
+                self.countdown_view(ui, end);
+            } else {
+                self.empty_state(ui);
             }
-            if redo {
-                step_history(doc, &mut self.crop, &mut self.drawing, true);
+        });
+        // The window is hidden while waiting; a message shown now would be gone before anyone saw it.
+        if !matches!(self.stage, Stage::Waiting) {
+            if let Some(msg) = self.live_note(&ctx) {
+                widgets::toast(&ctx, &msg, None);
             }
         }
-        if enter {
-            self.apply_crop();
-        }
-        if esc {
-            self.crop = None;
-        }
-        if zoom_fit {
-            self.zoom = None;
-        } else if zoom_in != zoom_out {
-            self.key_zoom = if zoom_in { ZOOM_STEP } else { 1.0 / ZOOM_STEP };
-        }
     }
 
-    fn apply_crop(&mut self) {
-        if let (Some((a, b)), Some(doc)) = (self.crop.take(), &mut self.doc) {
-            doc.crop(Rect::from_two_pos(a, b));
-            self.zoom = None;
-        }
-    }
-
-    /// With a snip open the toolbar needs room for all three groups; without one the window may shrink further.
-    fn sync_min_width(&mut self, ctx: &egui::Context) {
-        let monitor_w = ctx.input(|i| i.viewport().monitor_size).map_or(f32::INFINITY, |m| m.x);
-        let want = if self.doc.is_some() { edit_min_width(monitor_w) } else { MIN_WINDOW_W };
-        if want != self.min_width {
-            self.min_width = want;
-            ctx.send_viewport_cmd(ViewportCommand::MinInnerSize(vec2(want, MIN_WINDOW_H)));
-        }
-    }
-
-    fn toolbar(&mut self, ui: &mut egui::Ui) {
-        self.sync_min_width(&ui.ctx().clone());
-        egui::Panel::top("toolbar")
-            .frame(egui::Frame::new().fill(TOOLBAR_BG).inner_margin(egui::Margin::symmetric(12, 6)))
-            .show(ui, |ui| {
-                ui.spacing_mut().item_spacing = vec2(GAP, 0.0);
-                let row = Rect::from_min_size(ui.available_rect_before_wrap().min, vec2(ui.available_width(), BTN.y));
-                ui.allocate_rect(row, Sense::hover());
-                let layout = |l| egui::UiBuilder::new().max_rect(row).layout(l);
-
-                let mut left = ui.new_child(layout(Layout::left_to_right(Align::Center)));
-                self.capture_controls(&mut left);
-                let left_end = left.min_rect().max.x;
-
-                let mut right = ui.new_child(layout(Layout::right_to_left(Align::Center)));
-                self.output_controls(&mut right);
-                let right_start = right.min_rect().min.x;
-
-                if self.doc.is_some() {
-                    let width = self.markup_width();
-                    let x = markup_x(row.center().x, width, left_end, right_start);
-                    let mid_rect = Rect::from_min_size(pos2(x, row.min.y), vec2(width + 1.0, BTN.y));
-                    let mut mid = ui.new_child(egui::UiBuilder::new().max_rect(mid_rect).layout(Layout::left_to_right(Align::Center)));
-                    self.markup_controls(&mut mid);
+    fn home_menu(&mut self, ui: &mut egui::Ui) {
+        let more = icon_button(ui, Icon::More, None, false, true, "More");
+        egui::Popup::menu(&more).show(|ui| {
+            if ui.button("Settings…").clicked() {
+                self.open_settings(ui.ctx());
+            }
+            if ui.button("Open the Screenshots folder").clicked() {
+                if let Some(dir) = win::pictures_dir().map(|d| d.join("Screenshots")) {
+                    let _ = std::fs::create_dir_all(&dir);
+                    let _ = std::process::Command::new("explorer").arg(dir).spawn();
                 }
-            });
+            }
+        });
     }
 
     fn capture_controls(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
-        let (rect, resp) = ui.allocate_exact_size(vec2(80.0, BTN.y), Sense::click());
-        let p = ui.painter();
-        p.rect_filled(rect, 4.0, if resp.hovered() { BUTTON_HOVER } else { BUTTON_BG });
-        let icon = Rect::from_center_size(rect.left_center() + vec2(20.0, 0.0), vec2(18.0, 18.0));
-        icons::paint(p, icon, Icon::Plus, ACCENT, None);
-        p.text(rect.left_center() + vec2(36.0, 0.0), Align2::LEFT_CENTER, "New", FontId::proportional(14.0), ICON);
-        let tip = new_tooltip(self.mode, self.hotkey_rx.is_some(), self.hotkey_note.as_deref());
-        if resp.on_hover_text(tip).clicked() {
+        let tip = self.new_tip();
+        if widgets::new_button(ui, &tip).clicked() {
             self.start_snip(&ctx);
         }
         ui.add_space(8.0);
         self.mode_switch(ui);
         ui.add_space(4.0);
         self.shape_menu(ui);
-        if self.mode == Mode::Video {
+        if self.settings.mode == Mode::Video {
             return;
         }
 
-        let (timer, badge) = if self.delay == 0 { (Icon::TimerOff, None) } else { (Icon::Timer, Some(self.delay)) };
-        let resp = dropdown(ui, timer, badge).on_hover_text(format!("Delay: {}", delay_label(self.delay)));
+        let (timer, badge) = if self.settings.delay == 0 { (Icon::TimerOff, None) } else { (Icon::Timer, Some(self.settings.delay)) };
+        let resp = dropdown(ui, timer, badge).on_hover_text(format!("Delay: {}", delay_label(self.settings.delay)));
         egui::Popup::menu(&resp).show(|ui| {
             for d in DELAYS {
-                ui.selectable_value(&mut self.delay, d, delay_label(d));
+                ui.selectable_value(&mut self.settings.delay, d, delay_label(d));
             }
         });
     }
 
     fn mode_switch(&mut self, ui: &mut egui::Ui) {
-        let (group, _) = ui.allocate_exact_size(vec2(BTN.x * 2.0 + 6.0, BTN.y), Sense::hover());
-        ui.painter().rect_stroke(group, 5.0, (1.0, OUTLINE), StrokeKind::Inside);
+        const INSET: f32 = 2.0;
+        let (group, _) = ui.allocate_exact_size(vec2(BTN.x * 2.0 + 2.0 * INSET, BTN.y), Sense::hover());
+        // Concentric corners: the cells' radius plus the inset between them and the outline.
+        ui.painter().rect_stroke(group, RADIUS as f32 + INSET, (1.0, OUTLINE), StrokeKind::Inside);
         for (i, (mode, icon, tip)) in
             [(Mode::Photo, Icon::Camera, "Snip a picture"), (Mode::Video, Icon::Video, "Record a video")]
                 .into_iter()
                 .enumerate()
         {
-            let cell = Rect::from_min_size(group.min + vec2(3.0 + i as f32 * BTN.x, 3.0), BTN - vec2(0.0, 6.0));
+            let cell = Rect::from_min_size(group.min + vec2(INSET + i as f32 * BTN.x, INSET), BTN - vec2(0.0, 2.0 * INSET));
             let resp = ui.interact(cell, ui.scope_id().with(("mode", i)), Sense::click()).on_hover_text(tip);
             let p = ui.painter();
-            if self.mode == mode {
-                p.rect_filled(cell, 4.0, BUTTON_HOVER);
-                let bar = Rect::from_center_size(cell.center_bottom() - vec2(0.0, 3.0), vec2(14.0, 3.0));
+            if self.settings.mode == mode {
+                p.rect_filled(cell, RADIUS, BUTTON_HOVER);
+                let bar = Rect::from_center_size(cell.center_bottom() - vec2(0.0, 2.5), vec2(12.0, 3.0));
                 p.rect_filled(bar, 1.5, ACCENT);
             } else if resp.hovered() {
-                p.rect_filled(cell, 4.0, BUTTON_BG);
+                p.rect_filled(cell, RADIUS, BUTTON_BG);
             }
-            icons::paint(p, Rect::from_center_size(cell.center() - vec2(0.0, 1.0), vec2(18.0, 18.0)), icon, ICON, None);
+            icons::paint(p, Rect::from_center_size(cell.center() - vec2(0.0, 1.0), Vec2::splat(GLYPH)), icon, ICON, None);
             if resp.clicked() {
                 self.set_mode(mode);
             }
@@ -834,169 +1097,33 @@ impl App {
     }
 
     fn set_mode(&mut self, mode: Mode) {
-        self.mode = mode;
-        if !Shape_::choices(mode).contains(&self.shape) {
-            self.shape = Shape_::Rectangle;
+        self.settings.mode = mode;
+        if !Shape_::choices(mode).contains(&self.settings.shape) {
+            self.settings.shape = Shape_::Rectangle;
         }
     }
 
     fn shape_menu(&mut self, ui: &mut egui::Ui) {
-        let resp = dropdown(ui, self.shape.icon(), None).on_hover_text(format!("Shape: {}", self.shape.label()));
+        let resp = dropdown(ui, self.settings.shape.icon(), None).on_hover_text(format!("Shape: {}", self.settings.shape.label()));
         egui::Popup::menu(&resp).show(|ui| {
-            for &s in Shape_::choices(self.mode) {
+            for &s in Shape_::choices(self.settings.mode) {
                 let (rect, item) = ui.allocate_exact_size(vec2(150.0, 32.0), Sense::click());
                 let p = ui.painter();
                 if item.hovered() {
-                    p.rect_filled(rect, 4.0, BUTTON_HOVER);
+                    p.rect_filled(rect, RADIUS, BUTTON_HOVER);
                 }
-                if self.shape == s {
+                if self.settings.shape == s {
                     let pill = Rect::from_center_size(rect.left_center() + vec2(3.0, 0.0), vec2(3.0, 16.0));
                     p.rect_filled(pill, 1.5, ACCENT);
                 }
-                icons::paint(p, Rect::from_center_size(rect.left_center() + vec2(22.0, 0.0), vec2(18.0, 18.0)), s.icon(), ICON, None);
+                icons::paint(p, Rect::from_center_size(rect.left_center() + vec2(22.0, 0.0), Vec2::splat(GLYPH)), s.icon(), ICON, None);
                 p.text(rect.left_center() + vec2(42.0, 0.0), Align2::LEFT_CENTER, s.label(), FontId::proportional(14.0), ICON);
                 if item.clicked() {
-                    self.shape = s;
+                    self.settings.shape = s;
                     ui.close();
                 }
             }
         });
-    }
-
-    fn output_controls(&mut self, ui: &mut egui::Ui) {
-        let ctx = ui.ctx().clone();
-        let more = icon_button(ui, Icon::More, None, false, true, "More");
-        egui::Popup::menu(&more).show(|ui| {
-            ui.checkbox(&mut self.auto_copy, "Copy snips to the clipboard automatically");
-            ui.checkbox(&mut self.auto_save, "Save snips to Pictures\\Screenshots automatically");
-            if ui.button("Open the Screenshots folder").clicked() {
-                if let Some(dir) = win::pictures_dir().map(|d| d.join("Screenshots")) {
-                    let _ = std::fs::create_dir_all(&dir);
-                    let _ = std::process::Command::new("explorer").arg(dir).spawn();
-                }
-            }
-            if self.doc.is_some() {
-                ui.separator();
-                if ui.button("Zoom to fit").clicked() {
-                    self.zoom = None;
-                }
-                if ui.button("Actual size (100%)").clicked() {
-                    self.zoom = Some(1.0);
-                }
-            }
-        });
-        if self.video.is_some() {
-            divider(ui);
-            if icon_button(ui, Icon::Save, None, false, true, "Save a copy (Ctrl+S)").clicked() {
-                self.save_video_as(&ctx);
-            }
-        }
-        if self.doc.is_some() {
-            divider(ui);
-            if icon_button(ui, Icon::Copy, None, false, true, "Copy with markup (Ctrl+C)").clicked() {
-                self.copy(&ctx);
-            }
-            if icon_button(ui, Icon::Save, None, false, true, "Save as (Ctrl+S)").clicked() {
-                self.save_as(&ctx);
-            }
-        }
-    }
-
-    fn markup_width(&self) -> f32 {
-        let buttons = if self.crop.is_some() { 8.0 } else { 6.0 };
-        let dividers = 2.0;
-        buttons * BTN.x + dividers * DIVIDER_W + (buttons + dividers - 1.0) * GAP
-    }
-
-    fn markup_controls(&mut self, ui: &mut egui::Ui) {
-        for (tool, icon, tip) in [
-            (Tool::Pen, Icon::Pen, "Pen (click again for colour and size)"),
-            (Tool::Highlighter, Icon::Highlighter, "Highlighter (click again for colour and size)"),
-            (Tool::Eraser, Icon::Eraser, "Eraser: rubs out whole strokes"),
-        ] {
-            let ink = match tool {
-                Tool::Pen => Some(self.pen.0),
-                Tool::Highlighter => Some(self.highlighter.0),
-                _ => None,
-            };
-            let resp = icon_button(ui, icon, ink, self.tool == tool, true, tip);
-            let again = resp.clicked() && self.tool == tool;
-            if resp.clicked() {
-                self.tool = tool;
-                self.crop = None;
-            }
-            if ink.is_some() {
-                egui::Popup::from_response(&resp)
-                    .open_memory(again.then_some(egui::SetOpenCommand::Toggle))
-                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
-                    .show(|ui| self.ink_options(ui, tool));
-            }
-        }
-        divider(ui);
-        if icon_button(ui, Icon::Crop, None, self.tool == Tool::Crop, true, "Crop: drag a box, then Enter").clicked() {
-            self.tool = Tool::Crop;
-        }
-        if self.crop.is_some() {
-            if icon_button(ui, Icon::Check, None, false, true, "Apply crop (Enter)").clicked() {
-                self.apply_crop();
-            }
-            if icon_button(ui, Icon::Close, None, false, true, "Cancel crop (Esc)").clicked() {
-                self.crop = None;
-            }
-        }
-        divider(ui);
-        if let Some(doc) = &mut self.doc {
-            if icon_button(ui, Icon::Undo, None, false, doc.can_undo(), "Undo (Ctrl+Z)").clicked() {
-                step_history(doc, &mut self.crop, &mut self.drawing, false);
-            }
-            if icon_button(ui, Icon::Redo, None, false, doc.can_redo(), "Redo (Ctrl+Y)").clicked() {
-                step_history(doc, &mut self.crop, &mut self.drawing, true);
-            }
-        }
-    }
-
-    fn ink_options(&mut self, ui: &mut egui::Ui, tool: Tool) {
-        let ((color, width), palette, range) = match tool {
-            Tool::Highlighter => (&mut self.highlighter, &HIGHLIGHT_COLORS[..], 6.0..=48.0),
-            _ => (&mut self.pen, &PEN_COLORS[..], 1.0..=24.0),
-        };
-        ui.spacing_mut().item_spacing = vec2(6.0, 8.0);
-        ui.horizontal(|ui| {
-            for &c in palette {
-                let (rect, resp) = ui.allocate_exact_size(vec2(24.0, 24.0), Sense::click());
-                let p = ui.painter();
-                p.circle_filled(rect.center(), 9.0, c);
-                p.circle_stroke(rect.center(), 9.0, (1.0, Color32::from_gray(90)));
-                if *color == c {
-                    p.circle_stroke(rect.center(), 11.5, (2.0, ACCENT));
-                }
-                if resp.clicked() {
-                    *color = c;
-                }
-            }
-        });
-        ui.horizontal(|ui| {
-            ui.label("Size");
-            ui.add(egui::Slider::new(width, range).show_value(false));
-        });
-    }
-
-    /// `video_top` is the top of the content area while the video view is showing.
-    fn toast(&mut self, ctx: &egui::Context, video_top: Option<f32>) {
-        let Some(msg) = self.live_note(ctx) else { return };
-        let (align, offset) = toast_anchor(video_top);
-        egui::Area::new(egui::Id::unique("toast"))
-            .anchor(align, offset)
-            .order(egui::Order::Foreground)
-            .interactable(false)
-            .show(ctx, |ui| {
-                egui::Frame::new()
-                    .fill(BUTTON_BG)
-                    .stroke((1.0, OUTLINE))
-                    .corner_radius(6)
-                    .inner_margin(egui::Margin::symmetric(14, 8))
-                    .show(ui, |ui| ui.label(RichText::new(msg.as_str()).color(ICON)));
-            });
     }
 
     fn countdown_view(&mut self, ui: &mut egui::Ui, end: Instant) {
@@ -1016,16 +1143,16 @@ impl App {
     fn empty_state(&mut self, ui: &mut egui::Ui) {
         ui.with_layout(Layout::top_down(Align::Center), |ui| {
             ui.add_space((ui.available_height() * 0.5 - 50.0).max(8.0));
-            let title = match self.mode {
+            let title = match self.settings.mode {
                 Mode::Photo => "Snip anything on your screen",
                 Mode::Video => "Record anything on your screen",
             };
             ui.label(RichText::new(title).size(20.0).strong());
             ui.add_space(6.0);
-            let hint = match (self.mode, self.hotkey_rx.is_some()) {
-                (Mode::Photo, true) => "Press Alt+Shift+S anywhere, or pick a shape and click New.",
-                (Mode::Photo, false) => "Pick a shape and click New.",
-                (Mode::Video, _) => "Click New, choose an area, then press Start to record.",
+            let hint = match (self.settings.mode, self.hotkey) {
+                (Mode::Photo, Some(h)) => format!("Press {} anywhere, or pick a shape and click New.", h.label()),
+                (Mode::Photo, None) => "Pick a shape and click New.".into(),
+                (Mode::Video, _) => "Click New, choose an area, then press Start to record.".into(),
             };
             ui.label(RichText::new(hint).weak());
             if let Some(n) = &self.hotkey_note {
@@ -1035,163 +1162,11 @@ impl App {
         });
     }
 
-    fn canvas(&mut self, ui: &mut egui::Ui) {
-        let ctx = ui.ctx().clone();
-        let Some(doc) = &mut self.doc else { return };
-        let rev = (doc.image_rev, doc.ink_rev);
-        if self.texture.as_ref().is_none_or(|c| c.rev != rev) {
-            // ceiling: erase/undo re-flatten the whole snip (~150 ms for 20 long strokes on 4K); burn per-stroke tiles if erasing feels sticky.
-            let shown = if doc.strokes.is_empty() { doc.image.clone() } else { Arc::new(doc.flatten()) };
-            match &mut self.texture {
-                Some(c) => {
-                    c.tex.set(shown.clone(), TextureOptions::LINEAR);
-                    if c.rev.0 != rev.0 {
-                        c.live = None;
-                    }
-                    c.shown = shown;
-                    c.rev = rev;
-                }
-                None => {
-                    let tex = ctx.load_texture("snip", shown.clone(), TextureOptions::LINEAR);
-                    self.texture = Some(CanvasTex { tex, shown, rev, live: None });
-                }
-            }
-        }
-        let Some(canvas) = &mut self.texture else { return };
-
-        let ppp = ctx.pixels_per_point();
-        let px_size = vec2(doc.size()[0] as f32, doc.size()[1] as f32);
-        let natural = px_size / ppp;
-        let view = ui.available_size();
-        let fit = ((view - CANVAS_MARGIN) / natural).min_elem().clamp(0.02, 1.0);
-        let wheel_zoom = if ui.rect_contains_pointer(ui.max_rect()) { ui.input(|i| i.zoom_delta()) } else { 1.0 };
-        let zoom_delta = wheel_zoom * std::mem::replace(&mut self.key_zoom, 1.0);
-        let old_zoom = self.zoom.unwrap_or(fit);
-        if zoom_delta != 1.0 {
-            self.zoom = Some(clamp_zoom(old_zoom * zoom_delta, fit));
-        }
-        let zoom = self.zoom.unwrap_or(fit);
-        let shown = natural * zoom;
-
-        let view_rect = ui.available_rect_before_wrap();
-        let mut scroll = egui::ScrollArea::both().id_salt(SCROLL_ID).auto_shrink(false);
-        if zoom != old_zoom {
-            // Wheel zoom stays on the pointer, keyboard zoom on the middle of the view.
-            let pointer = if wheel_zoom != 1.0 { ui.input(|i| i.pointer.hover_pos()) } else { None };
-            let anchor = pointer.map_or(view / 2.0, |p| p - view_rect.min);
-            scroll = scroll.scroll_offset(anchored_offset(scroll_offset(ui), anchor, natural * old_zoom, shown, view));
-        }
-
-        scroll.show(ui, |ui| {
-            let area = shown + CANVAS_MARGIN;
-            let (outer, resp) = ui.allocate_exact_size(area.max(view), Sense::click_and_drag());
-            let img_rect = Rect::from_center_size(outer.center(), shown);
-            let k = px_size.x / img_rect.width(); // image pixels per point
-            let to_px = |p: Pos2| ((p - img_rect.min) * k).to_pos2();
-            let to_pt = |p: Pos2| img_rect.min + p.to_vec2() / k;
-
-            let painter = ui.painter();
-            // Committed ink is already burned into the texture, exactly as it will be saved.
-            painter.image(canvas.tex.id(), img_rect, Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)), Color32::WHITE);
-
-            let pointer = resp.interact_pointer_pos().or(resp.hover_pos());
-            // Drags are noticed a few pixels after the button goes down; start where it went down.
-            let origin = ctx.input(|i| i.pointer.press_origin()).or(pointer);
-            let swallowed = self.popup_guard.swallows(&ctx, resp.clicked());
-            match self.tool {
-                _ if swallowed => {}
-                Tool::Pen | Tool::Highlighter => {
-                    let (ink, (color, width)) = if self.tool == Tool::Pen {
-                        (Ink::Pen, self.pen)
-                    } else {
-                        (Ink::Highlighter, self.highlighter)
-                    };
-                    if resp.hovered() {
-                        ctx.set_cursor_icon(CursorIcon::Crosshair);
-                    }
-                    // Thickness is chosen in screen points, so ink looks the same at any zoom.
-                    let width_px = width * k;
-                    if resp.drag_started() || resp.clicked() {
-                        if let Some(p) = origin {
-                            self.drawing = Some(Stroke { ink, color, width: width_px, points: vec![to_px(p)] });
-                        }
-                    }
-                    if let (Some(s), Some(p)) = (&mut self.drawing, pointer) {
-                        let p = to_px(p);
-                        if s.points.last().is_none_or(|l| l.distance(p) > 0.75 * k) {
-                            s.points.push(p);
-                        }
-                    }
-                    if resp.drag_stopped() || resp.clicked() {
-                        if let Some(s) = self.drawing.take() {
-                            canvas.commit(doc, s);
-                        }
-                    }
-                    if let Some(s) = &self.drawing {
-                        canvas.show_live(&ctx, painter, img_rect, s, doc.size());
-                    }
-                }
-                Tool::Eraser => {
-                    let radius_pt = 10.0;
-                    if let Some(p) = resp.hover_pos().or(pointer) {
-                        painter.circle_stroke(p, radius_pt, (1.5, Color32::WHITE));
-                        painter.circle_stroke(p, radius_pt + 1.5, (1.0, Color32::BLACK));
-                    }
-                    if resp.drag_started() || resp.clicked() {
-                        self.erase_marked = false;
-                    }
-                    if resp.dragged() || resp.clicked() {
-                        if let Some(p) = pointer {
-                            let (p, r) = (to_px(p), radius_pt * k);
-                            if doc.hits(p, r) {
-                                if !self.erase_marked {
-                                    doc.checkpoint();
-                                    self.erase_marked = true;
-                                }
-                                doc.erase_at(p, r);
-                            }
-                        }
-                    }
-                }
-                Tool::Crop => {
-                    if resp.hovered() {
-                        ctx.set_cursor_icon(CursorIcon::Crosshair);
-                    }
-                    let clamp = |p: Pos2| p.clamp(Pos2::ZERO, px_size.to_pos2());
-                    if resp.drag_started() {
-                        if let Some(p) = origin {
-                            self.crop = Some((clamp(to_px(p)), clamp(to_px(p))));
-                        }
-                    }
-                    if resp.dragged() {
-                        if let (Some((_, b)), Some(p)) = (&mut self.crop, pointer) {
-                            *b = clamp(to_px(p));
-                        }
-                    }
-                    if let Some((a, b)) = self.crop {
-                        let sel = Rect::from_two_pos(to_pt(a), to_pt(b));
-                        dim_outside(painter, img_rect, sel);
-                        painter.rect_stroke(sel, 0.0, (1.5, Color32::WHITE), StrokeKind::Outside);
-                        let r = Rect::from_two_pos(a, b);
-                        painter.text(
-                            sel.left_top() + vec2(0.0, -6.0),
-                            Align2::LEFT_BOTTOM,
-                            format!("{:.0} × {:.0}  ·  Enter to crop", r.width(), r.height()),
-                            FontId::proportional(12.0),
-                            Color32::WHITE,
-                        );
-                    }
-                }
-            }
-        });
-        zoom_badge(ui.painter(), view_rect, zoom);
-    }
-
     fn picker_ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         self.popup_guard.begin_frame(&ctx);
         let rect = ui.max_rect();
-        let video = self.mode == Mode::Video;
+        let video = self.settings.mode == Mode::Video;
         let Stage::Picking(pk) = &mut self.stage else { return };
         let img = vec2(pk.grab.image.size[0] as f32, pk.grab.image.size[1] as f32);
         let k = img / rect.size();
@@ -1215,7 +1190,7 @@ impl App {
         let mut window_click = false;
         let mut cancel = take_escape(&ctx);
 
-        match self.shape {
+        match self.settings.shape {
             Shape_::Rectangle => {
                 if resp.drag_started() {
                     pk.start = origin.map(to_px);
@@ -1230,7 +1205,7 @@ impl App {
                     Some(s) => {
                         let shown = Rect::from_min_max(to_pt(s.min), to_pt(s.max));
                         dim_outside(painter, rect, shown);
-                        painter.rect_stroke(shown, 0.0, (1.0, Color32::WHITE), StrokeKind::Outside);
+                        widgets::dashed_outline(painter, shown);
                         size_tag(painter, shown, s.size());
                         if resp.drag_stopped() {
                             pk.start = None;
@@ -1359,10 +1334,14 @@ impl App {
             ViewportCommand::Resizable(false),
             ViewportCommand::WindowLevel(WindowLevel::AlwaysOnTop),
             ViewportCommand::Minimized(false),
-            ViewportCommand::Visible(true),
             ViewportCommand::Focus,
         ] {
             ctx.send_viewport_cmd(cmd);
+        }
+        // Straight from the tray the window is still the cloaked home window: uncloaked once the bar
+        // has been laid out and painted (`rec_bar_ui` fits it on the first pass).
+        if self.concealed {
+            self.reveal_in = 3;
         }
         ctx.request_repaint();
     }
@@ -1375,14 +1354,14 @@ impl App {
         };
         let settings = recorder::Settings {
             area: bar.area,
-            system_sound: self.record_system,
-            microphone: self.record_mic.then(|| self.mic_choice.clone()),
+            system_sound: self.settings.record_system,
+            microphone: self.settings.record_mic.then(|| self.settings.mic.clone()),
             path: dir.join("Screen Recordings").join(format!("Screen Recording {}.mp4", win::timestamp())),
         };
         let (tx, c) = (self.rec_tx.clone(), ctx.clone());
         bar.rec = Some(recorder::start(settings, move |event| {
             let _ = tx.send(event);
-            c.request_repaint();
+            wake_root(&c);
         }));
     }
 
@@ -1406,13 +1385,15 @@ impl App {
                     _ => Vec::new(),
                 };
                 self.close_rec_bar(ctx);
+                if self.quitting {
+                    // The file is complete once `Done` arrives; nobody is left to show it to.
+                    ctx.send_viewport_cmd(ViewportCommand::Close);
+                    return;
+                }
                 match result {
                     Ok(f) => {
                         let thumb = f.first_frame.map(|img| ctx.load_texture("recording", img, TextureOptions::LINEAR));
-                        self.video = Some(VideoResult { path: f.path, seconds: f.seconds, size: f.size, thumb });
-                        self.doc = None;
-                        self.texture = None;
-                        self.place_window(ctx, self.window_size_for(ctx));
+                        let video = VideoResult { path: f.path, seconds: f.seconds, size: f.size, thumb };
                         let mut msg = match f.stopped_early {
                             Some(why) => format!("Recording stopped early ({why}) · Saved to Videos\\Screen Recordings"),
                             None => "Saved to Videos\\Screen Recordings".to_string(),
@@ -1421,7 +1402,7 @@ impl App {
                             msg.push_str(" · ");
                             msg.push_str(&n);
                         }
-                        self.say(ctx, msg);
+                        self.editors.open_video(ctx, video, msg, self.hwnd, self.restore_corner);
                     }
                     Err(e) => self.say(ctx, format!("Recording failed: {e}")),
                 }
@@ -1433,8 +1414,8 @@ impl App {
     fn close_rec_bar(&mut self, ctx: &egui::Context) {
         self.stage = Stage::Idle;
         win::exclude_from_capture(self.hwnd as HWND, false);
-        self.show_window(ctx);
-        self.place_window(ctx, self.window_size_for(ctx));
+        self.return_home(ctx);
+        self.place_window(ctx);
     }
 
     fn rec_bar_ui(&mut self, ui: &mut egui::Ui) {
@@ -1498,10 +1479,10 @@ impl App {
                     let (t, _) = ui.allocate_exact_size(vec2(REC_CLOCK_W, BTN.y), Sense::hover());
                     ui.painter().text(t.center(), Align2::CENTER_CENTER, clock, FontId::monospace(14.0), ICON);
 
-                    let mic_icon = if self.record_mic { Icon::Mic } else { Icon::MicOff };
-                    let mic_tip = if self.record_mic { "Mute microphone" } else { "Unmute microphone" };
+                    let mic_icon = if self.settings.record_mic { Icon::Mic } else { Icon::MicOff };
+                    let mic_tip = if self.settings.record_mic { "Mute microphone" } else { "Unmute microphone" };
                     if icon_button(ui, mic_icon, None, false, !recording, mic_tip).clicked() {
-                        self.record_mic = !self.record_mic;
+                        self.settings.record_mic = !self.settings.record_mic;
                     }
                     let (chev, chev_resp) = ui.allocate_exact_size(vec2(REC_CHEVRON_W, BTN.y), if recording { Sense::hover() } else { Sense::click() });
                     icons::paint(ui.painter(), Rect::from_center_size(chev.center(), vec2(12.0, 12.0)), Icon::Chevron, if recording { ICON_OFF } else { ICON }, None);
@@ -1509,19 +1490,19 @@ impl App {
                         self.mics = audio::microphones();
                     }
                     egui::Popup::menu(&chev_resp).show(|ui| {
-                        if ui.selectable_label(!self.record_mic, "Mute").clicked() {
-                            self.record_mic = false;
+                        if ui.selectable_label(!self.settings.record_mic, "Mute").clicked() {
+                            self.settings.record_mic = false;
                         }
                         ui.separator();
                         for (i, m) in self.mics.iter().enumerate() {
-                            let chosen = self.record_mic
-                                && match &self.mic_choice {
+                            let chosen = self.settings.record_mic
+                                && match &self.settings.mic {
                                     Some(id) => *id == m.id,
                                     None => i == 0,
                                 };
                             if ui.selectable_label(chosen, &m.name).clicked() {
-                                self.record_mic = true;
-                                self.mic_choice = Some(m.id.clone());
+                                self.settings.record_mic = true;
+                                self.settings.mic = Some(m.id.clone());
                             }
                         }
                         if self.mics.is_empty() {
@@ -1529,10 +1510,10 @@ impl App {
                         }
                     });
 
-                    let sys_icon = if self.record_system { Icon::SystemSound } else { Icon::SystemSoundOff };
-                    let sys_tip = if self.record_system { "Mute system audio" } else { "Unmute system audio" };
+                    let sys_icon = if self.settings.record_system { Icon::SystemSound } else { Icon::SystemSoundOff };
+                    let sys_tip = if self.settings.record_system { "Mute system audio" } else { "Unmute system audio" };
                     if icon_button(ui, sys_icon, None, false, !recording, sys_tip).clicked() {
-                        self.record_system = !self.record_system;
+                        self.settings.record_system = !self.settings.record_system;
                     }
                     divider(ui);
                     let close_tip = if recording { "Stop and save" } else { "Close (Esc)" };
@@ -1563,77 +1544,22 @@ impl App {
         }
     }
 
-    fn video_view(&mut self, ui: &mut egui::Ui) {
-        let Some(v) = &self.video else { return };
-        let ppp = ui.ctx().pixels_per_point();
-        let avail = ui.available_rect_before_wrap();
-        let room = Rect::from_min_max(avail.min + vec2(24.0, 24.0), avail.max - vec2(24.0, 110.0));
-        let natural = vec2(v.size[0] as f32, v.size[1] as f32) / ppp;
-        let scale = (room.size() / natural).min_elem().clamp(0.02, 1.0);
-        let shown = Rect::from_center_size(room.center(), natural * scale);
-        let resp = ui.interact(shown, ui.scope_id().with("video"), Sense::click()).on_hover_text("Play");
-        let p = ui.painter();
-        match &v.thumb {
-            Some(t) => {
-                p.image(t.id(), shown, Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)), Color32::WHITE);
-            }
-            None => {
-                p.rect_filled(shown, 0.0, Color32::BLACK);
-            }
-        }
-        p.circle_filled(shown.center(), 30.0, Color32::from_black_alpha(if resp.hovered() { 190 } else { 150 }));
-        icons::paint(p, Rect::from_center_size(shown.center() + vec2(2.0, 0.0), vec2(28.0, 28.0)), Icon::Play, Color32::WHITE, None);
-        if resp.hovered() {
-            ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
-        }
-        let secs = v.seconds.round() as u64;
-        let info = format!("Screen recording · {}:{:02} · {} × {}", secs / 60, secs % 60, v.size[0], v.size[1]);
-        p.text(shown.center_bottom() + vec2(0.0, 22.0), Align2::CENTER_CENTER, info, FontId::proportional(14.0), ICON);
-        let buttons = Rect::from_center_size(shown.center_bottom() + vec2(0.0, 62.0), vec2(220.0, 32.0));
-        let path = v.path.clone();
-        let mut row = ui.new_child(egui::UiBuilder::new().max_rect(buttons).layout(Layout::left_to_right(Align::Center)));
-        let button = |ui: &mut egui::Ui, text: &str| {
-            ui.add(egui::Button::new(text).fill(BUTTON_HOVER).min_size(vec2(100.0, 32.0))).clicked()
-        };
-        let (play, folder) = (button(&mut row, "Play"), button(&mut row, "Show in folder"));
-        if resp.clicked() || play {
-            if let Err(e) = win::open_path(&path) {
-                self.say(ui.ctx(), format!("Couldn't open the video: {e}"));
-            }
-        }
-        if folder {
-            if let Err(e) = win::show_in_folder(&path) {
-                self.say(ui.ctx(), format!("Couldn't open the folder: {e}"));
-            }
-        }
-    }
-
-    fn save_video_as(&mut self, ctx: &egui::Context) {
-        let Some(v) = &self.video else { return };
-        let start = win::videos_dir().map(|d| d.join("Screen Recordings"));
-        let name = v.path.file_stem().map_or_else(|| "Screen Recording".into(), |n| n.to_string_lossy().into_owned());
-        let Some(path) = win::ask_save_path(self.hwnd as HWND, start.as_deref(), &name, ("MP4 video", "mp4")) else {
-            return;
-        };
-        let msg = match std::fs::copy(&v.path, &path) {
-            Ok(_) => format!("Saved {}", path.file_name().map_or_else(String::new, |n| n.to_string_lossy().into())),
-            Err(e) => format!("Couldn't save: {e}"),
-        };
-        self.say(ctx, msg);
-    }
-
     fn drive_screenshot(&mut self, ctx: &egui::Context) {
         let Some(job) = &mut self.screenshot else { return };
         ctx.request_repaint();
+        if job.target != ViewportId::ROOT {
+            ctx.request_repaint_of(job.target);
+        }
         job.frames += 1;
         if job.frames == 120 {
             let (tx, rx) = channel();
             job.rx = Some(rx);
             let c = ctx.clone();
-            ctx.request_screenshot(move |img| {
+            let shot = egui::ScreenshotCallback::new(move |img| {
                 let _ = tx.send(img);
-                c.request_repaint();
+                c.request_repaint_of(ViewportId::ROOT);
             });
+            ctx.send_viewport_cmd_to(job.target, ViewportCommand::Screenshot(shot));
         }
         let Some(img) = job.rx.as_ref().and_then(|rx| rx.try_recv().ok()) else { return };
         match win::save_png(&job.path, &img) {
@@ -1646,90 +1572,110 @@ impl App {
     }
 }
 
-/// The snip as shown: the picture with committed ink burned in by the same
-/// rasteriser that saves it, plus a layer for the stroke being drawn.
-struct CanvasTex {
-    tex: TextureHandle,
-    shown: Arc<ColorImage>,
-    /// `(image_rev, ink_rev)` of the doc that `shown` was built from.
-    rev: (u64, u64),
-    live: Option<LiveInk>,
+/// Brings the sign-in entry in line with "Start SnipScreen with Windows" on one worker, so quick
+/// toggles are applied in order (and only the newest of a burst at all) and the entry ends up as the
+/// setting says. Dropping it applies what is still queued, then stops.
+struct StartupEntry {
+    tx: Option<Sender<bool>>,
+    thread: Option<std::thread::JoinHandle<()>>,
 }
 
-/// Image-sized, see-through texture holding the stroke being drawn. Only the
-/// pixels its newest segments touch are re-rasterised and uploaded each frame.
-struct LiveInk {
-    tex: TextureHandle,
-    /// Points of the stroke already rasterised into `tex`.
-    done: usize,
-    /// Pixels written so far, cleared when the stroke ends.
-    dirty: Option<PxRect>,
-}
-
-impl LiveInk {
-    fn clear(&mut self) {
-        if let Some(r) = self.dirty.take() {
-            let (w, h) = (r.x1 - r.x0, r.y1 - r.y0);
-            self.tex.set_partial(r.pos(), ColorImage::new([w, h], vec![Color32::TRANSPARENT; w * h]), TextureOptions::LINEAR);
-        }
-        self.done = 0;
-    }
-}
-
-impl CanvasTex {
-    /// Adds a finished stroke, burning just that stroke into the texture
-    /// rather than re-flattening the whole snip.
-    fn commit(&mut self, doc: &mut Doc, s: Stroke) {
-        let current = self.rev == (doc.image_rev, doc.ink_rev);
-        if current {
-            if let Some(r) = s.bounds_from(0, doc.size()) {
-                let shown = Arc::make_mut(&mut self.shown);
-                markup::burn_stroke(shown, &s);
-                let patch = markup::sub_image(shown, r.x0, r.y0, r.x1 - r.x0, r.y1 - r.y0);
-                self.tex.set_partial(r.pos(), patch, TextureOptions::LINEAR);
+impl StartupEntry {
+    fn new(report: Notifier, apply: impl Fn(bool) -> Result<(), String> + Send + 'static) -> Self {
+        let (tx, rx) = channel::<bool>();
+        let thread = std::thread::spawn(move || {
+            while let Ok(mut on) = rx.recv() {
+                while let Ok(newer) = rx.try_recv() {
+                    on = newer;
+                }
+                if let Err(e) = apply(on) {
+                    report.send(format!("Couldn't update starting with Windows: {e}"));
+                }
             }
-        }
-        doc.add_stroke(s);
-        if current {
-            self.rev.1 = doc.ink_rev;
-        }
-        if let Some(live) = &mut self.live {
-            live.clear();
-        }
-    }
-
-    fn show_live(&mut self, ctx: &egui::Context, painter: &egui::Painter, img_rect: Rect, s: &Stroke, size: [usize; 2]) {
-        let live = self.live.get_or_insert_with(|| LiveInk {
-            tex: ctx.load_texture("live ink", ColorImage::new(size, vec![Color32::TRANSPARENT; size[0] * size[1]]), TextureOptions::LINEAR),
-            done: 0,
-            dirty: None,
         });
-        if s.points.len() < live.done {
-            live.clear();
+        Self { tx: Some(tx), thread: Some(thread) }
+    }
+
+    fn set(&self, on: bool) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(on);
         }
-        if live.done < s.points.len() {
-            if let Some(r) = s.bounds_from(live.done, size) {
-                live.tex.set_partial(r.pos(), s.ink_tile(r), TextureOptions::LINEAR);
-                live.dirty = Some(live.dirty.map_or(r, |d| d.union(r)));
-            }
-            live.done = s.points.len();
-        }
-        painter.image(live.tex.id(), img_rect, Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)), Color32::WHITE);
     }
 }
 
-fn dim_outside(painter: &egui::Painter, all: Rect, keep: Rect) {
-    let keep = keep.intersect(all);
-    for r in [
-        Rect::from_min_max(all.min, pos2(all.max.x, keep.min.y)),
-        Rect::from_min_max(pos2(all.min.x, keep.max.y), all.max),
-        Rect::from_min_max(pos2(all.min.x, keep.min.y), pos2(keep.min.x, keep.max.y)),
-        Rect::from_min_max(pos2(keep.max.x, keep.min.y), pos2(all.max.x, keep.max.y)),
-    ] {
-        if r.is_positive() {
-            painter.rect_filled(r, 0.0, DIM);
+impl Drop for StartupEntry {
+    fn drop(&mut self) {
+        self.tx = None;
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
         }
     }
+}
+
+/// Wakes the shell from another thread. `request_repaint` would target whichever viewport is in a
+/// pass right now (an editor or Settings, whose passes share the context), leaving the event unread
+/// until something else repaints the root.
+fn wake_root(ctx: &egui::Context) {
+    ctx.request_repaint_of(ViewportId::ROOT);
+}
+
+/// Messages show in the home window while it is on screen, and always in the recording bar, which
+/// draws them itself; otherwise they go to the newest editor.
+fn note_goes_home(home_visible: bool, recording: bool) -> bool {
+    home_visible || recording
+}
+
+/// Without a tray icon the app ends once the home window was closed and the last editor has gone,
+/// unless a capture is still running. In the tray it only ends on Quit.
+fn no_window_left(resident: bool, home_visible: bool, no_editors: bool, idle: bool) -> bool {
+    !resident && !home_visible && no_editors && idle
+}
+
+/// Where a start out of sight stands; see `App::hidden_start`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HiddenStart {
+    /// The first frame hasn't been painted yet; eframe shows the window right after it.
+    FirstFrame,
+    /// Painted and shown by eframe while cloaked, which gave it a taskbar button; the next pass
+    /// takes the button off if the window is still concealed.
+    Painted,
+    Done,
+}
+
+/// A made-up snip for `--screenshot-editor`: a deterministic gradient with a title bar and a few
+/// light cards, so scaling, ink and the toolbar can be checked in a render without a real screen.
+fn sample_image(w: usize, h: usize) -> ColorImage {
+    let mut px = Vec::with_capacity(w * h);
+    for y in 0..h {
+        for x in 0..w {
+            let (fx, fy) = (x as f32 / w as f32, y as f32 / h as f32);
+            let card = (x % 240) >= 24 && (x % 240) < 216 && y >= 96 && (y - 96) % 168 < 132;
+            px.push(if y < 48 {
+                Color32::from_rgb(0x24, 0x29, 0x33)
+            } else if card {
+                Color32::from_rgb(0xf4, 0xf6, 0xfa)
+            } else {
+                Color32::from_rgb((70.0 + 90.0 * fx) as u8, (110.0 + 60.0 * fy) as u8, (170.0 + 60.0 * (1.0 - fx)) as u8)
+            });
+        }
+    }
+    ColorImage::new([w, h], px)
+}
+
+fn sample_strokes() -> Vec<markup::Stroke> {
+    let line = |a: Pos2, b: Pos2| (0..=20).map(|i| a + (b - a) * (i as f32 / 20.0)).collect::<Vec<_>>();
+    vec![
+        markup::Stroke { on_dark: false, ink: markup::Ink::Highlighter, color: Color32::from_rgb(0xff, 0xe6, 0x00), width: 18.0, points: line(pos2(270.0, 140.0), pos2(450.0, 140.0)) },
+        markup::Stroke { on_dark: false, ink: markup::Ink::Pen, color: Color32::from_rgb(0xe8, 0x1c, 0x24), width: 4.0, points: line(pos2(520.0, 300.0), pos2(700.0, 420.0)) },
+    ]
+}
+
+fn crop_px(img: &ColorImage, r: Rect) -> ColorImage {
+    let x0 = (r.min.x.round().max(0.0) as usize).min(img.size[0] - 1);
+    let y0 = (r.min.y.round().max(0.0) as usize).min(img.size[1] - 1);
+    let x1 = (r.max.x.round() as usize).clamp(x0 + 1, img.size[0]);
+    let y1 = (r.max.y.round() as usize).clamp(y0 + 1, img.size[1]);
+    markup::sub_image(img, x0, y0, x1 - x0, y1 - y0)
 }
 
 fn size_tag(painter: &egui::Painter, shown: Rect, px: Vec2) {
@@ -1741,14 +1687,6 @@ fn size_tag(painter: &egui::Painter, shown: Rect, px: Vec2) {
     painter.galley(at + vec2(5.0, 2.0), galley, Color32::WHITE);
 }
 
-fn crop_px(img: &ColorImage, r: Rect) -> ColorImage {
-    let x0 = (r.min.x.round().max(0.0) as usize).min(img.size[0] - 1);
-    let y0 = (r.min.y.round().max(0.0) as usize).min(img.size[1] - 1);
-    let x1 = (r.max.x.round() as usize).clamp(x0 + 1, img.size[0]);
-    let y1 = (r.max.y.round() as usize).clamp(y0 + 1, img.size[1]);
-    markup::sub_image(img, x0, y0, x1 - x0, y1 - y0)
-}
-
 fn window_hwnd(cc: &eframe::CreationContext<'_>) -> isize {
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
     match cc.window_handle().map(|h| h.as_raw()) {
@@ -1757,67 +1695,133 @@ fn window_hwnd(cc: &eframe::CreationContext<'_>) -> isize {
     }
 }
 
-fn style(ctx: &egui::Context) {
-    ctx.set_theme(egui::Theme::Dark);
-    // Ctrl+Plus/Minus/0 zoom the snip (see `read_keys`), not egui's whole UI.
-    ctx.options_mut(|o| o.zoom_with_keyboard = false);
-    ctx.style_mut_of(egui::Theme::Dark, |s| {
-        s.spacing.button_padding = vec2(10.0, 5.0);
-        s.spacing.interact_size.y = 30.0;
-        s.visuals.selection.bg_fill = Color32::from_rgb(0x3d, 0x3d, 0x3d);
-        s.visuals.selection.stroke.color = Color32::WHITE;
-        s.visuals.panel_fill = TOOLBAR_BG;
-        s.visuals.window_fill = TOOLBAR_BG;
-        s.visuals.extreme_bg_color = CANVAS_BG;
-        s.visuals.widgets.noninteractive.bg_stroke.color = DIVIDER;
-        s.visuals.slider_trailing_fill = true;
-        s.visuals.widgets.inactive.bg_fill = BUTTON_BG;
-        s.visuals.widgets.inactive.weak_bg_fill = BUTTON_BG;
-        s.visuals.widgets.hovered.weak_bg_fill = BUTTON_HOVER;
-        for w in [
-            &mut s.visuals.widgets.inactive,
-            &mut s.visuals.widgets.hovered,
-            &mut s.visuals.widgets.active,
-            &mut s.visuals.widgets.open,
-            &mut s.visuals.widgets.noninteractive,
-        ] {
-            w.corner_radius = CornerRadius::same(4);
+/// What the command line asks for. `--open-link <link>` (what Windows runs for a `snipscreen:` link,
+/// see `notify::register`) carries text from outside, so after it nothing is read as a flag: a crafted
+/// link can't smuggle in `--screenshot <path>` or anything else.
+fn parse_args(args: &[String]) -> Result<(Option<Shot>, tray::Intent), String> {
+    if args.first().map(String::as_str) == Some(tray::OPEN_LINK_FLAG) {
+        return Ok((None, tray::Intent::Open(args.get(1).cloned().unwrap_or_default())));
+    }
+    let mut shot = None;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        let make = match a.as_str() {
+            "--screenshot" => Shot::Home,
+            "--screenshot-editor" => Shot::Editor,
+            "--screenshot-settings" => Shot::Settings,
+            _ => continue,
+        };
+        match it.next() {
+            Some(p) => shot = Some(make(PathBuf::from(p))),
+            None => return Err(format!("{a} needs a file name, e.g. {a} shot.png")),
         }
-        s.text_styles.insert(egui::TextStyle::Body, FontId::proportional(14.0));
-        s.text_styles.insert(egui::TextStyle::Button, FontId::proportional(14.0));
-    });
+    }
+    Ok((shot, tray::Intent::from_args(args)))
 }
 
 fn main() -> eframe::Result {
-    let mut args = std::env::args().skip(1);
-    let mut screenshot = None;
-    while let Some(a) = args.next() {
-        if a == "--screenshot" {
-            match args.next() {
-                Some(p) => screenshot = Some(PathBuf::from(p)),
-                None => {
-                    eprintln!("--screenshot needs a file name, e.g. --screenshot shot.png");
-                    std::process::exit(2);
-                }
-            }
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let (shot, intent) = match parse_args(&args) {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(2);
         }
+    };
+    win::become_dpi_aware();
+    let loaded = settings::load();
+    // A screenshot run must not take the shortcut or the single-instance slot from a running copy.
+    // This comes first so a launch that only forwards to the running copy exits without more work.
+    let boot = if shot.is_none() {
+        match start_resident(intent, loaded.settings.shortcut) {
+            Some(b) => Some(b),
+            None => return Ok(()),
+        }
+    } else {
+        None
+    };
+    if boot.is_some() {
+        notify::set_process_id();
     }
-    let mut viewport = egui::ViewportBuilder::default()
-        .with_title("Snipscreen")
-        .with_inner_size([620.0, 330.0])
-        .with_min_inner_size([MIN_WINDOW_W, MIN_WINDOW_H]);
+    let mut viewport = egui::ViewportBuilder::default().with_title("Snipscreen").with_inner_size(HOME_SIZE).with_min_inner_size([MIN_WINDOW_W, MIN_WINDOW_H]);
     // The icon is built into the binary and checked by `app_icon_decodes`, so a failure here
     // means a broken build; the app still runs with the default icon rather than refusing to start.
-    match app_icon() {
-        Ok(icon) => viewport = viewport.with_icon(Arc::new(icon)),
-        Err(e) => eprintln!("couldn't load the app icon: {e}"),
+    let icon = match app_icon() {
+        Ok(icon) => Some(Arc::new(icon)),
+        Err(e) => {
+            eprintln!("couldn't load the app icon: {e}");
+            None
+        }
+    };
+    if let Some(icon) = &icon {
+        viewport = viewport.with_icon(icon.clone());
+    }
+    if boot.as_ref().is_some_and(Boot::starts_hidden) {
+        // eframe's show after the first frame must not take focus from what the person is doing.
+        viewport = viewport.with_active(false);
     }
     let options = eframe::NativeOptions { viewport, ..Default::default() };
-    eframe::run_native(
-        "Snipscreen",
-        options,
-        Box::new(move |cc| Ok(Box::new(App::new(cc, screenshot)))),
-    )
+    eframe::run_native("Snipscreen", options, Box::new(move |cc| Ok(Box::new(App::new(cc, shot, icon, loaded, boot)))))
+}
+
+/// The single running copy's resident side, set up before the window so a second launch can reach
+/// it as early as possible.
+struct Boot {
+    agent: Option<tray::Agent>,
+    hotkey: Result<Hotkey, String>,
+    events: Receiver<tray::Event>,
+    /// Filled with the egui context once it exists, so agent events can wake the UI.
+    waker: Arc<OnceLock<egui::Context>>,
+    /// What this launch was started for.
+    intent: tray::Intent,
+}
+
+impl Boot {
+    /// Started with Windows, or to open a notification's snip: the home window stays out of sight.
+    fn starts_hidden(&self) -> bool {
+        matches!(self.intent, tray::Intent::Tray | tray::Intent::Open(_))
+    }
+}
+
+/// Claims the single-instance slot and starts the agent. `None` means this launch is done: its intent
+/// went to the copy already running, or it was `--quit` with nothing to quit.
+fn start_resident(intent: tray::Intent, hotkey: Hotkey) -> Option<Boot> {
+    // A copy that is quitting turns launches away; this one then waits for it to go (it may be
+    // saving a recording) and runs itself.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !tray::claim_single_instance() {
+        let failed = match tray::forward(&intent) {
+            Ok(tray::Forwarded::Taken) => return None,
+            Ok(tray::Forwarded::Closing) if intent == tray::Intent::Quit => return None,
+            Ok(tray::Forwarded::Closing) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(100));
+                continue;
+            }
+            Ok(tray::Forwarded::Closing) => "SnipScreen is still closing. Try again in a moment.".to_string(),
+            Err(e) => e,
+        };
+        if intent != tray::Intent::Quit {
+            win::error_box(&failed);
+        }
+        return None;
+    }
+    if intent == tray::Intent::Quit {
+        return None;
+    }
+    let waker: Arc<OnceLock<egui::Context>> = Arc::new(OnceLock::new());
+    let (tx, events) = channel();
+    let w = waker.clone();
+    let wake = move |e| {
+        let _ = tx.send(e);
+        if let Some(ctx) = w.get() {
+            wake_root(ctx);
+        }
+    };
+    let (agent, hotkey) = match tray::Agent::start(hotkey, true, wake) {
+        Ok(started) => (Some(started.agent), started.hotkey),
+        Err(e) => (None, Err(format!("Global shortcuts are off: {e}"))),
+    };
+    Some(Boot { agent, hotkey, events, waker, intent })
 }
 
 /// The window and taskbar icon: the 256 px render of `assets/snipscreen-icon.svg`, built into the binary.
@@ -1831,6 +1835,193 @@ fn app_icon() -> Result<egui::IconData, String> {
     }
     rgba.truncate(info.buffer_size());
     Ok(egui::IconData { rgba, width: info.width, height: info.height })
+}
+
+/// Snips kept in memory for a click on their notification, by count and by bytes (a 1080p
+/// full-screen snip is ~8 MB).
+const RECENT_SNIPS: usize = 10;
+const RECENT_BYTES: usize = 64 << 20;
+/// A notification leaves the screen after a few seconds and its snip is let go then; this is for
+/// the ones Windows never reports on (notifications held back by Do not disturb, say).
+const RECENT_AGE: Duration = Duration::from_secs(180);
+
+/// What background snip work reports to the shell.
+enum SnipEvent {
+    /// A snip read back from its file for a click on an older notification.
+    Loaded(Result<ColorImage, String>),
+    /// The notification for snip `id` couldn't be shown; `msg` says why and what copy/save did.
+    NotShown { id: u64, msg: String },
+    /// Snip `id`'s notification is up (or was replaced with one that tells what really happened).
+    Shown { id: u64, toast: notify::Shown },
+    /// Snip `id`'s notification left the screen.
+    Gone(u64),
+}
+
+/// A new snip's id: milliseconds since 1970, nudged up so two snips never share one, even across restarts.
+fn next_snip_id(last: u64, now: std::time::SystemTime) -> u64 {
+    let ms = now.duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
+    ms.max(last + 1)
+}
+
+/// The worker behind `App::notify_snip`. The notification goes up as soon as the preview is made,
+/// worded for copy and save going as asked; the PNG is encoded, copied and written alongside, and
+/// a notification that turns out wrong is replaced with one that says what failed. A click before
+/// the file is written opens the snip from memory. A snip that isn't auto-saved is kept in
+/// `recent`, so a click from the notification centre can still open it after a restart.
+fn deliver_by_notification(id: u64, image: &ColorImage, hwnd: isize, copy: bool, save_to: Option<Result<PathBuf, String>>, report: impl Fn(SnipEvent) + Clone + Send + 'static) {
+    let recent = notify::recent_dir();
+    // The file the link names, claimed now so the notification can name it before it is written.
+    let reserved = save_to.map(|to| to.and_then(|path| win::create_unique(&path)));
+    let planned: Option<Result<PathBuf, String>> = reserved.as_ref().map(|r| r.as_ref().map(|(p, _)| p.clone()).map_err(Clone::clone));
+    let kept = match &planned {
+        Some(Ok(_)) => None,
+        _ => recent.as_ref().map(|d| d.join(format!("snip-{id}.png"))),
+    };
+    let file = match (&planned, &kept) {
+        (Some(Ok(p)), _) | (_, Some(p)) => Some(p.clone()),
+        _ => None,
+    };
+    // The snip is let go once its notification has left the screen and its file is written, as a
+    // click from the notification centre then opens the file. With Do not disturb on, Windows
+    // reports the notification gone before the PNG is even encoded.
+    let (dismissed, written) = (Arc::new(std::sync::atomic::AtomicBool::new(false)), Arc::new(std::sync::atomic::AtomicBool::new(false)));
+    let gone = {
+        let (report, dismissed, written) = (report.clone(), dismissed.clone(), written.clone());
+        move || {
+            dismissed.store(true, std::sync::atomic::Ordering::SeqCst);
+            if written.load(std::sync::atomic::Ordering::SeqCst) {
+                report(SnipEvent::Gone(id));
+            }
+        }
+    };
+    let preview_path = recent.as_ref().map(|d| d.join(format!("preview-{id}.png")));
+    let (shown, files) = std::thread::scope(|s| {
+        let files = s.spawn(|| write_snip(image, hwnd, copy, reserved, kept.as_deref()));
+        let shown = match &file {
+            None => Err("couldn't find your local AppData folder".to_string()),
+            Some(file) => {
+                let preview = preview_path.and_then(|p| win::save_png(&p, &notify::preview_of(image)).ok().map(|_| p));
+                let (title, lines) = toast_text(&copy.then_some(Ok(())), &planned, None);
+                notify::Toast { title, lines, image: preview, launch: notify::open_link(id, file), tag: id.to_string() }.show(gone.clone()).map(|t| (t, file.clone()))
+            }
+        };
+        // A panic while encoding or writing counts as each job failing.
+        let files = files.join().unwrap_or_else(|_| {
+            let failed = "something went wrong".to_string();
+            Written { copied: copy.then(|| Err(failed.clone())), saved: planned.as_ref().map(|_| Err(failed.clone())), kept: kept.as_ref().map(|_| Err(failed.clone())) }
+        });
+        (shown, files)
+    });
+    let Written { copied, saved, kept } = files;
+    written.store(true, std::sync::atomic::Ordering::SeqCst);
+    if dismissed.load(std::sync::atomic::Ordering::SeqCst) {
+        report(SnipEvent::Gone(id));
+    }
+    match shown {
+        Err(e) => report(SnipEvent::NotShown { id, msg: not_shown(&e, copied, saved) }),
+        Ok((toast, file)) => {
+            report(SnipEvent::Shown { id, toast });
+            let went_wrong = matches!(copied, Some(Err(_))) || matches!((&planned, &saved), (Some(Ok(_)), Some(Err(_)))) || matches!(kept, Some(Err(_)));
+            if went_wrong {
+                let kept_err = kept.as_ref().and_then(|r| r.as_ref().err()).map(String::as_str);
+                let (title, lines) = toast_text(&copied, &saved, kept_err);
+                // The preview file is there by now; its picture stays.
+                let image = recent.as_ref().map(|d| d.join(format!("preview-{id}.png"))).filter(|p| p.exists());
+                match (notify::Toast { title, lines, image, launch: notify::open_link(id, &file), tag: id.to_string() }).show(gone) {
+                    Ok(toast) => report(SnipEvent::Shown { id, toast }),
+                    Err(e) => report(SnipEvent::NotShown { id, msg: not_shown(&e, copied, saved) }),
+                }
+            }
+        }
+    }
+    if let Some(dir) = &recent {
+        notify::prune_recent(dir);
+    }
+}
+
+/// What the automatic copy and save did with a new snip; `None` for a job that wasn't asked for.
+struct Delivered {
+    copied: Option<Result<(), String>>,
+    /// Where it was saved.
+    saved: Option<Result<PathBuf, String>>,
+}
+
+/// The snip as PNG, encoded once for both jobs, then copied and/or saved (to a new file) as asked.
+fn copy_and_save(hwnd: isize, image: &ColorImage, copy: bool, save_to: Option<Result<PathBuf, String>>) -> Delivered {
+    let png = win::encode_png(image);
+    let bytes = || png.as_ref().map_err(|e| format!("couldn't encode the snip: {e}"));
+    let copied = copy.then(|| bytes().and_then(|p| win::copy_image_with_png(hwnd as HWND, image, p)));
+    let saved = save_to.map(|to| to.and_then(|path| bytes().and_then(|p| win::save_new(&path, p))));
+    Delivered { copied, saved }
+}
+
+/// What `write_snip` did; `None` for a job that wasn't asked for.
+struct Written {
+    copied: Option<Result<(), String>>,
+    /// Into the reserved file in Pictures\Screenshots.
+    saved: Option<Result<PathBuf, String>>,
+    /// Into `recent`, for a snip that wasn't auto-saved.
+    kept: Option<Result<(), String>>,
+}
+
+/// The snip as PNG, encoded once, then copied and written into the files given.
+fn write_snip(image: &ColorImage, hwnd: isize, copy: bool, reserved: Option<Result<(PathBuf, std::fs::File), String>>, kept: Option<&std::path::Path>) -> Written {
+    let png = win::encode_png(image);
+    let bytes = || png.as_ref().map_err(|e| format!("couldn't encode the snip: {e}"));
+    let copied = copy.then(|| bytes().and_then(|p| win::copy_image_with_png(hwnd as HWND, image, p)));
+    let saved = reserved.map(|r| r.and_then(|(path, file)| fill(path, file, bytes())));
+    let kept = kept.map(|path| bytes().and_then(|p| std::fs::write(path, p).map_err(|e| format!("{}: {e}", path.display()))));
+    Written { copied, saved, kept }
+}
+
+/// Writes `bytes` into the new, empty `file` at `path`; on failure the empty file goes again.
+fn fill(path: PathBuf, mut file: std::fs::File, bytes: Result<&Vec<u8>, String>) -> Result<PathBuf, String> {
+    use std::io::Write;
+    let written = bytes.and_then(|b| file.write_all(b).map_err(|e| format!("{}: {e}", path.display())));
+    drop(file);
+    match written {
+        Ok(()) => Ok(path),
+        Err(e) => {
+            let _ = std::fs::remove_file(&path);
+            Err(e)
+        }
+    }
+}
+
+/// The editor's message when the notification failed: why, plus what copy and save did.
+fn not_shown(why: &str, copied: Option<Result<(), String>>, saved: Option<Result<PathBuf, String>>) -> String {
+    let mut msg = format!("Couldn't show the notification ({why}), so the snip opened here");
+    if let Some(note) = auto_note(copied, saved.map(|r| r.map(|_| ()))) {
+        msg.push_str(" · ");
+        msg.push_str(&note);
+    }
+    msg
+}
+
+/// A new snip's notification text: the title says what happened to it (copied, saved, or neither),
+/// the first line where it was saved and what failed, the last what a click does.
+fn toast_text(copied: &Option<Result<(), String>>, saved: &Option<Result<PathBuf, String>>, kept: Option<&str>) -> (String, Vec<String>) {
+    let title = match (copied, saved) {
+        (Some(Ok(())), _) => "Snip copied to clipboard",
+        (_, Some(Ok(_))) => "Snip saved",
+        _ => "Snip taken",
+    };
+    let mut status = Vec::new();
+    if let Some(Ok(p)) = saved {
+        status.push(format!("Saved to Pictures\\Screenshots as {}", p.file_name().map_or(String::new(), |n| n.to_string_lossy().into_owned())));
+    }
+    if let Some(Err(e)) = copied {
+        status.push(format!("Couldn't copy: {e}"));
+    }
+    if let Some(Err(e)) = saved {
+        status.push(format!("Couldn't auto-save: {e}"));
+    }
+    if let Some(e) = kept {
+        status.push(format!("Couldn't keep it for later: {e}"));
+    }
+    let mut lines: Vec<String> = (!status.is_empty()).then(|| status.join(" · ")).into_iter().collect();
+    lines.push("Select to mark it up".into());
+    (title.into(), lines)
 }
 
 /// Toast for a new snip's automatic copy and save; `None` when each job that ran succeeded and
@@ -1854,76 +2045,6 @@ fn auto_note(copied: Option<Result<(), String>>, saved: Option<Result<(), String
     (!parts.is_empty()).then(|| parts.join(" · "))
 }
 
-/// A popup that closes on a click outside lets that click through to whatever lies beneath it.
-/// This notices when a canvas click only dismissed a popup, so it doesn't also draw.
-#[derive(Default)]
-struct PopupClickGuard {
-    open_at_press: bool,
-}
-
-impl PopupClickGuard {
-    /// Call once per frame before any popup is shown: the press that starts a click sees the popups as they were.
-    fn begin_frame(&mut self, ctx: &egui::Context) {
-        if ctx.input(|i| i.pointer.any_pressed()) {
-            self.open_at_press = egui::Popup::is_any_open(ctx);
-        }
-    }
-
-    /// True for a click that was open at the press and is closed now. Drags leave the popup open, so they still draw.
-    fn swallows(&self, ctx: &egui::Context, clicked: bool) -> bool {
-        clicked && self.open_at_press && !egui::Popup::is_any_open(ctx)
-    }
-}
-
-const SCROLL_ID: &str = "snip_scroll";
-
-/// Where the canvas's scroll area is scrolled to, as of its last frame. Call from the `Ui` that holds it.
-fn scroll_offset(ui: &egui::Ui) -> Vec2 {
-    let id = ui.make_persistent_id(egui::IdSalt::new(SCROLL_ID));
-    egui::scroll_area::State::load(ui.ctx(), id).map_or(Vec2::ZERO, |s| s.clamped_offset())
-}
-
-/// Scroll offset that keeps the spot under `anchor` (relative to the view's corner) where it was when
-/// the snip is redrawn at `new_shown` instead of `old_shown`. The snip is centred in scrolling content
-/// that is its size plus `CANVAS_MARGIN`, or the whole view if that is larger. All values in points.
-fn anchored_offset(offset: Vec2, anchor: Vec2, old_shown: Vec2, new_shown: Vec2, view: Vec2) -> Vec2 {
-    let snip_corner = |shown: Vec2| ((shown + CANVAS_MARGIN).max(view) - shown) / 2.0;
-    let on_snip = (offset + anchor - snip_corner(old_shown)) / old_shown;
-    (snip_corner(new_shown) + on_snip * new_shown - anchor).max(Vec2::ZERO)
-}
-
-/// Explicit zoom limits. The floor gives way to a smaller fit, so zooming out from a very large
-/// snip never jumps up to the floor and enlarges it.
-fn clamp_zoom(zoom: f32, fit: f32) -> f32 {
-    zoom.clamp(MIN_ZOOM.min(fit), MAX_ZOOM)
-}
-
-fn zoom_label(zoom: f32) -> String {
-    // Zoom 1.0 is one screen pixel per snip pixel.
-    format!("{:.0}%", zoom * 100.0)
-}
-
-/// Current zoom in the bottom-right corner of the canvas, quiet enough to ignore.
-fn zoom_badge(painter: &egui::Painter, view: Rect, zoom: f32) {
-    let galley = painter.layout_no_wrap(zoom_label(zoom), FontId::proportional(11.0), ICON_OFF);
-    let rect = Rect::from_min_size(view.right_bottom() - galley.size() - vec2(20.0, 16.0), galley.size()).expand2(vec2(6.0, 2.0));
-    painter.rect_filled(rect, 4.0, TOOLBAR_BG.gamma_multiply(0.85));
-    painter.galley(rect.min + vec2(6.0, 2.0), galley, ICON_OFF);
-}
-
-/// Undoes or redoes one step. The pending crop box is in pixels of the image it was drawn on,
-/// and the restored image can be a different size, so the box is dropped rather than applied to it.
-/// A stroke still being drawn is in the old image's coordinates, so it is dropped as well.
-fn step_history(doc: &mut Doc, crop: &mut Option<(Pos2, Pos2)>, drawing: &mut Option<Stroke>, redo: bool) {
-    if redo {
-        doc.redo();
-    } else {
-        doc.undo();
-    }
-    *crop = None;
-    *drawing = None;
-}
-
 /// True on the frame the primary button comes up over `resp`. egui reports a press held longer than
 /// ~0.8 s or moved more than ~6 pt as a drag, not a click, and a still, slow press produces no frame
 /// that marks it a drag, so `clicked` and `drag_stopped` alone miss some releases.
@@ -1931,148 +2052,24 @@ fn released_on(ctx: &egui::Context, resp: &egui::Response) -> bool {
     resp.clicked() || resp.drag_stopped() || (ctx.input(|i| i.pointer.primary_released()) && resp.contains_pointer())
 }
 
-/// Narrowest editing window: wide enough for all three toolbar groups, but never wider than the
-/// monitor, where a window that cannot be reached edge to edge is worse than a crowded toolbar
-/// (`markup_x` packs the groups against each other when space runs short).
-fn edit_min_width(monitor_w: f32) -> f32 {
-    MIN_EDIT_W.min(monitor_w.max(MIN_WINDOW_W))
-}
-
-/// Window size that shows a snip of `snip` points with its chrome, kept within 85% of the monitor.
-fn edit_window_size(snip: Vec2, monitor: Vec2) -> Vec2 {
-    let min = vec2(edit_min_width(monitor.x), 440.0);
-    (snip + vec2(48.0, 120.0)).clamp(min, (monitor * 0.85).max(min))
-}
-
-/// Left edge of the markup group: centred in the toolbar when it fits clear of the capture and
-/// output groups, otherwise pushed right up against the capture group.
-fn markup_x(center: f32, width: f32, left_end: f32, right_start: f32) -> f32 {
-    (center - width / 2.0).min(right_start - GROUP_GAP - width).max(left_end + GROUP_GAP)
-}
-
-/// Editor shortcuts pressed this frame.
-#[derive(Debug, Default, PartialEq)]
-struct Keys {
-    new: bool,
-    save: bool,
-    undo: bool,
-    redo: bool,
-    copy: bool,
-    enter: bool,
-    esc: bool,
-    zoom_in: bool,
-    zoom_out: bool,
-    zoom_fit: bool,
-}
-
-impl Keys {
-    /// The countdown owns the window until it ends: New restarts it and Esc cancels it (see `tick_countdown`);
-    /// everything else would edit, save or zoom a snip that is about to be replaced.
-    fn during_countdown(self) -> Keys {
-        Keys { new: self.new, esc: self.esc, ..Keys::default() }
-    }
-}
-
 /// Esc is grabbed system-wide only while a countdown is running.
 fn wants_escape_hotkey(stage: &Stage) -> bool {
     matches!(stage, Stage::Counting { .. })
 }
 
-/// True if anything arrived on the channel; empties it.
-fn drain(rx: &Receiver<()>) -> bool {
-    rx.try_iter().count() > 0
-}
-
-/// Esc cancels the innermost thing: an open popup or menu closes itself on Esc, so while one is open
-/// the key is left alone, and otherwise it is consumed so only one action reacts to it.
-fn take_escape(ctx: &egui::Context) -> bool {
-    let popup_open = egui::Popup::is_any_open(ctx);
-    ctx.input_mut(|i| escape_for_app(i, popup_open))
-}
-
-fn escape_for_app(i: &mut egui::InputState, popup_open: bool) -> bool {
-    !popup_open && i.consume_key(Modifiers::NONE, Key::Escape)
-}
-
-/// `popup_open`: a popup or menu is showing. `focused`: a widget holds keyboard focus.
-fn read_keys(i: &mut egui::InputState, popup_open: bool, focused: bool) -> Keys {
-    let cmd = |k| KeyboardShortcut::new(Modifiers::COMMAND, k);
-    // egui ignores an extra Shift when matching, so Ctrl+Shift+Z must be
-    // consumed before Ctrl+Z or it would undo.
-    let redo_shift = i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::SHIFT, Key::Z));
-    let zoom_in_plus = i.consume_shortcut(&cmd(Key::Plus));
-    let zoom_in_equals = i.consume_shortcut(&cmd(Key::Equals));
-    Keys {
-        new: i.consume_shortcut(&cmd(Key::N)),
-        save: i.consume_shortcut(&cmd(Key::S)),
-        undo: i.consume_shortcut(&cmd(Key::Z)),
-        redo: redo_shift | i.consume_shortcut(&cmd(Key::Y)),
-        // egui turns Ctrl+C into a Copy event rather than a key press.
-        copy: i.events.iter().any(|e| matches!(e, Event::Copy)),
-        // Enter applies the crop only when nothing else claims it: with a button focused it activates that button.
-        enter: !popup_open && !focused && i.consume_key(Modifiers::NONE, Key::Enter),
-        esc: escape_for_app(i, popup_open),
-        zoom_in: zoom_in_plus | zoom_in_equals,
-        zoom_out: i.consume_shortcut(&cmd(Key::Minus)),
-        zoom_fit: i.consume_shortcut(&cmd(Key::Num0)),
-    }
-}
-
-fn icon_button(ui: &mut egui::Ui, icon: Icon, ink: Option<Color32>, selected: bool, enabled: bool, tip: &str) -> egui::Response {
-    let (rect, resp) = ui.allocate_exact_size(BTN, if enabled { Sense::click() } else { Sense::hover() });
-    let p = ui.painter();
-    if selected {
-        p.rect(rect, 4.0, BUTTON_BG, (1.0, OUTLINE), StrokeKind::Inside);
-    } else if enabled && resp.hovered() {
-        p.rect_filled(rect, 4.0, BUTTON_BG);
-    }
-    let color = if enabled { ICON } else { ICON_OFF };
-    icons::paint(p, Rect::from_center_size(rect.center(), vec2(20.0, 20.0)), icon, color, ink);
-    resp.on_hover_text(tip)
-}
 
 /// The New button's tooltip; the global shortcut is only advertised while it is registered.
 /// `note` is why it isn't (none in a screenshot run, which never tries).
-fn new_tooltip(mode: Mode, hotkey_registered: bool, note: Option<&str>) -> String {
+fn new_tooltip(mode: Mode, hotkey: Option<&str>, note: Option<&str>) -> String {
     let what = match mode {
         Mode::Photo => "New snip",
         Mode::Video => "New recording",
     };
-    match (hotkey_registered, note) {
-        (true, _) => format!("{what} (Ctrl+N, or Alt+Shift+S anywhere)"),
-        (false, Some(why)) => format!("{what} (Ctrl+N). {why}"),
-        (false, None) => format!("{what} (Ctrl+N)"),
+    match (hotkey, note) {
+        (Some(key), _) => format!("{what} (Ctrl+N, or {key} anywhere)"),
+        (None, Some(why)) => format!("{what} (Ctrl+N). {why}"),
+        (None, None) => format!("{what} (Ctrl+N)"),
     }
-}
-
-/// Where the toast sits: bottom centre, except over the video view, whose Play
-/// and "Show in folder" buttons live down there, so it drops from the top of the content instead.
-fn toast_anchor(video_top: Option<f32>) -> (Align2, Vec2) {
-    match video_top {
-        Some(top) => (Align2::CENTER_TOP, vec2(0.0, top + 8.0)),
-        None => (Align2::CENTER_BOTTOM, vec2(0.0, -20.0)),
-    }
-}
-
-/// Icon plus a small chevron; `badge` writes a number by the icon (timer seconds).
-fn dropdown(ui: &mut egui::Ui, icon: Icon, badge: Option<u64>) -> egui::Response {
-    let (rect, resp) = ui.allocate_exact_size(vec2(52.0, BTN.y), Sense::click());
-    let p = ui.painter();
-    if resp.hovered() {
-        p.rect_filled(rect, 4.0, BUTTON_BG);
-    }
-    let icon_rect = Rect::from_center_size(rect.left_center() + vec2(18.0, 0.0), vec2(20.0, 20.0));
-    icons::paint(p, icon_rect, icon, ICON, None);
-    icons::paint(p, Rect::from_center_size(rect.right_center() - vec2(13.0, 0.0), vec2(12.0, 12.0)), Icon::Chevron, ICON, None);
-    if let Some(n) = badge {
-        p.text(icon_rect.right_bottom() + vec2(1.0, 2.0), Align2::CENTER_BOTTOM, n.to_string(), FontId::proportional(10.0), ACCENT);
-    }
-    resp
-}
-
-fn divider(ui: &mut egui::Ui) {
-    let (rect, _) = ui.allocate_exact_size(vec2(DIVIDER_W, BTN.y), Sense::hover());
-    ui.painter().line_segment([rect.center_top() + vec2(0.0, 7.0), rect.center_bottom() - vec2(0.0, 7.0)], (1.0, DIVIDER));
 }
 
 /// A see-through, click-through window with a dashed outline just outside
@@ -2097,15 +2094,8 @@ fn area_outline(ctx: &egui::Context, [x, y, w, h]: [i32; 4]) {
             win::exclude_from_capture(hwnd, true);
             win::fit_client(hwnd, x - PAD, y - PAD, w + 2 * PAD, h + 2 * PAD);
         }
-        let r = ui.max_rect().shrink(1.5);
-        let p = ui.painter();
-        let dash = |a: Pos2, b: Pos2| {
-            p.add(Shape::dashed_line(&[a, b], (2.0, Color32::from_white_alpha(230)), 7.0, 5.0));
-        };
-        dash(r.left_top(), r.right_top());
-        dash(r.right_top(), r.right_bottom());
-        dash(r.right_bottom(), r.left_bottom());
-        dash(r.left_bottom(), r.left_top());
+        // The window reaches PAD pixels past the area on every side; the dashes go just outside it.
+        widgets::dashed_outline(ui.painter(), ui.max_rect().shrink(PAD as f32 / ui.ctx().pixels_per_point()));
     });
 }
 
@@ -2123,6 +2113,7 @@ fn bar_position(area: [i32; 4], work: [i32; 4], bw: i32, bh: i32) -> (i32, i32) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use eframe::egui::Event;
 
     #[test]
     fn recording_bar_fits_every_control_at_fractional_scales() {
@@ -2136,29 +2127,57 @@ mod tests {
     }
 
     #[test]
-    fn note_clock_starts_when_first_drawn() {
-        let mut n = Note::new("x".into());
-        // Raised at t=0 but only drawn from t=100: it still gets its full time.
-        assert!(n.visible(100.0));
-        assert!(n.visible(100.0 + NOTE_SECS));
-        assert!(!n.visible(100.0 + NOTE_SECS + 0.01));
-    }
-
-    #[test]
     fn new_tooltip_only_promises_a_registered_hotkey() {
-        assert_eq!(new_tooltip(Mode::Photo, true, None), "New snip (Ctrl+N, or Alt+Shift+S anywhere)");
-        assert_eq!(new_tooltip(Mode::Video, true, None), "New recording (Ctrl+N, or Alt+Shift+S anywhere)");
-        let taken = new_tooltip(Mode::Photo, false, Some("Alt+Shift+S is already used by another app"));
+        assert_eq!(new_tooltip(Mode::Photo, Some("Alt+Shift+S"), None), "New snip (Ctrl+N, or Alt+Shift+S anywhere)");
+        assert_eq!(new_tooltip(Mode::Video, Some("Ctrl+F12"), None), "New recording (Ctrl+N, or Ctrl+F12 anywhere)");
+        let taken = new_tooltip(Mode::Photo, None, Some("Alt+Shift+S is already used by another app"));
         assert_eq!(taken, "New snip (Ctrl+N). Alt+Shift+S is already used by another app");
-        assert!(!new_tooltip(Mode::Video, false, None).contains("Alt+Shift+S"));
+        assert!(!new_tooltip(Mode::Video, None, None).contains("Alt+Shift+S"));
+    }
+
+    /// A worker that finishes while an editor's pass runs must still wake the root, which reads the
+    /// channels. The pass below is an editor's own, as eframe runs it for a deferred viewport.
+    #[test]
+    fn workers_wake_the_root_even_during_another_windows_pass() {
+        let ctx = egui::Context::default();
+        let woken = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = woken.clone();
+        ctx.set_repaint_observer(move |info| log.lock().unwrap().push(info.viewport_id));
+        let editor = ViewportId::from_hash_of("an editor");
+        let mut plain_went_to = Vec::new();
+        let mut input = egui::RawInput { viewport_id: editor, ..Default::default() };
+        input.viewports.insert(editor, egui::ViewportInfo::default());
+        let mut out = ctx.run_ui(input, |ui| {
+            woken.lock().unwrap().clear();
+            let (plain, root) = (ui.ctx().clone(), ui.ctx().clone());
+            std::thread::spawn(move || plain.request_repaint()).join().unwrap();
+            plain_went_to = woken.lock().unwrap().split_off(0);
+            std::thread::spawn(move || wake_root(&root)).join().unwrap();
+        });
+        out.textures_delta.clear();
+        assert_eq!(plain_went_to, [editor], "the trap: a bare request_repaint goes to the window in its pass");
+        assert!(woken.lock().unwrap().starts_with(&[ViewportId::ROOT]), "{:?}", woken.lock().unwrap());
     }
 
     #[test]
-    fn toast_leaves_the_video_buttons_alone() {
-        assert_eq!(toast_anchor(None), (Align2::CENTER_BOTTOM, vec2(0.0, -20.0)));
-        let (align, offset) = toast_anchor(Some(48.0));
-        assert_eq!(align, Align2::CENTER_TOP);
-        assert!(offset.y > 48.0, "below the toolbar");
+    fn quick_startup_toggles_end_as_the_setting_says() {
+        let applied = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = applied.clone();
+        let (tx, rx) = channel();
+        let report = Notifier::new(tx, egui::Context::default(), ViewportId::ROOT);
+        let entry = StartupEntry::new(report, move |on| {
+            std::thread::sleep(Duration::from_millis(20));
+            log.lock().unwrap().push(on);
+            if on { Ok(()) } else { Err("access denied".into()) }
+        });
+        for on in [true, false, true, false, true] {
+            entry.set(on);
+        }
+        drop(entry);
+        let applied = applied.lock().unwrap();
+        assert_eq!(applied.last(), Some(&true), "the newest choice is applied last: {applied:?}");
+        assert!(applied.len() < 5, "a burst collapses: {applied:?}");
+        assert!(rx.try_iter().all(|m| m == "Couldn't update starting with Windows: access denied"));
     }
 
     #[test]
@@ -2170,94 +2189,6 @@ mod tests {
         assert_eq!(countdown_secs(ms(2000)), Some(2));
         assert_eq!(countdown_secs(ms(1)), Some(1));
         assert_eq!(countdown_secs(Duration::ZERO), None);
-    }
-
-    #[test]
-    fn undo_and_redo_drop_the_pending_crop_box() {
-        let mut doc = Doc::new(ColorImage::new([100, 80], vec![Color32::WHITE; 8000]));
-        doc.crop(Rect::from_min_max(pos2(10.0, 10.0), pos2(60.0, 50.0)));
-        assert_eq!(doc.size(), [50, 40]);
-        let box_on_cropped = Some((pos2(5.0, 5.0), pos2(45.0, 35.0)));
-
-        let mut crop = box_on_cropped;
-        step_history(&mut doc, &mut crop, &mut None, false);
-        assert_eq!(doc.size(), [100, 80], "undo restores the larger image");
-        assert_eq!(crop, None, "the 50x40 box must not carry over to the 100x80 image");
-
-        let mut crop = Some((pos2(80.0, 60.0), pos2(99.0, 79.0)));
-        step_history(&mut doc, &mut crop, &mut None, true);
-        assert_eq!(doc.size(), [50, 40], "redo re-crops");
-        assert_eq!(crop, None, "a box drawn on the large image would fall outside the small one");
-    }
-
-    #[test]
-    fn anchored_offset_keeps_the_anchor_on_the_same_spot_of_the_snip() {
-        let view = vec2(400.0, 300.0);
-        let (old, new) = (vec2(800.0, 600.0), vec2(1000.0, 750.0));
-        // Anchor at the view centre with the snip scrolled to (150, 120): that spot is 40% across, 50% down... recompute from the definition.
-        let (offset, anchor) = (vec2(150.0, 120.0), vec2(200.0, 150.0));
-        let got = anchored_offset(offset, anchor, old, new, view);
-        // The snip's corner sits at 16 in content space at both sizes (800+32 vs 1000+32 wide), so only the
-        // scale about the anchor matters: new = (offset + anchor - 16) * 1.25 + 16 - anchor.
-        assert_eq!(got, vec2((150.0 + 200.0 - 16.0) * 1.25 + 16.0 - 200.0, (120.0 + 150.0 - 16.0) * 1.25 + 16.0 - 150.0));
-    }
-
-    #[test]
-    fn anchored_offset_never_goes_negative_and_handles_a_snip_smaller_than_the_view() {
-        let view = vec2(400.0, 300.0);
-        // Zooming out about the far corner of the view would ask for a negative offset.
-        let off = anchored_offset(Vec2::ZERO, view - vec2(10.0, 10.0), vec2(1000.0, 800.0), vec2(200.0, 150.0), view);
-        assert_eq!(off, Vec2::ZERO);
-        // A snip that fits is centred, so growing it about the view centre keeps the centre.
-        let off = anchored_offset(Vec2::ZERO, view / 2.0, vec2(100.0, 100.0), vec2(200.0, 200.0), view);
-        assert_eq!(off, Vec2::ZERO);
-    }
-
-    /// Runs the canvas's scroll-area layout for one frame (viewport 400x300), optionally forcing the offset, and returns the offset it ends with.
-    fn scroll_frame(ctx: &egui::Context, shown: Vec2, force: Option<Vec2>) -> Vec2 {
-        let view = vec2(400.0, 300.0);
-        let input = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, view)), ..Default::default() };
-        let mut offset = Vec2::ZERO;
-        let mut out = ctx.run_ui(input, |ui| {
-            egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| {
-                let mut area = egui::ScrollArea::both().id_salt(SCROLL_ID).auto_shrink(false);
-                if let Some(f) = force {
-                    area = area.scroll_offset(f);
-                }
-                area.show(ui, |ui| {
-                    ui.allocate_exact_size((shown + CANVAS_MARGIN).max(view), Sense::click_and_drag());
-                });
-                offset = scroll_offset(ui);
-            });
-        });
-        out.textures_delta.clear();
-        offset
-    }
-
-    #[test]
-    fn zooming_through_the_scroll_area_leaves_the_anchored_spot_in_place() {
-        let (view, anchor) = (vec2(400.0, 300.0), vec2(120.0, 90.0));
-        let sizes = [vec2(800.0, 600.0), vec2(1000.0, 750.0), vec2(500.0, 375.0), vec2(200.0, 150.0)];
-        // The last pair grows a snip that fit the view, whose scroll range egui last measured as empty.
-        for (old, new) in [(sizes[0], sizes[1]), (sizes[1], sizes[2]), (sizes[0], sizes[2]), (sizes[3], sizes[1])] {
-            let ctx = egui::Context::default();
-            // Let egui learn the content size before scrolling, as it has by the time the user zooms.
-            for _ in 0..3 {
-                scroll_frame(&ctx, old, None);
-            }
-            scroll_frame(&ctx, old, Some(vec2(150.0, 120.0)));
-            let start = scroll_frame(&ctx, old, None);
-            let want = anchored_offset(start, anchor, old, new, view);
-            let got = scroll_frame(&ctx, new, Some(want));
-            assert!((got - want).length() < 0.5, "egui moved the offset from {want:?} to {got:?} zooming {old:?} -> {new:?}");
-        }
-    }
-
-    #[test]
-    fn zoom_label_is_a_whole_percent() {
-        assert_eq!(zoom_label(1.0), "100%");
-        assert_eq!(zoom_label(0.625), "62%");
-        assert_eq!(zoom_label(8.0), "800%");
     }
 
     /// Frames of a press-move-release on a fresh widget; returns whether `released_on` fired on any of them.
@@ -2304,162 +2235,6 @@ mod tests {
         assert!(release_detected(0.2, 20.0), "moved past the click distance");
     }
 
-    /// Keys seen by `read_keys` in one frame after pressing `key` with `mods`.
-    fn press(key: Key, mods: Modifiers) -> Keys {
-        press_in(key, mods, false, false)
-    }
-
-    /// Like `press`, with a popup open and/or a widget focused.
-    fn press_in(key: Key, mods: Modifiers, popup_open: bool, focused: bool) -> Keys {
-        let ctx = egui::Context::default();
-        let input = egui::RawInput {
-            events: vec![Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: mods }],
-            ..Default::default()
-        };
-        let mut keys = Keys::default();
-        let mut out = ctx.run_ui(input, |ui| keys = ui.ctx().input_mut(|i| read_keys(i, popup_open, focused)));
-        out.textures_delta.clear();
-        keys
-    }
-
-    #[test]
-    fn esc_and_enter_act_when_nothing_else_wants_them() {
-        assert_eq!(press(Key::Escape, Modifiers::NONE), Keys { esc: true, ..Default::default() });
-        assert_eq!(press(Key::Enter, Modifiers::NONE), Keys { enter: true, ..Default::default() });
-    }
-
-    #[test]
-    fn esc_is_left_to_an_open_popup() {
-        assert_eq!(press_in(Key::Escape, Modifiers::NONE, true, false), Keys::default());
-    }
-
-    #[test]
-    fn enter_is_left_to_an_open_popup_or_a_focused_widget() {
-        assert_eq!(press_in(Key::Enter, Modifiers::NONE, true, false), Keys::default());
-        assert_eq!(press_in(Key::Enter, Modifiers::NONE, false, true), Keys::default());
-    }
-
-    #[test]
-    fn esc_still_cancels_with_a_widget_focused() {
-        // egui drops keyboard focus on Esc itself, so a focused button must not hold the key back.
-        assert_eq!(press_in(Key::Escape, Modifiers::NONE, false, true), Keys { esc: true, ..Default::default() });
-    }
-
-    #[test]
-    fn esc_is_consumed_so_a_second_reader_does_not_also_act() {
-        let ctx = egui::Context::default();
-        let input = egui::RawInput {
-            events: vec![Event::Key { key: Key::Escape, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE }],
-            ..Default::default()
-        };
-        let (mut first, mut second) = (false, false);
-        let mut out = ctx.run_ui(input, |ui| {
-            first = take_escape(ui.ctx());
-            second = take_escape(ui.ctx());
-        });
-        out.textures_delta.clear();
-        assert!(first && !second);
-    }
-
-    #[test]
-    fn markup_group_never_overlaps_its_neighbours() {
-        // Group widths as laid out by `toolbar`: capture 298, output 133, markup with crop buttons 350.
-        let (left_end, out_w, width) = (12.0 + 298.0, 133.0, 350.0);
-        for window in [MIN_EDIT_W as i32, 900, 1200, 2000] {
-            let row_end = window as f32 - 12.0;
-            let right_start = row_end - out_w;
-            let x = markup_x((12.0 + row_end) / 2.0, width, left_end, right_start);
-            assert!(x >= left_end + GROUP_GAP, "overlaps capture group at {window}");
-            assert!(x + width <= right_start - GROUP_GAP, "overlaps output group at {window}");
-        }
-    }
-
-    #[test]
-    fn markup_group_centres_when_room_and_hugs_the_capture_group_otherwise() {
-        assert_eq!(markup_x(500.0, 200.0, 100.0, 900.0), 400.0);
-        assert_eq!(markup_x(500.0, 300.0, 100.0, 600.0), 284.0, "pushed left by the output group");
-        assert_eq!(markup_x(500.0, 800.0, 100.0, 1000.0), 116.0, "pulled right by the capture group");
-    }
-
-    /// One frame of a toolbar with a click-outside popup over a canvas; returns whether the canvas would draw.
-    fn popup_frame(ctx: &egui::Context, guard: &mut PopupClickGuard, events: Vec<Event>, open: bool) -> bool {
-        let input = egui::RawInput {
-            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(800.0, 600.0))),
-            events,
-            ..Default::default()
-        };
-        let mut draws = false;
-        let mut out = ctx.run_ui(input, |ui| {
-            guard.begin_frame(ui.ctx());
-            egui::Panel::top("t").show(ui, |ui| {
-                let pen = ui.button("pen");
-                egui::Popup::from_response(&pen)
-                    .open_memory(open.then_some(egui::SetOpenCommand::Bool(true)))
-                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
-                    .show(|ui| ui.label("options"));
-            });
-            egui::CentralPanel::default().show(ui, |ui| {
-                let resp = ui.allocate_response(ui.available_size(), Sense::click_and_drag());
-                draws = (resp.clicked() || resp.drag_started()) && !guard.swallows(ui.ctx(), resp.clicked());
-            });
-        });
-        out.textures_delta.clear();
-        draws
-    }
-
-    fn click(ctx: &egui::Context, guard: &mut PopupClickGuard, at: Pos2) -> bool {
-        let btn = |pressed| Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
-        popup_frame(ctx, guard, vec![Event::PointerMoved(at)], false);
-        popup_frame(ctx, guard, vec![btn(true)], false);
-        popup_frame(ctx, guard, vec![btn(false)], false)
-    }
-
-    #[test]
-    fn click_that_closes_a_popup_does_not_draw() {
-        let (ctx, mut guard) = (egui::Context::default(), PopupClickGuard::default());
-        for _ in 0..3 {
-            popup_frame(&ctx, &mut guard, vec![], false);
-        }
-        popup_frame(&ctx, &mut guard, vec![], true);
-        popup_frame(&ctx, &mut guard, vec![], false);
-        assert!(egui::Popup::is_any_open(&ctx), "popup should be open before the click");
-        assert!(!click(&ctx, &mut guard, pos2(400.0, 400.0)), "the dismissing click must not reach the canvas");
-        assert!(!egui::Popup::is_any_open(&ctx), "click outside should have closed the popup");
-        assert!(click(&ctx, &mut guard, pos2(400.0, 400.0)), "the next click draws as usual");
-    }
-
-    #[test]
-    fn esc_closes_an_open_popup_first_and_cancels_only_on_the_next_press() {
-        let ctx = egui::Context::default();
-        let esc = || Event::Key { key: Key::Escape, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE };
-        // Same order as `ui`: the shortcut reader runs before the toolbar shows the popup.
-        let frame = |events: Vec<Event>, open: bool| {
-            let input = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(800.0, 600.0))), events, ..Default::default() };
-            let mut cancels = false;
-            let mut out = ctx.run_ui(input, |ui| {
-                cancels = take_escape(ui.ctx());
-                egui::Panel::top("t").show(ui, |ui| {
-                    let b = ui.button("menu");
-                    egui::Popup::from_response(&b)
-                        .open_memory(open.then_some(egui::SetOpenCommand::Bool(true)))
-                        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
-                        .show(|ui| ui.label("options"));
-                });
-            });
-            out.textures_delta.clear();
-            cancels
-        };
-        for _ in 0..3 {
-            frame(vec![], false);
-        }
-        frame(vec![], true);
-        frame(vec![], false);
-        assert!(egui::Popup::is_any_open(&ctx), "popup should be open");
-        assert!(!frame(vec![esc()], false), "first Esc belongs to the popup");
-        assert!(!egui::Popup::is_any_open(&ctx), "and it closed the popup");
-        assert!(frame(vec![esc()], false), "second Esc cancels");
-    }
-
     #[test]
     fn auto_note_reports_what_each_job_did() {
         let ok = || Some(Ok(()));
@@ -2476,13 +2251,92 @@ mod tests {
     }
 
     #[test]
-    fn only_new_and_esc_act_during_a_countdown() {
-        let all = Keys { new: true, save: true, undo: true, redo: true, copy: true, enter: true, esc: true, zoom_in: true, zoom_out: true, zoom_fit: true };
-        assert_eq!(all.during_countdown(), Keys { new: true, esc: true, ..Default::default() });
-        for keys in [press(Key::S, Modifiers::COMMAND), press(Key::Z, Modifiers::COMMAND), press(Key::Enter, Modifiers::NONE), press(Key::Plus, Modifiers::COMMAND)] {
-            assert_eq!(keys.during_countdown(), Keys::default());
-        }
-        assert_eq!(press(Key::N, Modifiers::COMMAND).during_countdown(), Keys { new: true, ..Default::default() });
+    fn notification_text_is_truthful_about_copy_and_save() {
+        let ok = || Some(Ok(()));
+        let saved = || Some(Ok(PathBuf::from(r"C:\Users\a\Pictures\Screenshots\Snip 2026-11-05 141530.png")));
+        let hint = "Select to mark it up".to_string();
+        let as_saved = "Saved to Pictures\\Screenshots as Snip 2026-11-05 141530.png".to_string();
+        assert_eq!(toast_text(&ok(), &saved(), None), ("Snip copied to clipboard".into(), vec![as_saved.clone(), hint.clone()]));
+        assert_eq!(toast_text(&ok(), &None, None), ("Snip copied to clipboard".into(), vec![hint.clone()]));
+        assert_eq!(toast_text(&None, &saved(), None), ("Snip saved".into(), vec![as_saved.clone(), hint.clone()]));
+        assert_eq!(toast_text(&None, &None, None), ("Snip taken".into(), vec![hint.clone()]));
+        assert_eq!(toast_text(&Some(Err("busy".into())), &saved(), None), ("Snip saved".into(), vec![format!("{as_saved} · Couldn't copy: busy"), hint.clone()]));
+        assert_eq!(
+            toast_text(&ok(), &Some(Err("disk full".into())), None),
+            ("Snip copied to clipboard".into(), vec!["Couldn't auto-save: disk full".into(), hint.clone()])
+        );
+        assert_eq!(toast_text(&Some(Err("busy".into())), &Some(Err("disk full".into())), None).0, "Snip taken");
+        assert_eq!(
+            toast_text(&ok(), &None, Some("access denied")),
+            ("Snip copied to clipboard".into(), vec!["Couldn't keep it for later: access denied".into(), hint.clone()]),
+            "an unsaved snip that couldn't be kept is reported"
+        );
+    }
+
+    #[test]
+    fn a_link_never_turns_into_flags() {
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let (shot, intent) = parse_args(&args(&["--open-link", "snipscreen:open?id=1&path=x", "--screenshot", "C:\\evil.png", "--quit"])).unwrap();
+        assert!(shot.is_none(), "--screenshot after a link is part of nothing");
+        assert_eq!(intent, tray::Intent::Open("snipscreen:open?id=1&path=x".into()));
+        let (shot, intent) = parse_args(&args(&["--open-link"])).unwrap();
+        assert!(shot.is_none());
+        assert_eq!(intent, tray::Intent::Open(String::new()), "an empty link opens nothing later");
+        // Only in first place does it mean anything; a bare link is never opened.
+        let (_, intent) = parse_args(&args(&["--tray", "--open-link", "snipscreen:open?id=1&path=x"])).unwrap();
+        assert_eq!(intent, tray::Intent::Tray);
+        assert_eq!(parse_args(&args(&["snipscreen:open?id=1&path=x"])).unwrap().1, tray::Intent::Show);
+        assert!(matches!(parse_args(&args(&["--screenshot", "a.png"])), Ok((Some(Shot::Home(_)), tray::Intent::Show))));
+        assert!(parse_args(&args(&["--screenshot"])).is_err());
+    }
+
+    #[test]
+    fn snip_ids_never_repeat() {
+        let t = std::time::UNIX_EPOCH + Duration::from_millis(1_000);
+        assert_eq!(next_snip_id(0, t), 1_000);
+        assert_eq!(next_snip_id(1_000, t), 1_001, "two snips in one millisecond");
+        assert_eq!(next_snip_id(5_000, t), 5_001, "the clock went back");
+    }
+
+    #[test]
+    fn one_png_serves_both_the_clipboard_and_the_files() {
+        let dir = std::env::temp_dir().join(format!("snipscreen-deliver-{}", std::process::id()));
+        let img = ColorImage::new([4, 3], vec![Color32::from_rgb(1, 2, 3); 12]);
+        let reserved = win::create_unique(&dir.join("Snip.png"));
+        let Written { copied, saved, kept } = write_snip(&img, 0, false, Some(reserved), Some(&dir.join("snip-1.png")));
+        let on_disk = saved.as_ref().and_then(|r| r.as_ref().ok()).and_then(|p| std::fs::read(p).ok());
+        let also = std::fs::read(dir.join("snip-1.png")).ok();
+        let failed = write_snip(&img, 0, false, Some(Err("couldn't find your Pictures folder".into())), Some(&dir.join("no-such-dir").join("x.png")));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(copied.is_none(), "copy wasn't asked for");
+        assert_eq!(on_disk, win::encode_png(&img).ok(), "the saved file is the encoded PNG");
+        assert_eq!((kept, also), (Some(Ok(())), on_disk));
+        assert_eq!(failed.saved, Some(Err("couldn't find your Pictures folder".into())));
+        assert!(matches!(failed.kept, Some(Err(e)) if e.contains("x.png")), "a snip that can't be kept says so");
+    }
+
+    #[test]
+    fn the_editor_path_saves_the_encoded_png() {
+        let dir = std::env::temp_dir().join(format!("snipscreen-save-{}", std::process::id()));
+        let img = ColorImage::new([4, 3], vec![Color32::from_rgb(1, 2, 3); 12]);
+        let Delivered { copied, saved } = copy_and_save(0, &img, false, Some(Ok(dir.join("Snip.png"))));
+        let on_disk = saved.as_ref().and_then(|r| r.as_ref().ok()).and_then(|p| std::fs::read(p).ok());
+        let failed = copy_and_save(0, &img, false, Some(Err("couldn't find your Pictures folder".into()))).saved;
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(copied.is_none(), "copy wasn't asked for");
+        assert_eq!(on_disk, win::encode_png(&img).ok());
+        assert_eq!(failed, Some(Err("couldn't find your Pictures folder".into())));
+    }
+
+    #[test]
+    fn a_reserved_file_that_cant_be_filled_is_removed() {
+        let dir = std::env::temp_dir().join(format!("snipscreen-fill-{}", std::process::id()));
+        let (path, file) = win::create_unique(&dir.join("Snip.png")).unwrap();
+        let r = fill(path.clone(), file, Err("couldn't encode the snip: boom".into()));
+        let left = path.exists();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(r, Err("couldn't encode the snip: boom".into()));
+        assert!(!left, "no empty file stays behind");
     }
 
     #[test]
@@ -2494,60 +2348,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn drain_reports_and_empties_pending_global_esc_presses() {
-        let (tx, rx) = channel();
-        assert!(!drain(&rx));
-        tx.send(()).unwrap();
-        tx.send(()).unwrap();
-        assert!(drain(&rx));
-        assert!(!drain(&rx), "a press must be reported once");
-    }
-
-    #[test]
-    fn zoom_out_never_enlarges_a_snip_that_fits_below_the_floor() {
-        // Fit 3%: the 5% floor would make zooming out grow the snip.
-        let fit = 0.03;
-        assert!(clamp_zoom(fit / ZOOM_STEP, fit) <= fit);
-        assert_eq!(clamp_zoom(fit * ZOOM_STEP, fit), fit * ZOOM_STEP, "zooming in works as usual");
-        // Normal fit: the floor and ceiling hold.
-        assert_eq!(clamp_zoom(0.01, 0.5), MIN_ZOOM);
-        assert_eq!(clamp_zoom(100.0, 0.5), MAX_ZOOM);
-    }
-
-    #[test]
-    fn editing_window_fits_a_narrow_monitor() {
-        // 1280 px panel at 175% scaling is 731 pt wide.
-        let monitor = vec2(731.0, 411.0);
-        let size = edit_window_size(vec2(2000.0, 1000.0), monitor);
-        assert!(size.x <= monitor.x, "window must fit the monitor width, got {}", size.x);
-        assert_eq!(edit_min_width(731.0), 731.0);
-        assert_eq!(edit_min_width(1920.0), MIN_EDIT_W, "a wide monitor keeps the full toolbar width");
-        assert_eq!(edit_min_width(300.0), MIN_WINDOW_W, "never below the plain window minimum");
-        // Wide monitors are unchanged: snip plus chrome, clamped to 85% of the monitor.
-        let wide = vec2(1920.0, 1080.0);
-        assert_eq!(edit_window_size(vec2(100.0, 100.0), wide), vec2(MIN_EDIT_W, 440.0));
-        assert_eq!(edit_window_size(vec2(5000.0, 5000.0), wide), wide * 0.85);
-    }
-
-    #[test]
-    fn markup_group_survives_a_window_narrower_than_the_toolbar() {
-        let (left_end, out_w, width) = (12.0 + 298.0, 133.0, 350.0);
-        for window in [520.0_f32, 600.0, 731.0] {
-            let row_end = window - 12.0;
-            let x = markup_x((12.0 + row_end) / 2.0, width, left_end, row_end - out_w);
-            assert!(x.is_finite() && x >= left_end + GROUP_GAP, "packs against the capture group at {window}");
-        }
-    }
-
-    #[test]
-    fn undo_drops_a_stroke_in_progress() {
-        let mut doc = Doc::new(ColorImage::new([100, 80], vec![Color32::WHITE; 8000]));
-        doc.crop(Rect::from_min_max(pos2(10.0, 10.0), pos2(60.0, 50.0)));
-        let mut drawing = Some(Stroke { ink: Ink::Pen, color: Color32::RED, width: 4.0, points: vec![pos2(1.0, 1.0)] });
-        step_history(&mut doc, &mut None, &mut drawing, false);
-        assert!(drawing.is_none(), "a stroke in the old image's coordinates must not land on the restored one");
-    }
 
     /// One frame in the picker's order: the full-screen response is read first, the shape menu shown after it.
     /// Returns whether a Window-mode pick survives the guard.
@@ -2596,31 +2396,6 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_shift_z_redoes() {
-        assert_eq!(press(Key::Z, Modifiers::COMMAND | Modifiers::SHIFT), Keys { redo: true, ..Default::default() });
-    }
-
-    #[test]
-    fn ctrl_plus_equals_minus_and_zero_zoom_the_snip() {
-        assert_eq!(press(Key::Plus, Modifiers::COMMAND), Keys { zoom_in: true, ..Default::default() });
-        assert_eq!(press(Key::Equals, Modifiers::COMMAND), Keys { zoom_in: true, ..Default::default() });
-        assert_eq!(press(Key::Minus, Modifiers::COMMAND), Keys { zoom_out: true, ..Default::default() });
-        assert_eq!(press(Key::Num0, Modifiers::COMMAND), Keys { zoom_fit: true, ..Default::default() });
-    }
-
-    #[test]
-    fn zoom_keys_need_ctrl() {
-        assert_eq!(press(Key::Minus, Modifiers::NONE), Keys::default());
-        assert_eq!(press(Key::Num0, Modifiers::NONE), Keys::default());
-    }
-
-    #[test]
-    fn ctrl_z_undoes_and_ctrl_y_redoes() {
-        assert_eq!(press(Key::Z, Modifiers::COMMAND), Keys { undo: true, ..Default::default() });
-        assert_eq!(press(Key::Y, Modifiers::COMMAND), Keys { redo: true, ..Default::default() });
-    }
-
-    #[test]
     fn app_icon_decodes() {
         let icon = app_icon().expect("the built-in icon decodes");
         assert_eq!((icon.width, icon.height), (256, 256));
@@ -2628,6 +2403,32 @@ mod tests {
         // Transparent outside the rounded tile, opaque at its centre.
         assert_eq!(icon.rgba[3], 0, "top-left corner is outside the tile");
         assert_eq!(icon.rgba[(128 * 256 + 128) * 4 + 3], 255, "the tile's centre is opaque");
+    }
+
+    #[test]
+    fn messages_follow_the_window_that_is_on_screen() {
+        assert!(note_goes_home(true, false), "home window open: it shows its own messages");
+        assert!(note_goes_home(false, true), "the recording bar always shows its own");
+        assert!(!note_goes_home(false, false), "home window closed: the newest editor shows them");
+    }
+
+    #[test]
+    fn the_app_ends_only_when_no_window_is_left() {
+        assert!(no_window_left(false, false, true, true));
+        assert!(!no_window_left(false, true, true, true), "the home window is still open");
+        assert!(!no_window_left(false, false, false, true), "an editor is still open");
+        assert!(!no_window_left(false, false, true, false), "a capture is still running and will open an editor");
+        assert!(!no_window_left(true, false, true, true), "in the tray the app stays until Quit");
+    }
+
+    #[test]
+    fn sample_snip_is_deterministic_and_fits_its_strokes() {
+        let (a, b) = (sample_image(960, 600), sample_image(960, 600));
+        assert_eq!(a.size, [960, 600]);
+        assert!(a.pixels == b.pixels, "the same picture every run, so renders can be compared");
+        for s in sample_strokes() {
+            assert!(s.points.iter().all(|p| p.x < 960.0 && p.y < 600.0));
+        }
     }
 
     const WORK: [i32; 4] = [0, 0, 1920, 1080];

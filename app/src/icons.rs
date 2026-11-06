@@ -16,6 +16,13 @@ pub enum Icon {
     Pen,
     Highlighter,
     Eraser,
+    /// Shape tools: the shape, with a dot of the ink they draw in.
+    Arrow,
+    Line,
+    RectOutline,
+    Ellipse,
+    /// A "T", with a dot of the text's ink.
+    Text,
     Crop,
     Check,
     Close,
@@ -111,7 +118,38 @@ pub fn paint(p: &Painter, rect: Rect, icon: Icon, color: Color32, ink: Option<Co
             line(&[(7.0, 7.5), (12.5, 13.0)], w, color);
             line(&[(6.5, 15.5), (17.0, 15.5)], w, color);
         }
+        Icon::Arrow | Icon::Line | Icon::RectOutline | Icon::Ellipse => {
+            match icon {
+                Icon::Arrow => {
+                    line(&[(3.5, 15.5), (11.0, 8.0)], w, color);
+                    filled(&[(15.5, 3.5), (13.2, 10.1), (8.9, 5.8)], color);
+                }
+                Icon::Line => line(&[(3.5, 15.5), (15.5, 3.5)], w, color),
+                Icon::RectOutline => {
+                    p.rect_stroke(rect_at(2.5, 3.5, 15.5, 13.0), 0.0, stroke, outline);
+                }
+                _ => {
+                    let pts = (0..32).map(|i| {
+                        let a = std::f32::consts::TAU * i as f32 / 32.0;
+                        at(9.0 + 6.5 * a.cos(), 8.5 + 5.0 * a.sin())
+                    });
+                    p.add(Shape::closed_line(pts.collect(), stroke));
+                }
+            }
+            if let Some(ink) = ink {
+                p.circle(at(16.0, 16.0), 2.6 * s, ink, Stroke::new(1.0 * s, color));
+            }
+        }
+        Icon::Text => {
+            line(&[(3.5, 4.0), (14.5, 4.0)], 1.6, color);
+            line(&[(9.0, 4.0), (9.0, 16.0)], 1.6, color);
+            if let Some(ink) = ink {
+                p.circle(at(16.0, 16.0), 2.6 * s, ink, Stroke::new(1.0 * s, color));
+            }
+        }
         Icon::Crop => {
+
+
             line(&[(6.0, 2.5), (6.0, 14.0), (17.5, 14.0)], w, color);
             line(&[(2.5, 6.0), (14.0, 6.0), (14.0, 17.5)], w, color);
         }
