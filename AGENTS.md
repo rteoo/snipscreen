@@ -12,7 +12,8 @@ Windows Snipping Tool. Windows-only: it talks to Win32, DXGI, WASAPI and Media F
 | `app/src/editor.rs` | One result per native window: `Editor` (a `Snip` being marked up, or a `VideoResult`), its toolbar, canvas, shortcuts (`read_keys`), copy/save and toast. `Editors` owns the open windows; each is a deferred egui viewport behind `Arc<Mutex<Editor>>`, so it repaints only for its own input. |
 | `app/src/widgets.rs` | Shared look: colour and size constants, egui style, `icon_button`/`dropdown`/`divider`/`new_button`, toasts (`Note`, `Notifier`), `PopupClickGuard`, the Esc rule. |
 | `app/src/settings.rs` | Persisted choices in `%APPDATA%\SnipScreen\settings.ini` (`key=value`): shortcut (`Hotkey`), after-capture behaviour, auto copy/save, start with Windows, capture mode/shape/delay, recording sound. Unreadable values fall back to defaults and are reported; `Saver` writes atomically (temp + rename) on its own thread. The shell's `Mode`/`Shape` live here. Pure logic plus file IO, unit-tested. |
-| `app/src/win.rs` | Thin Win32 layer: screen grab (GDI), window list, clipboard, save dialog, global hotkey, monitor rects, capture exclusion. |
+| `app/src/tray.rs` | The resident side: one thread with a hidden top-level window (class `SnipScreen.Agent`) that owns the global snip shortcut and the countdown's Esc, and takes `WM_COPYDATA` from later launches. `claim_single_instance` (named mutex `Local\SnipScreen.Instance`) and `forward` make a second launch hand its `Intent` (show / `--tray` / `--quit` / a `snipscreen:` link) to the running copy and exit. Everything reaches the shell as a `tray::Event` over one channel. |
+| `app/src/win.rs` | Thin Win32 layer: screen grab (GDI), window list, clipboard, save dialog, known folders, monitor rects, capture exclusion. |
 | `app/src/markup.rs` | Snip document: image, pen/highlighter strokes, eraser, crop, freeform cut, 50-step undo. Pure logic, unit-tested. |
 | `app/src/recorder.rs` | Screen recording to MP4 (H.264 + AAC) via DXGI duplication + Media Foundation sink writer, 30 fps, max side 4096. |
 | `app/src/audio.rs` | WASAPI capture: system loopback and microphone, 48 kHz stereo f32, plus mixing. |
@@ -47,14 +48,15 @@ Toolchain verified: Rust 1.99.1 stable, MSVC target. No `rust-toolchain` file. T
 - **Formatting is not rustfmt-managed.** The code uses long lines; `cargo fmt --check` reports ~124 diffs. Never run `cargo fmt` across the tree as part of another change. Match surrounding style.
 - `cargo clippy --all-targets` is clean. Keep it that way.
 - egui's `consume_shortcut` ignores extra Shift/Alt, so consume the more specific shortcut first (Ctrl+Shift+Z before Ctrl+Z). Editor key handling lives in `read_keys` in `editor.rs` and is unit-tested; the home window only takes Ctrl+N.
-- `unsafe` lives only in `win.rs`, `recorder.rs`, `audio.rs`. Keep it there; `main.rs`, `editor.rs`, `widgets.rs`, `markup.rs`, `icons.rs` stay safe.
+- `unsafe` lives only in `win.rs`, `tray.rs`, `recorder.rs`, `audio.rs`. Keep it there; `main.rs`, `editor.rs`, `widgets.rs`, `markup.rs`, `icons.rs` stay safe.
 - Errors cross module boundaries as `Result<_, String>` and surface as a toast: `App::say` in the shell, `Editor::say` inside an editor's own frame, and a `widgets::Notifier` from worker threads (it also wakes the right window). No panics on user paths.
 - Slow work (grab, clipboard, PNG save, recording) runs on a spawned thread and reports back over `mpsc` channels plus `ctx.request_repaint()`. Keep the UI thread non-blocking.
 - Editor windows are deferred viewports: `Editors::show` must run on every pass of the root window (egui closes a viewport its parent stops showing), the root never blocks on an editor's lock, and an editor talks back only through its `new_requested`/`closed` flags, collected by `Editors::poll`. Don't switch them to immediate viewports: those re-run the root and every other editor (and their vsync'd swaps) on each repaint.
 - Deliberate limits are marked `// ceiling:` with the upgrade trigger (see the multi-monitor picker in `main.rs`).
 - Colours sampled from the original are constants at the top of `widgets.rs`. Change them there, not inline.
 - Output folders: snips auto-save to `Pictures\Screenshots\Snip <timestamp>.png`; recordings go to `Videos\Screen Recordings\Screen Recording <timestamp>.mp4`.
-- Global hotkey is Alt+Shift+S (Win+Shift+S and Print Screen belong to the system tool).
+- Only one copy runs. Started again, it forwards to the running one (`main::start_resident`) before doing any other work; screenshot runs (`--screenshot*`) skip this and never take the shortcut. `cargo run` while the app is running just brings the running copy up.
+- Global hotkey defaults to Alt+Shift+S (Win+Shift+S and Print Screen belong to the system tool).
 
 ## Testing
 

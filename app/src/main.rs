@@ -6,12 +6,13 @@ mod icons;
 mod markup;
 mod recorder;
 mod settings;
+mod tray;
 mod widgets;
 mod win;
 
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use editor::{Editors, VideoResult};
@@ -20,7 +21,7 @@ use eframe::egui::{
     StrokeKind, TextureHandle, TextureOptions, Vec2, ViewportCommand, ViewportId, WindowLevel,
 };
 use icons::Icon;
-use settings::{Mode, Settings, Shape as Shape_, DELAYS};
+use settings::{Hotkey, Mode, Settings, Shape as Shape_, DELAYS};
 use widgets::{
     dim_outside, divider, dropdown, icon_button, style, take_escape, Note, Notifier, PopupClickGuard, ACCENT, BTN, BUTTON_BG, BUTTON_HOVER, DIM, DIVIDER_W,
     GAP, ICON, ICON_OFF, MIN_WINDOW_H, MIN_WINDOW_W, OUTLINE, TOOLBAR_BG,
@@ -165,12 +166,18 @@ struct App {
     stage: Stage,
     grab_tx: Sender<Result<win::Grab, String>>,
     grab_rx: Receiver<Result<win::Grab, String>>,
-    hotkey_rx: Option<Receiver<()>>,
+    /// The resident thread: global shortcuts and later launches. `None` in a screenshot run.
+    agent: Option<tray::Agent>,
+    agent_rx: Option<Receiver<tray::Event>>,
+    /// The snip shortcut in force; `None` when it isn't registered (`hotkey_note` says why).
+    hotkey: Option<Hotkey>,
     hotkey_note: Option<String>,
     /// Presses of the global Esc hotkey, which is registered only during a countdown.
-    esc_rx: Option<Receiver<()>>,
-    esc_hotkey: Option<win::EscapeHotkey>,
+    /// The global Esc fired since the countdown last looked.
+    global_esc: bool,
     esc_armed: bool,
+    /// Quit was asked for; the app closes once a running recording is saved.
+    quitting: bool,
     note: Option<Note>,
     /// Window corner before the picker took over the screen, in pixels.
     restore_corner: Option<[i32; 2]>,
@@ -190,7 +197,7 @@ struct App {
 }
 
 impl App {
-    fn new(cc: &eframe::CreationContext<'_>, shot: Option<Shot>, icon: Option<Arc<egui::IconData>>, loaded: settings::Loaded) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>, shot: Option<Shot>, icon: Option<Arc<egui::IconData>>, loaded: settings::Loaded, boot: Option<Boot>) -> Self {
         style(&cc.egui_ctx);
         let hwnd = window_hwnd(cc);
         let (grab_tx, grab_rx) = channel();
@@ -209,26 +216,18 @@ impl App {
         }
         let saved = settings.clone();
         let (rec_tx, rec_rx) = channel();
-        let (mut hotkey_rx, mut hotkey_note, mut esc_rx, mut esc_hotkey) = (None, None, None, None);
-        // A screenshot run must not steal the shortcut from a running copy.
-        if shot.is_none() {
-            let (tx, rx) = channel();
-            let (esc_tx, erx) = channel();
-            let (ctx, esc_ctx) = (cc.egui_ctx.clone(), cc.egui_ctx.clone());
-            match win::listen_hotkey(
-                move || {
-                    let _ = tx.send(());
-                    ctx.request_repaint();
-                },
-                move || {
-                    let _ = esc_tx.send(());
-                    esc_ctx.request_repaint();
-                },
-            ) {
-                Ok(esc) => (hotkey_rx, esc_rx, esc_hotkey) = (Some(rx), Some(erx), Some(esc)),
-                Err(e) => hotkey_note = Some(e),
+        let (agent, agent_rx, hotkey, hotkey_note, intent) = match boot {
+            Some(b) => {
+                // Events sent before this point are waiting in the channel and handled on the first pass.
+                let _ = b.waker.set(cc.egui_ctx.clone());
+                let (hotkey, note) = match b.hotkey {
+                    Ok(h) => (Some(h), None),
+                    Err(e) => (None, Some(e)),
+                };
+                (b.agent, Some(b.events), hotkey, note, Some(b.intent))
             }
-        }
+            None => (None, None, None, None, None),
+        };
         let mut app = Self {
             hwnd,
             settings,
@@ -238,11 +237,13 @@ impl App {
             stage: Stage::Idle,
             grab_tx,
             grab_rx,
-            hotkey_rx,
+            agent,
+            agent_rx,
+            hotkey,
             hotkey_note,
-            esc_rx,
-            esc_hotkey,
+            global_esc: false,
             esc_armed: false,
+            quitting: false,
             note: None,
             restore_corner: None,
             settle: 0,
@@ -256,6 +257,9 @@ impl App {
         };
         if !loaded.problems.is_empty() && !shot_run {
             app.say(&cc.egui_ctx, format!("Some settings couldn't be read and were reset: {}", loaded.problems.join(", ")));
+        }
+        if let Some(intent) = intent {
+            app.on_intent(&cc.egui_ctx, intent);
         }
         app.screenshot = shot.map(|shot| match shot {
             Shot::Home(path) => ScreenshotJob { path, target: ViewportId::ROOT, frames: 0, rx: None },
@@ -296,8 +300,8 @@ impl App {
         let want = wants_escape_hotkey(&self.stage);
         if want != self.esc_armed {
             self.esc_armed = want;
-            if let Some(esc) = &self.esc_hotkey {
-                esc.set(want);
+            if let Some(agent) = &self.agent {
+                agent.set_escape(want);
             }
         }
     }
@@ -318,8 +322,8 @@ impl App {
 
     /// Advances the delay countdown: Esc cancels, the last second hides the window.
     fn tick_countdown(&mut self, ctx: &egui::Context) {
-        // Always drained, so a press that arrives just as the countdown ends is not kept for the next one.
-        let global_esc = self.esc_rx.as_ref().is_some_and(drain);
+        // Always taken, so a press that arrives just as the countdown ends is not kept for the next one.
+        let global_esc = std::mem::take(&mut self.global_esc);
         let Stage::Counting { end } = self.stage else { return };
         if take_escape(ctx) || global_esc {
             self.cancel_countdown(ctx);
@@ -410,7 +414,7 @@ impl App {
     /// The home window's close button. With editors open it only hides the home window; the app
     /// ends when the last window is gone (see `close_when_no_window_is_left`).
     fn on_home_close(&mut self, ctx: &egui::Context) {
-        if !ctx.input(|i| i.viewport().close_requested()) || self.editors.is_empty() || self.screenshot.is_some() {
+        if !ctx.input(|i| i.viewport().close_requested()) || self.quitting || self.editors.is_empty() || self.screenshot.is_some() {
             return;
         }
         ctx.send_viewport_cmd(ViewportCommand::CancelClose);
@@ -496,6 +500,42 @@ impl App {
         });
     }
 
+    /// The New buttons' tooltip, naming the shortcut only while it is registered.
+    fn new_tip(&self) -> String {
+        new_tooltip(self.settings.mode, self.hotkey.map(Hotkey::label).as_deref(), self.hotkey_note.as_deref())
+    }
+
+    /// A launch of the program: this one, or a later one forwarded by `tray::forward`.
+    fn on_intent(&mut self, ctx: &egui::Context, intent: tray::Intent) {
+        match intent {
+            tray::Intent::Show | tray::Intent::Open(_) => self.show_home(ctx),
+            tray::Intent::Tray => {}
+            tray::Intent::Quit => self.quit(ctx),
+        }
+    }
+
+    /// Brings the home window up, or, mid-capture, has it come back when the capture ends.
+    fn show_home(&mut self, ctx: &egui::Context) {
+        self.home_visible = true;
+        if matches!(self.stage, Stage::Idle | Stage::Counting { .. }) {
+            self.return_home(ctx);
+        }
+    }
+
+    /// Ends the app. A recording in progress is stopped and saved first; editors close with it,
+    /// their snips already copied and saved as the settings asked.
+    fn quit(&mut self, ctx: &egui::Context) {
+        self.quitting = true;
+        if let Stage::Recording(bar) = &mut self.stage {
+            if let Some(rec) = &mut bar.rec {
+                rec.stop();
+                bar.saving = true;
+                return;
+            }
+        }
+        ctx.send_viewport_cmd(ViewportCommand::Close);
+    }
+
     /// Hands changed settings to the saver; a few field compares per pass when nothing changed.
     fn persist(&mut self) {
         if self.settings != self.saved {
@@ -536,6 +576,13 @@ impl App {
 }
 
 impl eframe::App for App {
+    /// Lets go of the shortcuts and writes pending settings before the process ends.
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.persist();
+        self.saver = settings::Saver::new(None, |_| {});
+        self.agent = None;
+    }
+
     /// Transparent so the recording-area outline window shows only its dashes.
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
         [0.0; 4]
@@ -549,7 +596,15 @@ impl eframe::App for App {
         while let Ok(event) = self.rec_rx.try_recv() {
             self.on_record_event(ctx, event);
         }
-        let hotkey = self.hotkey_rx.as_ref().is_some_and(drain);
+        let mut hotkey = false;
+        while let Some(event) = self.agent_rx.as_ref().and_then(|rx| rx.try_recv().ok()) {
+            match event {
+                tray::Event::Snip => hotkey = true,
+                tray::Event::Escape => self.global_esc = true,
+                tray::Event::Intent(intent) => self.on_intent(ctx, intent),
+                tray::Event::HotkeySet(_) => {}
+            }
+        }
         if self.editors.poll().new_snip || hotkey {
             self.start_snip(ctx);
         }
@@ -560,7 +615,7 @@ impl eframe::App for App {
         self.reveal_picker(ctx);
         self.settle_window(ctx);
         self.sync_escape_hotkey();
-        self.editors.set_new_tip(new_tooltip(self.settings.mode, self.hotkey_rx.is_some(), self.hotkey_note.as_deref()));
+        self.editors.set_new_tip(self.new_tip());
         self.close_when_no_window_is_left(ctx);
         self.persist();
     }
@@ -628,7 +683,7 @@ impl App {
 
     fn capture_controls(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
-        let tip = new_tooltip(self.settings.mode, self.hotkey_rx.is_some(), self.hotkey_note.as_deref());
+        let tip = self.new_tip();
         if widgets::new_button(ui, &tip).clicked() {
             self.start_snip(&ctx);
         }
@@ -727,10 +782,10 @@ impl App {
             };
             ui.label(RichText::new(title).size(20.0).strong());
             ui.add_space(6.0);
-            let hint = match (self.settings.mode, self.hotkey_rx.is_some()) {
-                (Mode::Photo, true) => "Press Alt+Shift+S anywhere, or pick a shape and click New.",
-                (Mode::Photo, false) => "Pick a shape and click New.",
-                (Mode::Video, _) => "Click New, choose an area, then press Start to record.",
+            let hint = match (self.settings.mode, self.hotkey) {
+                (Mode::Photo, Some(h)) => format!("Press {} anywhere, or pick a shape and click New.", h.label()),
+                (Mode::Photo, None) => "Pick a shape and click New.".into(),
+                (Mode::Video, _) => "Click New, choose an area, then press Start to record.".into(),
             };
             ui.label(RichText::new(hint).weak());
             if let Some(n) = &self.hotkey_note {
@@ -959,6 +1014,11 @@ impl App {
                     _ => Vec::new(),
                 };
                 self.close_rec_bar(ctx);
+                if self.quitting {
+                    // The file is complete once `Done` arrives; nobody is left to show it to.
+                    ctx.send_viewport_cmd(ViewportCommand::Close);
+                    return;
+                }
                 match result {
                     Ok(f) => {
                         let thumb = f.first_frame.map(|img| ctx.load_texture("recording", img, TextureOptions::LINEAR));
@@ -1222,6 +1282,17 @@ fn main() -> eframe::Result {
             }
         }
     }
+    let loaded = settings::load();
+    // A screenshot run must not take the shortcut or the single-instance slot from a running copy.
+    // This comes first so a launch that only forwards to the running copy exits without more work.
+    let boot = if shot.is_none() {
+        match start_resident(tray::Intent::from_args(&std::env::args().skip(1).collect::<Vec<_>>()), loaded.settings.shortcut) {
+            Some(b) => Some(b),
+            None => return Ok(()),
+        }
+    } else {
+        None
+    };
     let mut viewport = egui::ViewportBuilder::default().with_title("Snipscreen").with_inner_size(HOME_SIZE).with_min_inner_size([MIN_WINDOW_W, MIN_WINDOW_H]);
     // The icon is built into the binary and checked by `app_icon_decodes`, so a failure here
     // means a broken build; the app still runs with the default icon rather than refusing to start.
@@ -1235,9 +1306,50 @@ fn main() -> eframe::Result {
     if let Some(icon) = &icon {
         viewport = viewport.with_icon(icon.clone());
     }
-    let loaded = settings::load();
     let options = eframe::NativeOptions { viewport, ..Default::default() };
-    eframe::run_native("Snipscreen", options, Box::new(move |cc| Ok(Box::new(App::new(cc, shot, icon, loaded)))))
+    eframe::run_native("Snipscreen", options, Box::new(move |cc| Ok(Box::new(App::new(cc, shot, icon, loaded, boot)))))
+}
+
+/// The single running copy's resident side, set up before the window so a second launch can reach
+/// it as early as possible.
+struct Boot {
+    agent: Option<tray::Agent>,
+    hotkey: Result<Hotkey, String>,
+    events: Receiver<tray::Event>,
+    /// Filled with the egui context once it exists, so agent events can wake the UI.
+    waker: Arc<OnceLock<egui::Context>>,
+    /// What this launch was started for.
+    intent: tray::Intent,
+}
+
+/// Claims the single-instance slot and starts the agent. `None` means this launch is done: its intent
+/// went to the copy already running, or it was `--quit` with nothing to quit.
+fn start_resident(intent: tray::Intent, hotkey: Hotkey) -> Option<Boot> {
+    if !tray::claim_single_instance() {
+        if let Err(e) = tray::forward(&intent) {
+            if intent != tray::Intent::Quit {
+                win::error_box(&e);
+            }
+        }
+        return None;
+    }
+    if intent == tray::Intent::Quit {
+        return None;
+    }
+    let waker: Arc<OnceLock<egui::Context>> = Arc::new(OnceLock::new());
+    let (tx, events) = channel();
+    let w = waker.clone();
+    let wake = move |e| {
+        let _ = tx.send(e);
+        if let Some(ctx) = w.get() {
+            ctx.request_repaint();
+        }
+    };
+    let (agent, hotkey) = match tray::Agent::start(hotkey, wake) {
+        Ok(started) => (Some(started.agent), started.hotkey),
+        Err(e) => (None, Err(format!("Global shortcuts are off: {e}"))),
+    };
+    Some(Boot { agent, hotkey, events, waker, intent })
 }
 
 /// The window and taskbar icon: the 256 px render of `assets/snipscreen-icon.svg`, built into the binary.
@@ -1286,22 +1398,18 @@ fn wants_escape_hotkey(stage: &Stage) -> bool {
     matches!(stage, Stage::Counting { .. })
 }
 
-/// True if anything arrived on the channel; empties it.
-fn drain(rx: &Receiver<()>) -> bool {
-    rx.try_iter().count() > 0
-}
 
 /// The New button's tooltip; the global shortcut is only advertised while it is registered.
 /// `note` is why it isn't (none in a screenshot run, which never tries).
-fn new_tooltip(mode: Mode, hotkey_registered: bool, note: Option<&str>) -> String {
+fn new_tooltip(mode: Mode, hotkey: Option<&str>, note: Option<&str>) -> String {
     let what = match mode {
         Mode::Photo => "New snip",
         Mode::Video => "New recording",
     };
-    match (hotkey_registered, note) {
-        (true, _) => format!("{what} (Ctrl+N, or Alt+Shift+S anywhere)"),
-        (false, Some(why)) => format!("{what} (Ctrl+N). {why}"),
-        (false, None) => format!("{what} (Ctrl+N)"),
+    match (hotkey, note) {
+        (Some(key), _) => format!("{what} (Ctrl+N, or {key} anywhere)"),
+        (None, Some(why)) => format!("{what} (Ctrl+N). {why}"),
+        (None, None) => format!("{what} (Ctrl+N)"),
     }
 }
 
@@ -1368,11 +1476,11 @@ mod tests {
 
     #[test]
     fn new_tooltip_only_promises_a_registered_hotkey() {
-        assert_eq!(new_tooltip(Mode::Photo, true, None), "New snip (Ctrl+N, or Alt+Shift+S anywhere)");
-        assert_eq!(new_tooltip(Mode::Video, true, None), "New recording (Ctrl+N, or Alt+Shift+S anywhere)");
-        let taken = new_tooltip(Mode::Photo, false, Some("Alt+Shift+S is already used by another app"));
+        assert_eq!(new_tooltip(Mode::Photo, Some("Alt+Shift+S"), None), "New snip (Ctrl+N, or Alt+Shift+S anywhere)");
+        assert_eq!(new_tooltip(Mode::Video, Some("Ctrl+F12"), None), "New recording (Ctrl+N, or Ctrl+F12 anywhere)");
+        let taken = new_tooltip(Mode::Photo, None, Some("Alt+Shift+S is already used by another app"));
         assert_eq!(taken, "New snip (Ctrl+N). Alt+Shift+S is already used by another app");
-        assert!(!new_tooltip(Mode::Video, false, None).contains("Alt+Shift+S"));
+        assert!(!new_tooltip(Mode::Video, None, None).contains("Alt+Shift+S"));
     }
 
     #[test]
@@ -1454,15 +1562,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn drain_reports_and_empties_pending_global_esc_presses() {
-        let (tx, rx) = channel();
-        assert!(!drain(&rx));
-        tx.send(()).unwrap();
-        tx.send(()).unwrap();
-        assert!(drain(&rx));
-        assert!(!drain(&rx), "a press must be reported once");
-    }
 
     /// One frame in the picker's order: the full-screen response is read first, the shape menu shown after it.
     /// Returns whether a Window-mode pick survives the guard.

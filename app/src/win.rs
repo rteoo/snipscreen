@@ -1,4 +1,4 @@
-//! Thin Win32 layer: screen grab, window list, clipboard, save dialog, hotkey.
+//! Thin Win32 layer: screen grab, window list, clipboard, save dialog, folders.
 
 use std::ffi::c_void;
 use std::mem::{size_of, zeroed};
@@ -26,16 +26,14 @@ use windows_sys::Win32::System::SystemInformation::GetLocalTime;
 use windows_sys::Win32::UI::Controls::Dialogs::{
     GetSaveFileNameW, OFN_NOCHANGEDIR, OFN_OVERWRITEPROMPT, OFN_PATHMUSTEXIST, OPENFILENAMEW,
 };
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    RegisterHotKey, UnregisterHotKey, MOD_ALT, MOD_NOREPEAT, MOD_SHIFT, VK_ESCAPE,
-};
+
 use windows_sys::Win32::UI::Shell::{FOLDERID_Pictures, FOLDERID_RoamingAppData, FOLDERID_Videos, SHGetKnownFolderPath};
 use windows_sys::Win32::System::Com::CoTaskMemFree;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, FindWindowW, GetClientRect, GetCursorPos, GetWindowPlacement, WINDOWPLACEMENT, SetWindowDisplayAffinity, WDA_EXCLUDEFROMCAPTURE, WDA_NONE, GetMessageW, GetSystemMetrics, GetWindowLongW, GetWindowRect,
-    GetWindowTextLengthW, IsIconic, ShowWindow, SW_SHOWNOACTIVATE, IsWindowVisible, SetWindowPos, GWL_EXSTYLE, MSG,
+    EnumWindows, FindWindowW, GetClientRect, GetCursorPos, GetWindowPlacement, WINDOWPLACEMENT, SetWindowDisplayAffinity, WDA_EXCLUDEFROMCAPTURE, WDA_NONE, GetSystemMetrics, GetWindowLongW, GetWindowRect,
+    GetWindowTextLengthW, IsIconic, ShowWindow, SW_SHOWNOACTIVATE, IsWindowVisible, SetWindowPos, GWL_EXSTYLE, MessageBoxW, MB_ICONWARNING, MB_OK,
     SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SWP_NOACTIVATE,
-    SWP_NOSIZE, SWP_NOZORDER, WM_HOTKEY, WM_APP, PeekMessageW, PostThreadMessageW, PM_NOREMOVE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT,
+    SWP_NOSIZE, SWP_NOZORDER, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT,
 };
 
 /// A frozen picture of every monitor plus the windows that were on it.
@@ -461,73 +459,11 @@ pub fn ask_save_path(
     Some(PathBuf::from(String::from_utf16_lossy(&buf[..len])))
 }
 
-const HOTKEY_SNIP: i32 = 1;
-const HOTKEY_ESCAPE: i32 = 2;
-const MSG_ARM_ESCAPE: u32 = WM_APP + 1;
-const MSG_DISARM_ESCAPE: u32 = WM_APP + 2;
-
-#[link(name = "kernel32")]
-extern "system" {
-    fn GetCurrentThreadId() -> u32;
-}
-
-/// Handle to the hotkey thread that turns the global Esc hotkey on and off.
-/// Dropping it releases Esc.
-pub struct EscapeHotkey {
-    thread: u32,
-}
-
-impl EscapeHotkey {
-    /// While on, Esc is taken from whatever app has focus and reported through
-    /// the `on_escape` callback instead. Hotkeys belong to the thread that
-    /// registered them, so this posts a request to that thread. If another app
-    /// already owns Esc the registration quietly fails and only in-app Esc works.
-    pub fn set(&self, on: bool) {
-        let msg = if on { MSG_ARM_ESCAPE } else { MSG_DISARM_ESCAPE };
-        unsafe { PostThreadMessageW(self.thread, msg, 0, 0) };
-    }
-}
-
-impl Drop for EscapeHotkey {
-    fn drop(&mut self) {
-        self.set(false);
-    }
-}
-
-/// Listens for Alt+Shift+S anywhere in Windows on its own thread and calls
-/// `on_press` each time. The same thread owns the on-demand Esc hotkey (see
-/// [`EscapeHotkey`]) and calls `on_escape` when it fires. Returns an error if
-/// another app already owns Alt+Shift+S.
-pub fn listen_hotkey(on_press: impl Fn() + Send + 'static, on_escape: impl Fn() + Send + 'static) -> Result<EscapeHotkey, String> {
-    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || unsafe {
-        let ok = RegisterHotKey(null_mut(), HOTKEY_SNIP, MOD_ALT | MOD_SHIFT | MOD_NOREPEAT, 'S' as u32) != 0;
-        let mut msg: MSG = zeroed();
-        // Creates this thread's message queue, so a request posted right after
-        // the handshake is not lost.
-        PeekMessageW(&mut msg, null_mut(), 0, 0, PM_NOREMOVE);
-        let _ = ready_tx.send(ok.then(|| GetCurrentThreadId()));
-        if !ok {
-            return;
-        }
-        while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
-            match msg.message {
-                WM_HOTKEY if msg.wParam == HOTKEY_SNIP as usize => on_press(),
-                WM_HOTKEY if msg.wParam == HOTKEY_ESCAPE as usize => on_escape(),
-                MSG_ARM_ESCAPE => {
-                    RegisterHotKey(null_mut(), HOTKEY_ESCAPE, MOD_NOREPEAT, VK_ESCAPE as u32);
-                }
-                MSG_DISARM_ESCAPE => {
-                    UnregisterHotKey(null_mut(), HOTKEY_ESCAPE);
-                }
-                _ => {}
-            }
-        }
-    });
-    match ready_rx.recv() {
-        Ok(Some(thread)) => Ok(EscapeHotkey { thread }),
-        _ => Err("Alt+Shift+S is already used by another app".into()),
-    }
+/// A message box for the one failure that has no window to show it in: a second launch that
+/// couldn't reach the running copy.
+pub fn error_box(msg: &str) {
+    let (text, title) = (wide(msg), wide("SnipScreen"));
+    unsafe { MessageBoxW(null_mut(), text.as_ptr(), title.as_ptr(), MB_ICONWARNING | MB_OK) };
 }
 
 /// Keeps a window out of screenshots and recordings (Windows 10 2004+).
