@@ -178,6 +178,11 @@ struct App {
     esc_armed: bool,
     /// Quit was asked for; the app closes once a running recording is saved.
     quitting: bool,
+    /// The agent is running, so the app lives in the tray: closing the home window only hides it.
+    resident: bool,
+    /// Started out of sight (`--tray`): eframe shows the root window once its first frame is painted,
+    /// so it stays cloaked until that show has been undone.
+    hidden_start: HiddenStart,
     note: Option<Note>,
     /// Window corner before the picker took over the screen, in pixels.
     restore_corner: Option<[i32; 2]>,
@@ -216,6 +221,10 @@ impl App {
         }
         let saved = settings.clone();
         let (rec_tx, rec_rx) = channel();
+        let hidden = boot.as_ref().is_some_and(|b| b.starts_hidden());
+        if hidden {
+            win::cloak(hwnd as HWND, true);
+        }
         let (agent, agent_rx, hotkey, hotkey_note, intent) = match boot {
             Some(b) => {
                 // Events sent before this point are waiting in the channel and handled on the first pass.
@@ -244,10 +253,12 @@ impl App {
             global_esc: false,
             esc_armed: false,
             quitting: false,
+            resident: false,
+            hidden_start: if hidden { HiddenStart::FirstFrame } else { HiddenStart::Done },
             note: None,
             restore_corner: None,
             settle: 0,
-            home_visible: true,
+            home_visible: !hidden,
             popup_guard: PopupClickGuard::default(),
             screenshot: None,
             mics: Vec::new(),
@@ -258,6 +269,7 @@ impl App {
         if !loaded.problems.is_empty() && !shot_run {
             app.say(&cc.egui_ctx, format!("Some settings couldn't be read and were reset: {}", loaded.problems.join(", ")));
         }
+        app.resident = app.agent.is_some();
         if let Some(intent) = intent {
             app.on_intent(&cc.egui_ctx, intent);
         }
@@ -411,10 +423,10 @@ impl App {
         }
     }
 
-    /// The home window's close button. With editors open it only hides the home window; the app
-    /// ends when the last window is gone (see `close_when_no_window_is_left`).
+    /// The home window's close button. In the tray, or with editors open, it only hides the home
+    /// window; otherwise the app ends when the last window is gone (see `close_when_no_window_is_left`).
     fn on_home_close(&mut self, ctx: &egui::Context) {
-        if !ctx.input(|i| i.viewport().close_requested()) || self.quitting || self.editors.is_empty() || self.screenshot.is_some() {
+        if !ctx.input(|i| i.viewport().close_requested()) || self.quitting || self.screenshot.is_some() || (!self.resident && self.editors.is_empty()) {
             return;
         }
         ctx.send_viewport_cmd(ViewportCommand::CancelClose);
@@ -433,7 +445,7 @@ impl App {
     }
 
     fn close_when_no_window_is_left(&self, ctx: &egui::Context) {
-        if no_window_left(self.home_visible, self.editors.is_empty(), matches!(self.stage, Stage::Idle)) {
+        if no_window_left(self.resident, self.home_visible, self.editors.is_empty(), matches!(self.stage, Stage::Idle)) {
             ctx.send_viewport_cmd(ViewportCommand::Close);
         }
     }
@@ -589,6 +601,10 @@ impl eframe::App for App {
     }
 
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if self.hidden_start == HiddenStart::Painted {
+            win::cloak(self.hwnd as HWND, false);
+            self.hidden_start = HiddenStart::Done;
+        }
         self.on_home_close(ctx);
         while let Ok(msg) = self.bg_rx.try_recv() {
             self.say(ctx, msg);
@@ -622,6 +638,13 @@ impl eframe::App for App {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        if self.hidden_start == HiddenStart::FirstFrame {
+            // Processed right after eframe's first-frame show, which the cloak keeps off the screen
+            // (and `with_active(false)` keeps from taking focus).
+            ctx.send_viewport_cmd(ViewportCommand::Visible(false));
+            self.hidden_start = HiddenStart::Painted;
+            ctx.request_repaint();
+        }
         if matches!(self.stage, Stage::Picking(_)) {
             self.picker_ui(ui);
         } else if matches!(self.stage, Stage::Recording(_)) {
@@ -1207,9 +1230,20 @@ fn note_goes_home(home_visible: bool, recording: bool) -> bool {
     home_visible || recording
 }
 
-/// The app ends once the home window was closed and the last editor has gone, unless a capture is still running.
-fn no_window_left(home_visible: bool, no_editors: bool, idle: bool) -> bool {
-    !home_visible && no_editors && idle
+/// Without a tray icon the app ends once the home window was closed and the last editor has gone,
+/// unless a capture is still running. In the tray it only ends on Quit.
+fn no_window_left(resident: bool, home_visible: bool, no_editors: bool, idle: bool) -> bool {
+    !resident && !home_visible && no_editors && idle
+}
+
+/// Where a start out of sight stands; see `App::hidden_start`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HiddenStart {
+    /// The first frame hasn't been painted yet; eframe shows the window right after it.
+    FirstFrame,
+    /// Painted, shown by eframe while cloaked, and hidden again. Uncloak on the next pass.
+    Painted,
+    Done,
 }
 
 /// A made-up snip for `--screenshot-editor`: a deterministic gradient with a title bar and a few
@@ -1282,6 +1316,7 @@ fn main() -> eframe::Result {
             }
         }
     }
+    win::become_dpi_aware();
     let loaded = settings::load();
     // A screenshot run must not take the shortcut or the single-instance slot from a running copy.
     // This comes first so a launch that only forwards to the running copy exits without more work.
@@ -1306,6 +1341,10 @@ fn main() -> eframe::Result {
     if let Some(icon) = &icon {
         viewport = viewport.with_icon(icon.clone());
     }
+    if boot.as_ref().is_some_and(Boot::starts_hidden) {
+        // eframe's show after the first frame must not take focus from what the person is doing.
+        viewport = viewport.with_active(false);
+    }
     let options = eframe::NativeOptions { viewport, ..Default::default() };
     eframe::run_native("Snipscreen", options, Box::new(move |cc| Ok(Box::new(App::new(cc, shot, icon, loaded, boot)))))
 }
@@ -1320,6 +1359,13 @@ struct Boot {
     waker: Arc<OnceLock<egui::Context>>,
     /// What this launch was started for.
     intent: tray::Intent,
+}
+
+impl Boot {
+    /// Started with Windows, or to open a notification's snip: the home window stays out of sight.
+    fn starts_hidden(&self) -> bool {
+        matches!(self.intent, tray::Intent::Tray | tray::Intent::Open(_))
+    }
 }
 
 /// Claims the single-instance slot and starts the agent. `None` means this launch is done: its intent
@@ -1345,7 +1391,7 @@ fn start_resident(intent: tray::Intent, hotkey: Hotkey) -> Option<Boot> {
             ctx.request_repaint();
         }
     };
-    let (agent, hotkey) = match tray::Agent::start(hotkey, wake) {
+    let (agent, hotkey) = match tray::Agent::start(hotkey, true, wake) {
         Ok(started) => (Some(started.agent), started.hotkey),
         Err(e) => (None, Err(format!("Global shortcuts are off: {e}"))),
     };
@@ -1628,10 +1674,11 @@ mod tests {
 
     #[test]
     fn the_app_ends_only_when_no_window_is_left() {
-        assert!(no_window_left(false, true, true));
-        assert!(!no_window_left(true, true, true), "the home window is still open");
-        assert!(!no_window_left(false, false, true), "an editor is still open");
-        assert!(!no_window_left(false, true, false), "a capture is still running and will open an editor");
+        assert!(no_window_left(false, false, true, true));
+        assert!(!no_window_left(false, true, true, true), "the home window is still open");
+        assert!(!no_window_left(false, false, false, true), "an editor is still open");
+        assert!(!no_window_left(false, false, true, false), "a capture is still running and will open an editor");
+        assert!(!no_window_left(true, false, true, true), "in the tray the app stays until Quit");
     }
 
     #[test]

@@ -9,7 +9,7 @@ use std::ptr::{null, null_mut};
 use eframe::egui::{Color32, ColorImage};
 use windows_sys::Win32::Foundation::{GlobalFree, HWND, LPARAM, POINT, RECT, SYSTEMTIME};
 use windows_sys::Win32::Graphics::Dwm::{
-    DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS,
+    DwmGetWindowAttribute, DwmSetWindowAttribute, DWMWA_CLOAK, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS,
 };
 use windows_sys::Win32::Graphics::Gdi::{
     BitBlt, ClientToScreen, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject,
@@ -32,6 +32,7 @@ use windows_sys::Win32::System::Com::CoTaskMemFree;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     EnumWindows, FindWindowW, GetClientRect, GetCursorPos, GetWindowPlacement, WINDOWPLACEMENT, SetWindowDisplayAffinity, WDA_EXCLUDEFROMCAPTURE, WDA_NONE, GetSystemMetrics, GetWindowLongW, GetWindowRect,
     GetWindowTextLengthW, IsIconic, ShowWindow, SW_SHOWNOACTIVATE, IsWindowVisible, SetWindowPos, GWL_EXSTYLE, MessageBoxW, MB_ICONWARNING, MB_OK,
+
     SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SWP_NOACTIVATE,
     SWP_NOSIZE, SWP_NOZORDER, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT,
 };
@@ -457,6 +458,26 @@ pub fn ask_save_path(
     }
     let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
     Some(PathBuf::from(String::from_utf16_lossy(&buf[..len])))
+}
+
+#[link(name = "user32")]
+extern "system" {
+    fn SetProcessDpiAwarenessContext(value: isize) -> i32;
+}
+
+/// Per-monitor DPI awareness (v2), as winit sets it when the window is made; done first so the tray
+/// icon, loaded before any window exists, comes out at the screen's real size instead of a blurry 16 px.
+pub fn become_dpi_aware() {
+    const PER_MONITOR_AWARE_V2: isize = -4;
+    unsafe { SetProcessDpiAwarenessContext(PER_MONITOR_AWARE_V2) };
+}
+
+/// Cloaks or uncloaks a window: a cloaked window may be shown, but DWM draws none of it and the
+/// taskbar and Alt+Tab leave it out. A start in the tray (`--tray`) cloaks the root window across
+/// eframe's show-after-the-first-frame, so nothing flashes.
+pub fn cloak(hwnd: HWND, on: bool) {
+    let value: i32 = on.into();
+    unsafe { DwmSetWindowAttribute(hwnd, DWMWA_CLOAK as _, &value as *const i32 as *const c_void, size_of::<i32>() as u32) };
 }
 
 /// A message box for the one failure that has no window to show it in: a second launch that

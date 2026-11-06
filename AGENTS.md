@@ -12,7 +12,7 @@ Windows Snipping Tool. Windows-only: it talks to Win32, DXGI, WASAPI and Media F
 | `app/src/editor.rs` | One result per native window: `Editor` (a `Snip` being marked up, or a `VideoResult`), its toolbar, canvas, shortcuts (`read_keys`), copy/save and toast. `Editors` owns the open windows; each is a deferred egui viewport behind `Arc<Mutex<Editor>>`, so it repaints only for its own input. |
 | `app/src/widgets.rs` | Shared look: colour and size constants, egui style, `icon_button`/`dropdown`/`divider`/`new_button`, toasts (`Note`, `Notifier`), `PopupClickGuard`, the Esc rule. |
 | `app/src/settings.rs` | Persisted choices in `%APPDATA%\SnipScreen\settings.ini` (`key=value`): shortcut (`Hotkey`), after-capture behaviour, auto copy/save, start with Windows, capture mode/shape/delay, recording sound. Unreadable values fall back to defaults and are reported; `Saver` writes atomically (temp + rename) on its own thread. The shell's `Mode`/`Shape` live here. Pure logic plus file IO, unit-tested. |
-| `app/src/tray.rs` | The resident side: one thread with a hidden top-level window (class `SnipScreen.Agent`) that owns the global snip shortcut and the countdown's Esc, and takes `WM_COPYDATA` from later launches. `claim_single_instance` (named mutex `Local\SnipScreen.Instance`) and `forward` make a second launch hand its `Intent` (show / `--tray` / `--quit` / a `snipscreen:` link) to the running copy and exit. Everything reaches the shell as a `tray::Event` over one channel. |
+| `app/src/tray.rs` | The resident side: one thread with a hidden top-level window (class `SnipScreen.Agent`) that owns the tray icon and its menu (re-added on Explorer's `TaskbarCreated`), the global snip shortcut and the countdown's Esc, and takes `WM_COPYDATA` from later launches. `claim_single_instance` (named mutex `Local\SnipScreen.Instance`) and `forward` make a second launch hand its `Intent` (show / `--tray` / `--quit` / a `snipscreen:` link) to the running copy and exit. Everything reaches the shell as a `tray::Event` over one channel. |
 | `app/src/win.rs` | Thin Win32 layer: screen grab (GDI), window list, clipboard, save dialog, known folders, monitor rects, capture exclusion. |
 | `app/src/markup.rs` | Snip document: image, pen/highlighter strokes, eraser, crop, freeform cut, 50-step undo. Pure logic, unit-tested. |
 | `app/src/recorder.rs` | Screen recording to MP4 (H.264 + AAC) via DXGI duplication + Media Foundation sink writer, 30 fps, max side 4096. |
@@ -34,7 +34,8 @@ Run from `app/`.
 | Build (dev, opt-level 2) | `cargo build` |
 | Release build | `cargo build --release` → `target/release/snipscreen.exe` |
 | Windows installer (from the repo root, after the release build) | `build_installer.bat` → `installer/Output/SnipscreenSetup-<version>.exe` (Inno Setup 6, per-user; set `SNIPSCREEN_BUILD_NONINTERACTIVE=1` to skip the pauses). Keep `MyAppVersion` in `installer/snipscreen.iss` equal to the `Cargo.toml` version. |
-| Run | `cargo run` (opens the home window) |
+| Run | `cargo run` (opens the home window; the app then lives in the tray until Quit) |
+| Run as at sign-in | `cargo run -- --tray` (starts hidden in the tray; `--quit` ends a running copy) |
 | Tests | `cargo test` |
 | Device-dependent tests (sound hardware) | `cargo test -- --ignored` |
 | Lint | `cargo clippy --all-targets` |
@@ -55,6 +56,7 @@ Toolchain verified: Rust 1.99.1 stable, MSVC target. No `rust-toolchain` file. T
 - Deliberate limits are marked `// ceiling:` with the upgrade trigger (see the multi-monitor picker in `main.rs`).
 - Colours sampled from the original are constants at the top of `widgets.rs`. Change them there, not inline.
 - Output folders: snips auto-save to `Pictures\Screenshots\Snip <timestamp>.png`; recordings go to `Videos\Screen Recordings\Screen Recording <timestamp>.mp4`.
+- The app is resident: closing the home window hides it, and only the tray menu's Quit (or `--quit`, or signing out) ends the process, after a running recording is saved. `--tray` starts with the root window cloaked and inactive across eframe's show-after-first-frame (`HiddenStart` in `main.rs`), so nothing flashes or takes focus.
 - Only one copy runs. Started again, it forwards to the running one (`main::start_resident`) before doing any other work; screenshot runs (`--screenshot*`) skip this and never take the shortcut. `cargo run` while the app is running just brings the running copy up.
 - Global hotkey defaults to Alt+Shift+S (Win+Shift+S and Print Screen belong to the system tool).
 

@@ -1,5 +1,5 @@
-//! The resident side of SnipScreen: one thread with a hidden window that owns the global
-//! shortcuts and takes requests from later launches.
+//! The resident side of SnipScreen: one thread with a hidden window that owns the tray icon and
+//! its menu, the global shortcuts, and takes requests from later launches.
 //!
 //! The window is a plain top-level one that is never shown (not a message-only window, which
 //! would miss the `TaskbarCreated` broadcast). It blocks in `GetMessageW`, so it costs nothing
@@ -14,10 +14,16 @@ use std::thread::JoinHandle;
 use windows_sys::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS, HANDLE, HMODULE, HWND, LPARAM, LRESULT, WPARAM};
 use windows_sys::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{RegisterHotKey, UnregisterHotKey, MOD_NOREPEAT, VK_ESCAPE};
+use windows_sys::Win32::UI::Shell::{
+    Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_SETVERSION, NIN_SELECT, NOTIFYICONDATAW, NOTIFYICON_VERSION_4,
+};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    AllowSetForegroundWindow, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, FindWindowW, GetMessageW, GetWindowLongPtrW, GetWindowThreadProcessId,
-    PostMessageW, PostQuitMessage, RegisterClassExW, SendMessageTimeoutW, SetWindowLongPtrW, TranslateMessage, GWLP_USERDATA, MSG, SMTO_ABORTIFHUNG, WM_APP,
-    WM_CLOSE, WM_COPYDATA, WM_DESTROY, WM_ENDSESSION, WM_HOTKEY, WM_QUERYENDSESSION, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_POPUP,
+    AllowSetForegroundWindow, AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyMenu, DestroyWindow, DispatchMessageW, FindWindowW,
+    GetMessageW, GetSystemMetrics, GetWindowLongPtrW, GetWindowThreadProcessId, KillTimer, LoadImageW, PostMessageW, PostQuitMessage, RegisterClassExW,
+    RegisterWindowMessageW, SendMessageTimeoutW, SetForegroundWindow, SetMenuDefaultItem, SetTimer, SetWindowLongPtrW, TrackPopupMenuEx, TranslateMessage,
+    GWLP_USERDATA, HICON, IMAGE_ICON, LR_DEFAULTCOLOR, MF_SEPARATOR, MF_STRING, MSG, SMTO_ABORTIFHUNG, SM_CXSMICON, SM_CYSMICON, TPM_BOTTOMALIGN, TPM_RETURNCMD,
+    TPM_RIGHTBUTTON, WM_APP, WM_CLOSE, WM_CONTEXTMENU, WM_COPYDATA, WM_DESTROY, WM_ENDSESSION, WM_HOTKEY, WM_LBUTTONDBLCLK, WM_NULL, WM_QUERYENDSESSION, WM_TIMER,
+    WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_POPUP,
 };
 
 use crate::settings::Hotkey;
@@ -34,12 +40,28 @@ const HOTKEY_SNIP: [i32; 2] = [1, 3];
 const MSG_ARM_ESCAPE: u32 = WM_APP + 1;
 const MSG_DISARM_ESCAPE: u32 = WM_APP + 2;
 const MSG_SET_HOTKEY: u32 = WM_APP + 3;
+/// The tray icon's callback message.
+const MSG_TRAY: u32 = WM_APP + 10;
+/// Enter or Space on the focused tray icon (`NIN_SELECT | NINF_KEY`).
+const NIN_KEYSELECT: u32 = NIN_SELECT | 1;
+
+/// Retries adding the tray icon while the taskbar isn't up yet (right after sign-in).
+const TIMER_TRAY_RETRY: usize = 1;
+const TRAY_RETRY_MS: u32 = 2000;
+const TRAY_RETRIES: u8 = 15;
+
+const MENU_NEW: usize = 1;
+const MENU_OPEN: usize = 2;
+const MENU_QUIT: usize = 4;
 
 #[link(name = "kernel32")]
 extern "system" {
     fn CreateMutexW(attributes: *const c_void, initial_owner: i32, name: *const u16) -> HANDLE;
     fn GetModuleHandleW(name: *const u16) -> HMODULE;
 }
+
+/// The exe's icon resource; `winresource` embeds `assets/snipscreen.ico` under id 1.
+const ICON_RESOURCE: usize = 1;
 
 /// What a launch of the program asks for.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -154,11 +176,19 @@ struct State {
     hotkey: Option<Hotkey>,
     /// Index into `HOTKEY_SNIP` of the id the current shortcut is registered under.
     slot: usize,
+    /// The small icon from the exe, kept for re-adding the tray icon.
+    icon: HICON,
+    /// Whether the tray icon is in the notification area right now.
+    tray_added: bool,
+    tray_retries: u8,
+    /// Explorer broadcasts this after it (re)starts; every tray icon must be added again.
+    taskbar_created: u32,
 }
 
 impl Agent {
-    /// Starts the thread and its window, and registers `hotkey`. Fails only if the window can't be made.
-    pub fn start(hotkey: Hotkey, on_event: impl Fn(Event) + Send + 'static) -> Result<Started, String> {
+    /// Starts the thread and its window, registers `hotkey` and, with `tray`, adds the tray icon.
+    /// Fails only if the window can't be made.
+    pub fn start(hotkey: Hotkey, tray: bool, on_event: impl Fn(Event) + Send + 'static) -> Result<Started, String> {
         let (ready_tx, ready_rx) = channel();
         let thread = std::thread::spawn(move || unsafe {
             let hwnd = match create_window() {
@@ -169,8 +199,23 @@ impl Agent {
                 }
             };
             let first = register(hwnd, HOTKEY_SNIP[0], hotkey);
-            let state = Box::new(State { on_event: Box::new(on_event), hotkey: first.as_ref().ok().copied(), slot: 0 });
-            SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(state) as isize);
+            let instance = GetModuleHandleW(null());
+            let icon = LoadImageW(instance, ICON_RESOURCE as *const u16, IMAGE_ICON, GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_DEFAULTCOLOR) as HICON;
+            let taskbar_created = RegisterWindowMessageW(wide("TaskbarCreated").as_ptr());
+            let state = Box::new(State {
+                on_event: Box::new(on_event),
+                hotkey: first.as_ref().ok().copied(),
+                slot: 0,
+                icon,
+                tray_added: false,
+                tray_retries: 0,
+                taskbar_created,
+            });
+            let state = Box::into_raw(state);
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, state as isize);
+            if tray {
+                add_tray_icon(hwnd, &mut *state);
+            }
             let _ = ready_tx.send(Ok((hwnd as isize, first)));
             let mut msg: MSG = zeroed();
             while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
@@ -224,6 +269,58 @@ unsafe fn create_window() -> Result<HWND, String> {
         return Err(format!("couldn't create the agent window (error {})", GetLastError()));
     }
     Ok(hwnd)
+}
+
+fn tray_data(hwnd: HWND) -> NOTIFYICONDATAW {
+    NOTIFYICONDATAW { cbSize: size_of::<NOTIFYICONDATAW>() as u32, hWnd: hwnd, uID: 1, ..Default::default() }
+}
+
+/// Puts the icon in the notification area. Right after sign-in the taskbar may not exist yet, so a
+/// failure is retried on a timer for a while; Explorer's `TaskbarCreated` also re-adds it.
+unsafe fn add_tray_icon(hwnd: HWND, st: &mut State) {
+    let mut nid = tray_data(hwnd);
+    nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP | NIF_SHOWTIP;
+    nid.uCallbackMessage = MSG_TRAY;
+    nid.hIcon = st.icon;
+    for (dst, src) in nid.szTip.iter_mut().zip("SnipScreen".encode_utf16()) {
+        *dst = src;
+    }
+    st.tray_added = Shell_NotifyIconW(NIM_ADD, &nid) != 0;
+    if st.tray_added {
+        nid.Anonymous.uVersion = NOTIFYICON_VERSION_4;
+        Shell_NotifyIconW(NIM_SETVERSION, &nid);
+        KillTimer(hwnd, TIMER_TRAY_RETRY);
+    } else if st.tray_retries < TRAY_RETRIES {
+        st.tray_retries += 1;
+        SetTimer(hwnd, TIMER_TRAY_RETRY, TRAY_RETRY_MS, None);
+    } else {
+        KillTimer(hwnd, TIMER_TRAY_RETRY);
+    }
+}
+
+/// The right-click menu at screen point `x`, `y`, with the snip shortcut shown beside New snip.
+/// Returns the chosen item, 0 for none. Runs a modal loop, so the window procedure re-enters.
+unsafe fn tray_menu(hwnd: HWND, shortcut: Option<String>, x: i32, y: i32) -> usize {
+    let menu = CreatePopupMenu();
+    if menu.is_null() {
+        return 0;
+    }
+    let new = match shortcut {
+        Some(key) => format!("New snip\t{key}"),
+        None => "New snip".into(),
+    };
+    AppendMenuW(menu, MF_STRING, MENU_NEW, wide(&new).as_ptr());
+    AppendMenuW(menu, MF_STRING, MENU_OPEN, wide("Open SnipScreen").as_ptr());
+    AppendMenuW(menu, MF_SEPARATOR, 0, null());
+    AppendMenuW(menu, MF_STRING, MENU_QUIT, wide("Quit").as_ptr());
+    SetMenuDefaultItem(menu, MENU_OPEN as u32, 0);
+    // Without being the foreground window the menu wouldn't close when the person clicks elsewhere;
+    // the WM_NULL afterwards is the documented fix for the menu closing on the second try.
+    SetForegroundWindow(hwnd);
+    let chosen = TrackPopupMenuEx(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_BOTTOMALIGN, x, y, hwnd, null());
+    PostMessageW(hwnd, WM_NULL, 0, 0);
+    DestroyMenu(menu);
+    chosen as usize
 }
 
 unsafe fn register(hwnd: HWND, id: i32, hotkey: Hotkey) -> Result<Hotkey, String> {
@@ -280,6 +377,35 @@ unsafe extern "system" fn agent_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM)
                 None => 0,
             };
         }
+        MSG_TRAY => {
+            // NOTIFYICON_VERSION_4: the event is in the low word of lParam, the anchor point in wParam.
+            let (x, y) = ((w & 0xffff) as i16 as i32, ((w >> 16) & 0xffff) as i16 as i32);
+            match (l & 0xffff) as u32 {
+                NIN_SELECT | NIN_KEYSELECT | WM_LBUTTONDBLCLK => (st.on_event)(Event::Intent(Intent::Show)),
+                WM_CONTEXTMENU => {
+                    let chosen = tray_menu(hwnd, st.hotkey.map(Hotkey::label), x, y);
+                    // The menu's loop ran this procedure again; borrow the state afresh.
+                    let st = &mut *state;
+                    match chosen {
+                        MENU_NEW => (st.on_event)(Event::Snip),
+                        MENU_OPEN => (st.on_event)(Event::Intent(Intent::Show)),
+                        MENU_QUIT => (st.on_event)(Event::Intent(Intent::Quit)),
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+        WM_TIMER if w == TIMER_TRAY_RETRY => {
+            if !st.tray_added {
+                add_tray_icon(hwnd, st);
+            }
+        }
+        // Only when an icon was asked for: one that was added, or one still being retried.
+        _ if msg == st.taskbar_created && st.taskbar_created != 0 && (st.tray_added || st.tray_retries > 0) => {
+            st.tray_retries = 0;
+            add_tray_icon(hwnd, st);
+        }
         WM_QUERYENDSESSION => return 1,
         // Windows is signing out, or the installer's Restart Manager wants the file: leave cleanly.
         WM_ENDSESSION if w != 0 => (st.on_event)(Event::Intent(Intent::Quit)),
@@ -289,6 +415,12 @@ unsafe extern "system" fn agent_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM)
         WM_DESTROY => {
             for id in [HOTKEY_SNIP[0], HOTKEY_SNIP[1], HOTKEY_ESCAPE] {
                 UnregisterHotKey(hwnd, id);
+            }
+            if st.tray_added {
+                Shell_NotifyIconW(NIM_DELETE, &tray_data(hwnd));
+            }
+            if !st.icon.is_null() {
+                DestroyIcon(st.icon);
             }
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
             drop(Box::from_raw(state));
@@ -338,7 +470,8 @@ mod tests {
         use windows_sys::Win32::UI::Input::KeyboardAndMouse::{MOD_ALT, MOD_CONTROL, MOD_SHIFT, MOD_WIN, VK_F1};
         let (tx, rx) = channel();
         let first = Hotkey { mods: MOD_CONTROL | MOD_ALT | MOD_SHIFT | MOD_WIN, vk: VK_F1 as u32 + 21 };
-        let Started { agent, hotkey } = Agent::start(first, move |e| tx.send(e).unwrap()).expect("agent window");
+        // No tray icon: a test must not put one in the person's notification area.
+        let Started { agent, hotkey } = Agent::start(first, false, move |e| tx.send(e).unwrap()).expect("agent window");
         assert_eq!(hotkey, Ok(first));
 
         // `forward` looks the window up by class, so a copy run by another test or the real app could
