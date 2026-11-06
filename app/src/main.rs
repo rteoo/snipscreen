@@ -552,6 +552,7 @@ impl App {
     /// Explorer restarted: it, and winit, put a taskbar button back on every window. Taken off now,
     /// and again a moment later in case winit's own re-add lands after this.
     fn on_taskbar_created(&mut self, ctx: &egui::Context) {
+        win::forget_taskbar_list();
         if self.concealed {
             win::set_taskbar_button(self.hwnd as HWND, false);
             self.retab_at = Some(Instant::now() + Duration::from_secs(2));

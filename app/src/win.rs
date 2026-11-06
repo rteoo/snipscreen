@@ -582,7 +582,7 @@ pub fn wait_for_composition() {
 struct TaskbarListVtbl {
     query_interface: usize,
     add_ref: usize,
-    release: usize,
+    release: unsafe extern "system" fn(*mut c_void) -> u32,
     hr_init: unsafe extern "system" fn(*mut c_void) -> i32,
     add_tab: unsafe extern "system" fn(*mut c_void, HWND) -> i32,
     delete_tab: unsafe extern "system" fn(*mut c_void, HWND) -> i32,
@@ -607,6 +607,7 @@ pub fn set_taskbar_button(hwnd: HWND, on: bool) {
                 return;
             }
             if ((**list).hr_init)(list as *mut c_void) != 0 {
+                ((**list).release)(list as *mut c_void);
                 return;
             }
             cell.set(list);
@@ -616,6 +617,17 @@ pub fn set_taskbar_button(hwnd: HWND, on: bool) {
             ((**list).add_tab)(list as *mut c_void, hwnd);
         } else {
             ((**list).delete_tab)(list as *mut c_void, hwnd);
+        }
+    });
+}
+
+/// Lets go of this thread's taskbar list after Explorer restarted: the old one talks to the taskbar
+/// that is gone, so the next `set_taskbar_button` makes a new one.
+pub fn forget_taskbar_list() {
+    TASKBAR.with(|cell| {
+        let list = cell.replace(null_mut());
+        if !list.is_null() {
+            unsafe { ((**list).release)(list as *mut c_void) };
         }
     });
 }
@@ -1072,6 +1084,27 @@ mod tests {
         assert_eq!(bar_hit(&s, 300, 2, 600, false, false), HTCAPTION, "nor does one that can't be resized");
         let menu_open = BarState { bar: [0; 4], ..s };
         assert_eq!(bar_hit(&menu_open, 300, 20, 600, false, true), HTCLIENT, "with a menu open the bar is egui's");
+    }
+
+    #[test]
+    fn the_taskbar_list_is_made_again_after_being_forgotten() {
+        std::thread::spawn(|| {
+            let com = unsafe { CoInitializeEx(null(), COINIT_APARTMENTTHREADED as u32) } >= 0;
+            forget_taskbar_list();
+            // A window that isn't there: the list is still made, and the call does nothing.
+            set_taskbar_button(null_mut(), false);
+            let made = TASKBAR.with(|c| !c.get().is_null());
+            forget_taskbar_list();
+            assert!(TASKBAR.with(|c| c.get().is_null()));
+            set_taskbar_button(null_mut(), false);
+            assert_eq!(TASKBAR.with(|c| !c.get().is_null()), made, "made again on the next use");
+            forget_taskbar_list();
+            if com {
+                unsafe { CoUninitialize() };
+            }
+        })
+        .join()
+        .unwrap();
     }
 
     #[test]
