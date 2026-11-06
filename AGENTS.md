@@ -35,7 +35,7 @@ Run from `app/`.
 |---|---|
 | Build (dev, opt-level 2) | `cargo build` |
 | Release build | `cargo build --release` → `target/release/snipscreen.exe` |
-| Windows installer (from the repo root, after the release build) | `build_installer.bat` → `installer/Output/SnipscreenSetup-<version>.exe` (Inno Setup 6, per-user; set `SNIPSCREEN_BUILD_NONINTERACTIVE=1` to skip the pauses). Keep `MyAppVersion` in `installer/snipscreen.iss` equal to the `Cargo.toml` version. |
+| Windows installer (from the repo root, after the release build) | `build_installer.bat` → `installer/Output/SnipscreenSetup-<version>.exe` (Inno Setup 6, per-user; set `SNIPSCREEN_BUILD_NONINTERACTIVE=1` to skip the pauses). Keep `MyAppVersion` in `installer/snipscreen.iss` equal to the `Cargo.toml` version. Install and uninstall first run `snipscreen.exe --quit` and wait for the instance mutex to go; uninstall removes the HKCU Run value, the `SnipScreen.App` AUMID key and the `snipscreen` protocol key. |
 | Run | `cargo run` (opens the home window; the app then lives in the tray until Quit) |
 | Run as at sign-in | `cargo run -- --tray` (starts hidden in the tray; `--quit` ends a running copy) |
 | Tests | `cargo test` |

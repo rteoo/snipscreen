@@ -4,8 +4,13 @@
 ; app\target\release\snipscreen.exe), then build_installer.bat (compiles this
 ; script into installer\Output\).
 ;
-; SnipScreen keeps no settings or data of its own: snips and recordings live in
-; the user's Pictures and Videos folders and are never touched on uninstall.
+; Snips and recordings live in the user's Pictures and Videos folders and are
+; never touched on uninstall; neither are the settings in %APPDATA%\SnipScreen
+; or the notification pictures in %LOCALAPPDATA%\SnipScreen (some of them are
+; snips that were not auto-saved).
+; What SnipScreen registers for itself while it runs (the Run entry for "Start
+; with Windows", its notification identity and the snipscreen: link handler,
+; all under HKCU) is removed on uninstall.
 
 #define MyAppName "SnipScreen"
 #define MyAppVersion "0.1.1"
@@ -13,6 +18,7 @@
 #define MyAppExeName "snipscreen.exe"
 #define MyAppIcon "..\app\assets\snipscreen.ico"
 #define MyBuildDir "..\app\target\release"
+#define MyAppId "SnipScreen.App"
 
 [Setup]
 ; Stable AppId so future versions upgrade in place instead of installing twice.
@@ -39,8 +45,9 @@ SetupIconFile={#MyAppIcon}
 UninstallDisplayIcon={app}\{#MyAppExeName}
 UninstallDisplayName={#MyAppName} {#MyAppVersion}
 WizardStyle=modern
-; SnipScreen has no single-instance mutex; Restart Manager closes a running
-; copy so an upgrade can replace the executable.
+; SnipScreen stays running in the tray. [Code] asks a running copy to quit
+; (snipscreen.exe --quit) before files are replaced or removed; Restart Manager
+; stays on as the fallback.
 CloseApplications=yes
 
 [Languages]
@@ -48,7 +55,8 @@ Name: "brazilianportuguese"; MessagesFile: "compiler:Languages\BrazilianPortugue
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
-; No "start with Windows" task: SnipScreen opens straight into area picking.
+; No "start with Windows" task: the app's own setting (on by default) owns the
+; Run entry and can be changed in its Settings window.
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; Flags: unchecked
 
 [Files]
@@ -57,9 +65,53 @@ Source: "..\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\README.md"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
-Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
+; The same AppUserModelID the app sets on itself (notify.rs), so the running
+; window groups with a pinned shortcut and notifications carry the app's name.
+Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; AppUserModelID: "{#MyAppId}"
 Name: "{group}\{cm:UninstallProgram,{#MyAppName}}"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
 
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#MyAppName}}"; Flags: nowait postinstall skipifsilent
+
+[Code]
+// Asks a running copy to quit and waits (up to ~15 s, enough to finish saving a
+// recording) until it is gone, so its files can be replaced or removed.
+procedure QuitRunningCopy();
+var
+  Exe: String;
+  Code, Waited: Integer;
+begin
+  Exe := ExpandConstant('{app}\{#MyAppExeName}');
+  if not FileExists(Exe) then
+    Exit;
+  Exec(Exe, '--quit', '', SW_HIDE, ewWaitUntilTerminated, Code);
+  Waited := 0;
+  while CheckForMutexes('Local\SnipScreen.Instance') and (Waited < 15000) do
+  begin
+    Sleep(100);
+    Waited := Waited + 100;
+  end;
+end;
+
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+begin
+  QuitRunningCopy();
+  Result := '';
+end;
+
+function InitializeUninstall(): Boolean;
+begin
+  QuitRunningCopy();
+  Result := True;
+end;
+
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+begin
+  if CurUninstallStep = usPostUninstall then
+  begin
+    RegDeleteValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Run', 'SnipScreen');
+    RegDeleteKeyIncludingSubkeys(HKCU, 'Software\Classes\AppUserModelId\{#MyAppId}');
+    RegDeleteKeyIncludingSubkeys(HKCU, 'Software\Classes\snipscreen');
+  end;
+end;
