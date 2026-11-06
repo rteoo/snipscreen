@@ -120,9 +120,9 @@ impl Shape {
             ShapeKind::Ellipse => {
                 let r = Rect::from_two_pos(self.from, self.to);
                 let (a, b) = (r.width() / 2.0, r.height() / 2.0);
-                // Ramanujan's perimeter; chords of about 3 px keep the outline round at any size.
-                let perimeter = std::f32::consts::PI * (3.0 * (a + b) - ((3.0 * a + b) * (a + 3.0 * b)).sqrt());
-                let n = (perimeter / 3.0).clamp(24.0, 4096.0) as usize;
+                // Equal steps of the angle stray from the true curve by at most `a * step² / 8`; this
+                // many keeps that under 0.05 px at any size, with short chords where it bends most.
+                let n = (10.0 * a.max(b).sqrt()).clamp(24.0, 4096.0) as usize;
                 let at = |i: usize| {
                     let t = std::f32::consts::TAU * i as f32 / n as f32;
                     r.center() + eframe::egui::vec2(a * t.cos(), b * t.sin())
@@ -142,15 +142,16 @@ impl Shape {
         }
     }
 
-    fn paint(&self, patch: &mut ColorImage, at: [usize; 2]) {
+    /// Paints with `segments` and `head` worked out beforehand by `Mark::raster`.
+    fn paint(&self, segments: &[(Pos2, Pos2)], head: Option<[Pos2; 3]>, patch: &mut ColorImage, at: [usize; 2]) {
         let r = patch_rect(patch, at);
         let mut cover = vec![0f32; patch.pixels.len()];
         match self.kind {
             ShapeKind::Rectangle => cover_box_outline(&mut cover, r, Rect::from_two_pos(self.from, self.to), self.radius()),
-            _ => cover_segments(&mut cover, r, self.segments().into_iter(), self.radius()),
+            _ => cover_segments(&mut cover, r, segments.iter().copied(), self.radius()),
         }
-        if self.kind == ShapeKind::Arrow {
-            cover_triangle(&mut cover, r, self.arrow().1);
+        if let Some(head) = head {
+            cover_triangle(&mut cover, r, head);
         }
         for (px, &k) in patch.pixels.iter_mut().zip(&cover) {
             if k > 0.0 {
@@ -212,13 +213,26 @@ impl Mark {
         }
     }
 
-    /// Composites the mark onto `patch`, a piece of the picture whose top-left pixel is `at`. The
-    /// result for a pixel depends only on that pixel and the mark, never on where the patch ends,
-    /// so painting tile runs one at a time gives the same pixels as painting the whole picture.
-    pub fn paint(&self, patch: &mut ColorImage, at: [usize; 2]) {
+    /// The mark ready to paint many patches: its geometry is worked out once, not per tile run.
+    pub fn raster(&self) -> Raster<'_> {
         match self {
-            Mark::Stroke(s) => s.paint(patch, at),
-            Mark::Shape(s) => s.paint(patch, at),
+            Mark::Stroke(_) => Raster { mark: self, segments: Vec::new(), head: None },
+            Mark::Shape(s) => Raster {
+                mark: self,
+                segments: if s.kind == ShapeKind::Rectangle { Vec::new() } else { s.segments() },
+                head: (s.kind == ShapeKind::Arrow).then(|| s.arrow().1),
+            },
+        }
+    }
+
+    /// Image pixels the mark can touch, as a rectangle.
+    pub fn bounds(&self) -> Rect {
+        match self {
+            Mark::Stroke(s) => Rect::from_points(&s.points).expand(s.radius() + 1.0),
+            Mark::Shape(s) => {
+                let head = if s.kind == ShapeKind::Arrow { Rect::from_points(&s.arrow().1) } else { Rect::NOTHING };
+                Rect::from_two_pos(s.from, s.to).union(head).expand(s.radius() + 1.0)
+            }
         }
     }
 
@@ -240,6 +254,24 @@ impl Mark {
     }
 }
 
+/// A mark with its geometry worked out, ready to paint patch after patch.
+pub struct Raster<'a> {
+    mark: &'a Mark,
+    segments: Vec<(Pos2, Pos2)>,
+    head: Option<[Pos2; 3]>,
+}
+
+impl Raster<'_> {
+    /// Composites the mark onto `patch`, a piece of the picture whose top-left pixel is `at`. The
+    /// result for a pixel depends only on that pixel and the mark, never on where the patch ends,
+    /// so painting tile runs one at a time gives the same pixels as painting the whole picture.
+    pub fn paint(&self, patch: &mut ColorImage, at: [usize; 2]) {
+        match self.mark {
+            Mark::Stroke(s) => s.paint(patch, at),
+            Mark::Shape(s) => s.paint(&self.segments, self.head, patch, at),
+        }
+    }
+}
 /// Side of the square tiles marks are rasterised and uploaded in, in image pixels.
 pub const TILE: usize = 32;
 
@@ -333,22 +365,53 @@ fn patch_rect(patch: &ColorImage, at: [usize; 2]) -> PxRect {
 /// `rad`. Taking the max means overlaps and self-crossings never add up.
 fn cover_segments(cover: &mut [f32], r: PxRect, segments: impl Iterator<Item = (Pos2, Pos2)>, rad: f32) {
     let bw = r.x1 - r.x0;
+    let reach = rad + 1.0;
     for (a, b) in segments {
-        let sb = Rect::from_two_pos(a, b).expand(rad + 1.0);
+        let sb = Rect::from_two_pos(a, b).expand(reach);
         let sx0 = (sb.min.x.floor().max(0.0) as usize).max(r.x0);
         let sy0 = (sb.min.y.floor().max(0.0) as usize).max(r.y0);
         let sx1 = (sb.max.x.ceil().max(0.0) as usize).min(r.x1);
         let sy1 = (sb.max.y.ceil().max(0.0) as usize).min(r.y1);
+        if sx0 >= sx1 || sy0 >= sy1 {
+            continue;
+        }
+        // A pixel further than `reach` from the segment's line can't be covered, so on a slanted
+        // segment each row only visits its band, not the whole bounding box.
+        let ab = b - a;
+        let len2 = ab.length_sq();
+        let inv_len2 = if len2 > 0.0 { 1.0 / len2 } else { 0.0 };
+        let n = if len2 > 0.0 { ab.rot90() / len2.sqrt() } else { eframe::egui::Vec2::ZERO };
+        // Squared distances beyond which a pixel is untouched, and within which it is fully covered.
+        let (out2, in2) = ((rad + 0.5) * (rad + 0.5), if rad > 0.5 { (rad - 0.5) * (rad - 0.5) } else { -1.0 });
         for y in sy0..sy1 {
+            let (mut x0, mut x1) = (sx0, sx1);
+            if n.x.abs() > 1e-3 {
+                let off = n.y * (y as f32 + 0.5 - a.y);
+                let (u, v) = (a.x + (-reach - off) / n.x, a.x + (reach - off) / n.x);
+                x0 = x0.max((u.min(v) - 0.5).floor().max(0.0) as usize);
+                x1 = x1.min((u.max(v) + 0.5).ceil().max(0.0) as usize);
+            }
             let row = &mut cover[(y - r.y0) * bw..(y - r.y0 + 1) * bw];
-            for x in sx0..sx1 {
-                let d = dist_to_segment(Pos2::new(x as f32 + 0.5, y as f32 + 0.5), a, b);
-                let c = (rad + 0.5 - d).clamp(0.0, 1.0);
+            let py = y as f32 + 0.5 - a.y;
+            for x in x0..x1 {
                 let slot = &mut row[x - r.x0];
+                // Thick strokes overlap themselves a lot; a pixel already fully covered is done.
+                if *slot >= 1.0 {
+                    continue;
+                }
+                let px = x as f32 + 0.5 - a.x;
+                let t = ((px * ab.x + py * ab.y) * inv_len2).clamp(0.0, 1.0);
+                let (dx, dy) = (px - ab.x * t, py - ab.y * t);
+                let d2 = dx * dx + dy * dy;
+                if d2 >= out2 {
+                    continue;
+                }
+                let c = if d2 <= in2 { 1.0 } else { (rad + 0.5 - d2.sqrt()).clamp(0.0, 1.0) };
                 if c > *slot {
                     *slot = c;
                 }
             }
+
         }
     }
 }
@@ -450,12 +513,14 @@ fn multiply(px: Color32, ink: Color32, k: f32) -> Color32 {
 #[derive(Clone)]
 struct Snapshot {
     image: Arc<ColorImage>,
-    marks: Vec<Mark>,
+    marks: Vec<Arc<Mark>>,
 }
 
 pub struct Doc {
     pub image: Arc<ColorImage>,
-    pub marks: Vec<Mark>,
+    /// Shared, so an undo snapshot costs a pointer per mark and a mark keeps its identity from one
+    /// version of the list to the next (`changed_tiles` relies on that).
+    pub marks: Vec<Arc<Mark>>,
     undo: Vec<Snapshot>,
     redo: Vec<Snapshot>,
     /// Bumped whenever `image` changes so the texture can be refreshed.
@@ -529,7 +594,7 @@ impl Doc {
     /// Adds a finished mark as one undoable step.
     pub fn add_mark(&mut self, m: impl Into<Mark>) {
         self.checkpoint();
-        self.marks.push(m.into());
+        self.marks.push(Arc::new(m.into()));
         self.ink_rev += 1;
     }
 
@@ -564,9 +629,48 @@ impl Doc {
         self.ink_rev += 1;
         let shift = eframe::egui::vec2(x0 as f32, y0 as f32);
         for m in &mut self.marks {
-            m.translate(-shift);
+            Arc::make_mut(m).translate(-shift);
         }
     }
+
+    /// Tiles whose pixels differ between the picture burned with `before` and with the current
+    /// marks: the footprints of every mark in one list and not the other. Marks are compared by
+    /// identity, so `before` must be an earlier version of `marks` on the same picture.
+    pub fn changed_tiles(&self, before: &[Arc<Mark>]) -> Tiles {
+        let ids = |v: &[Arc<Mark>]| v.iter().map(Arc::as_ptr).collect::<std::collections::HashSet<_>>();
+        let (was, now) = (ids(before), ids(&self.marks));
+        let mut tiles = Tiles::new(self.size());
+        let gone = before.iter().filter(|m| !now.contains(&Arc::as_ptr(m)));
+        let added = self.marks.iter().filter(|m| !was.contains(&Arc::as_ptr(m)));
+        for m in gone.chain(added) {
+            m.footprint(&mut tiles);
+        }
+        tiles
+    }
+
+    /// The flattened picture over each run of `tiles`, built from the bare picture and only the
+    /// marks that reach that run: the same pixels `flatten` gives there.
+    // ceiling: re-burns every mark that reaches a damaged run (an undo under 20 thick highlighter
+    // strokes stacked on one path takes ~90 ms on 4K); keep per-mark layers if piled-up marks feel sticky.
+    pub fn render_runs(&self, tiles: &Tiles) -> Vec<(PxRect, ColorImage)> {
+
+        let marks: Vec<(Rect, Raster)> = self.marks.iter().map(|m| (m.bounds(), m.raster())).collect();
+        tiles
+            .runs()
+            .into_iter()
+            .map(|r| {
+                let mut patch = sub_image(&self.image, r.x0, r.y0, r.x1 - r.x0, r.y1 - r.y0);
+                let area = Rect::from_min_max(Pos2::new(r.x0 as f32, r.y0 as f32), Pos2::new(r.x1 as f32, r.y1 as f32));
+                for (b, raster) in &marks {
+                    if b.intersects(area) {
+                        raster.paint(&mut patch, r.pos());
+                    }
+                }
+                (r, patch)
+            })
+            .collect()
+    }
+
 
     /// The picture with all ink burned in, ready to copy or save.
     pub fn flatten(&self) -> ColorImage {
@@ -663,12 +767,14 @@ fn dist_to_segment(p: Pos2, a: Pos2, b: Pos2) -> f32 {
 pub fn burn(img: &mut ColorImage, m: &Mark) {
     let mut tiles = Tiles::new(img.size);
     m.footprint(&mut tiles);
+    let raster = m.raster();
     for r in tiles.runs() {
         let mut patch = sub_image(img, r.x0, r.y0, r.x1 - r.x0, r.y1 - r.y0);
-        m.paint(&mut patch, r.pos());
+        raster.paint(&mut patch, r.pos());
         paste(img, &patch, r.pos());
     }
 }
+
 
 /// Copies `patch` into `img` with its top-left pixel at `at`.
 pub fn paste(img: &mut ColorImage, patch: &ColorImage, at: [usize; 2]) {
@@ -702,12 +808,12 @@ mod tests {
     fn crop_moves_strokes_and_undo_restores() {
         let mut d = Doc::new(white(100, 80));
         d.checkpoint();
-        d.marks.push(Mark::Stroke(Stroke {
+        d.marks.push(Arc::new(Mark::Stroke(Stroke {
             ink: Ink::Pen,
             color: Color32::RED,
             width: 4.0,
             points: vec![Pos2::new(50.0, 40.0)],
-        }));
+        })));
         d.crop(Rect::from_min_max(Pos2::new(10.0, 20.0), Pos2::new(60.0, 70.0)));
         assert_eq!(d.size(), [50, 50]);
         assert_eq!(stroke(&d.marks[0]).points[0], Pos2::new(40.0, 20.0));
@@ -723,12 +829,12 @@ mod tests {
     #[test]
     fn flatten_burns_pen_ink() {
         let mut d = Doc::new(white(20, 20));
-        d.marks.push(Mark::Stroke(Stroke {
+        d.marks.push(Arc::new(Mark::Stroke(Stroke {
             ink: Ink::Pen,
             color: Color32::BLACK,
             width: 6.0,
             points: vec![Pos2::new(2.0, 10.0), Pos2::new(18.0, 10.0)],
-        }));
+        })));
         let out = d.flatten();
         assert_eq!(out.pixels[10 * 20 + 10], Color32::BLACK);
         assert_eq!(out.pixels[0], Color32::WHITE);
@@ -755,7 +861,7 @@ mod tests {
     fn repaint(shown: &mut ColorImage, pristine: &ColorImage, m: &Mark, tiles: &Tiles) {
         for r in tiles.runs() {
             let mut patch = sub_image(pristine, r.x0, r.y0, r.x1 - r.x0, r.y1 - r.y0);
-            m.paint(&mut patch, r.pos());
+            m.raster().paint(&mut patch, r.pos());
             paste(shown, &patch, r.pos());
         }
     }
@@ -837,7 +943,7 @@ mod tests {
             let mut by_runs = gradient(70, 50);
             burn(&mut by_runs, m);
             let mut whole = gradient(70, 50);
-            m.paint(&mut whole, [0, 0]);
+            m.raster().paint(&mut whole, [0, 0]);
             assert!(by_runs.pixels == whole.pixels, "{m:?} paints outside its footprint");
         }
     }
@@ -904,9 +1010,45 @@ mod tests {
         assert!(d.hits(Pos2::new(50.0, 54.0), 1.0), "in the arrow head");
         assert!(d.erase_at(Pos2::new(90.0, 40.0), 2.0));
         assert_eq!(d.marks.len(), 1);
-        assert!(matches!(&d.marks[0], Mark::Shape(Shape { kind: ShapeKind::Arrow, .. })));
+        assert!(matches!(&*d.marks[0], Mark::Shape(Shape { kind: ShapeKind::Arrow, .. })));
         d.crop(Rect::from_min_max(Pos2::new(5.0, 5.0), Pos2::new(95.0, 95.0)));
-        assert!(matches!(&d.marks[0], Mark::Shape(s) if s.from == Pos2::new(5.0, 45.0)), "crop moves shapes too");
+        assert!(matches!(&*d.marks[0], Mark::Shape(s) if s.from == Pos2::new(5.0, 45.0)), "crop moves shapes too");
+    }
+
+    #[test]
+    fn patching_only_the_changed_tiles_matches_a_full_flatten() {
+        let mut d = Doc::new(gradient(120, 90));
+        // Overlapping marks of every kind, so a redrawn tile must re-burn its neighbours in order.
+        d.add_mark(Stroke { ink: Ink::Highlighter, ..zigzag() });
+        d.add_mark(shape(ShapeKind::Rectangle, 6.0, (10.0, 10.0), (100.0, 70.0)));
+        d.add_mark(Stroke { ink: Ink::Pen, color: Color32::BLUE, width: 5.0, points: vec![Pos2::new(0.0, 80.0), Pos2::new(119.0, 5.0)] });
+        d.add_mark(shape(ShapeKind::Ellipse, 3.0, (30.0, 20.0), (110.0, 85.0)));
+        d.add_mark(Stroke { ink: Ink::Highlighter, color: Color32::from_rgb(92, 214, 255), width: 14.0, points: vec![Pos2::new(5.0, 40.0), Pos2::new(115.0, 45.0)] });
+        let mut shown = d.flatten();
+        let mut burned = d.marks.clone();
+        let mut check = |d: &Doc, what: &str| {
+            for (r, patch) in d.render_runs(&d.changed_tiles(&burned)) {
+                paste(&mut shown, &patch, r.pos());
+            }
+            burned = d.marks.clone();
+            assert!(shown.pixels == d.flatten().pixels, "after {what}");
+        };
+        d.checkpoint();
+        assert!(d.erase_at(Pos2::new(100.0, 40.0), 2.0));
+        check(&d, "erasing the rectangle");
+        d.checkpoint();
+        assert!(d.erase_at(Pos2::new(60.0, 43.0), 1.0));
+        check(&d, "erasing through a pile of marks");
+        d.undo();
+        check(&d, "undo");
+        d.undo();
+        check(&d, "a second undo");
+        d.redo();
+        check(&d, "redo");
+        d.undo();
+        d.undo();
+        check(&d, "undoing an add");
+        assert_eq!(d.changed_tiles(&d.marks.clone()), Tiles::new(d.size()), "nothing changed, nothing to redraw");
     }
 
     #[test]
@@ -951,12 +1093,12 @@ mod tests {
     fn eraser_removes_touched_stroke_only() {
         let mut d = Doc::new(white(50, 50));
         for y in [10.0, 40.0] {
-            d.marks.push(Mark::Stroke(Stroke {
+            d.marks.push(Arc::new(Mark::Stroke(Stroke {
                 ink: Ink::Highlighter,
                 color: Color32::YELLOW,
                 width: 4.0,
                 points: vec![Pos2::new(5.0, y), Pos2::new(45.0, y)],
-            }));
+            })));
         }
         assert!(d.erase_at(Pos2::new(25.0, 12.0), 2.0));
         assert_eq!(d.marks.len(), 1);

@@ -403,22 +403,8 @@ impl Snip {
     fn canvas(&mut self, ui: &mut egui::Ui, guard: &PopupClickGuard) {
         let ctx = ui.ctx().clone();
         let Snip { doc, tools, texture, drawing, erase_marked, crop, crop_drag, zoom: zoom_choice, key_zoom } = self;
-        let rev = (doc.image_rev, doc.ink_rev);
-        if texture.as_ref().is_none_or(|c| c.rev != rev) {
-            // ceiling: erase/undo re-flatten the whole snip (~150 ms for 20 long strokes on 4K); burn per-stroke tiles if erasing feels sticky.
-            let shown = if doc.marks.is_empty() { doc.image.clone() } else { Arc::new(doc.flatten()) };
-            match texture {
-                Some(c) => {
-                    c.tex.set(shown.clone(), TextureOptions::LINEAR);
-                    *c = CanvasTex::new(c.tex.clone(), shown, rev);
-                }
-                None => {
-                    let tex = ctx.load_texture("snip", shown.clone(), TextureOptions::LINEAR);
-                    *texture = Some(CanvasTex::new(tex, shown, rev));
-                }
-            }
-        }
-        let Some(canvas) = texture else { return };
+        let canvas = texture.get_or_insert_with(|| CanvasTex::new(&ctx, doc));
+        canvas.sync(doc);
 
         let ppp = ctx.pixels_per_point();
         let px_size = vec2(doc.size()[0] as f32, doc.size()[1] as f32);
@@ -554,6 +540,8 @@ impl Snip {
                     }
                 }
             }
+            // An erase above changed the doc after the first sync: show it in this same frame.
+            canvas.sync(doc);
             match drawing {
                 Some(m) => canvas.show_live(m),
                 None => canvas.clear_live(),
@@ -1036,6 +1024,8 @@ struct CanvasTex {
     shown: Arc<ColorImage>,
     /// `(image_rev, ink_rev)` of the doc that `shown` was built from.
     rev: (u64, u64),
+    /// The marks burned into `shown`, to tell which ones an erase or undo took away or brought back.
+    burned: Vec<Arc<Mark>>,
     live: Live,
 }
 
@@ -1055,17 +1045,46 @@ impl Live {
 }
 
 impl CanvasTex {
-    fn new(tex: TextureHandle, shown: Arc<ColorImage>, rev: (u64, u64)) -> Self {
+    /// The canvas for `doc`, flattened in full.
+    fn new(ctx: &egui::Context, doc: &Doc) -> Self {
+        let shown = if doc.marks.is_empty() { doc.image.clone() } else { Arc::new(doc.flatten()) };
+        let tex = ctx.load_texture("snip", shown.clone(), TextureOptions::LINEAR);
         let live = Live::new(shown.size);
-        Self { tex, shown, rev, live }
+        Self { tex, shown, rev: (doc.image_rev, doc.ink_rev), burned: doc.marks.clone(), live }
+    }
+
+    /// Brings the picture and texture up to date with `doc`. When only marks changed (an erase, an
+    /// undo of a mark) just the tiles those marks cover are redrawn and uploaded; a new picture
+    /// (crop, or undoing one) is flattened and uploaded whole.
+    fn sync(&mut self, doc: &Doc) {
+        let rev = (doc.image_rev, doc.ink_rev);
+        if self.rev == rev {
+            return;
+        }
+        if self.rev.0 == rev.0 {
+            let mut tiles = doc.changed_tiles(&self.burned);
+            tiles.union(&self.live.tiles);
+            let shown = Arc::make_mut(&mut self.shown);
+            for (r, patch) in doc.render_runs(&tiles) {
+                markup::paste(shown, &patch, r.pos());
+                self.tex.set_partial(r.pos(), patch, TextureOptions::LINEAR);
+            }
+        } else {
+            self.shown = if doc.marks.is_empty() { doc.image.clone() } else { Arc::new(doc.flatten()) };
+            self.tex.set(self.shown.clone(), TextureOptions::LINEAR);
+        }
+        self.rev = rev;
+        self.burned = doc.marks.clone();
+        self.live = Live::new(self.shown.size);
     }
 
     /// Uploads the runs of `tiles` with `m` painted over the committed picture, or plain when `m` is `None`.
     fn upload(&mut self, tiles: &Tiles, m: Option<&Mark>) {
+        let raster = m.map(Mark::raster);
         for r in tiles.runs() {
             let mut patch = markup::sub_image(&self.shown, r.x0, r.y0, r.x1 - r.x0, r.y1 - r.y0);
-            if let Some(m) = m {
-                m.paint(&mut patch, r.pos());
+            if let Some(raster) = &raster {
+                raster.paint(&mut patch, r.pos());
             }
             self.tex.set_partial(r.pos(), patch, TextureOptions::LINEAR);
         }
@@ -1079,9 +1098,10 @@ impl CanvasTex {
             let mut tiles = Tiles::new(doc.size());
             m.footprint(&mut tiles);
             let shown = Arc::make_mut(&mut self.shown);
+            let raster = m.raster();
             for r in tiles.runs() {
                 let mut patch = markup::sub_image(shown, r.x0, r.y0, r.x1 - r.x0, r.y1 - r.y0);
-                m.paint(&mut patch, r.pos());
+                raster.paint(&mut patch, r.pos());
                 markup::paste(shown, &patch, r.pos());
                 self.tex.set_partial(r.pos(), patch, TextureOptions::LINEAR);
             }
@@ -1092,6 +1112,7 @@ impl CanvasTex {
         doc.add_mark(m);
         if current {
             self.rev.1 = doc.ink_rev;
+            self.burned = doc.marks.clone();
         }
         self.live = Live::new(self.shown.size);
     }
@@ -1505,10 +1526,10 @@ mod tests {
         snip.doc.add_mark(stroke());
         assert_eq!(*snip.flattened(), snip.doc.flatten(), "no canvas yet: flattened from the doc");
         let ctx = egui::Context::default();
-        let tex = ctx.load_texture("t", ColorImage::new([1, 1], vec![Color32::BLACK]), TextureOptions::LINEAR);
-        let shown = Arc::new(snip.doc.flatten());
-        snip.texture = Some(CanvasTex::new(tex, shown.clone(), (snip.doc.image_rev, snip.doc.ink_rev)));
-        assert!(Arc::ptr_eq(&snip.flattened(), &shown), "a current canvas is reused, not re-burned");
+        snip.texture = Some(CanvasTex::new(&ctx, &snip.doc));
+        let shown = snip.texture.as_ref().unwrap().shown.clone();
+        assert!(
+Arc::ptr_eq(&snip.flattened(), &shown), "a current canvas is reused, not re-burned");
         snip.doc.erase_at(pos2(3.0, 3.0), 2.0);
         assert!(!Arc::ptr_eq(&snip.flattened(), &shown), "a stale canvas is never copied");
         assert_eq!(*snip.flattened(), snip.doc.flatten());
@@ -1596,7 +1617,7 @@ mod tests {
         for (kind, _, _) in SHAPES {
             let mut snip = Snip::new(gradient(300, 200), Tools { tool: Tool::Shape, shape_kind: kind, ..Tools::default() });
             drag_and_compare(&mut snip, &PATH);
-            assert!(matches!(&snip.doc.marks[0], Mark::Shape(s) if s.kind == kind && s.to == pos2(600.0 - 640.0 + 150.0, 360.0 - 400.0 + 100.0)), "{kind:?} ends where the drag ended");
+            assert!(matches!(&*snip.doc.marks[0], Mark::Shape(s) if s.kind == kind && s.to == pos2(600.0 - 640.0 + 150.0, 360.0 - 400.0 + 100.0)), "{kind:?} ends where the drag ended");
         }
     }
 
@@ -1668,6 +1689,34 @@ mod tests {
         let esc = Event::Key { key: Key::Escape, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE };
         frame(&ctx, &editors, vec![esc]);
         assert_eq!(editors.with(a, |e| e.snip().map(|s| (s.crop, s.doc.size(), s.doc.can_undo()))).unwrap(), Some((None, [40, 30], false)));
+    }
+
+    #[test]
+    fn erase_and_undo_show_at_once_and_match_the_saved_snip() {
+        let ctx = egui::Context::default();
+        let mut snip = Snip::new(gradient(300, 200), Tools::default());
+        let mut screen = Screen { image: None };
+        canvas_frame(&ctx, &mut snip, &mut screen, vec![]);
+        for (tool, path) in [(Tool::Pen, &PATH[..]), (Tool::Highlighter, &[pos2(600.0, 450.0), pos2(650.0, 455.0), pos2(700.0, 460.0)][..])] {
+            snip.tools.tool = tool;
+            canvas_frame(&ctx, &mut snip, &mut screen, vec![Event::PointerMoved(path[0]), pointer(path[0], true)]);
+            for &p in &path[1..] {
+                canvas_frame(&ctx, &mut snip, &mut screen, vec![Event::PointerMoved(p)]);
+            }
+            canvas_frame(&ctx, &mut snip, &mut screen, vec![pointer(*path.last().unwrap(), false)]);
+        }
+        assert_eq!(snip.doc.marks.len(), 2);
+        let full = snip.texture.as_ref().map(|c| c.tex.id());
+        snip.tools.tool = Tool::Eraser;
+        canvas_frame(&ctx, &mut snip, &mut screen, vec![Event::PointerMoved(PATH[0]), pointer(PATH[0], true)]);
+        canvas_frame(&ctx, &mut snip, &mut screen, vec![pointer(PATH[0], false)]);
+        assert_eq!(snip.doc.marks.len(), 1, "the click erased the pen stroke");
+        assert!(screen.pixels() == snip.doc.flatten().pixels, "the erase shows in the frame that made it");
+        snip.step(false);
+        canvas_frame(&ctx, &mut snip, &mut screen, vec![]);
+        assert!(screen.pixels() == snip.doc.flatten().pixels, "undo shows the stroke again");
+        assert_eq!(snip.texture.as_ref().map(|c| c.tex.id()), full, "the same texture, patched rather than replaced");
+        assert!(*snip.flattened() == snip.doc.flatten());
     }
 
     #[test]
