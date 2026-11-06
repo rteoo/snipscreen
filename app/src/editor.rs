@@ -37,6 +37,8 @@ const CANVAS_MARGIN: Vec2 = vec2(32.0, 32.0);
 const SCROLL_ID: &str = "snip_scroll";
 /// Frames spent keeping a new window on its monitor while Windows finishes any rescaling.
 const SETTLE_FRAMES: u8 = 8;
+/// Frames a Save waits for its window's handle (found by title once Windows has made the window).
+const SAVE_WAIT_FRAMES: u8 = 30;
 /// Each further open editor starts this many pixels down and right of the last, so none hides another.
 const CASCADE: i32 = 28;
 
@@ -282,6 +284,8 @@ pub struct Editor {
     closed: bool,
     /// A Save is under way (its dialog is open or its file is being written).
     saving: Arc<AtomicBool>,
+    /// Frames left to wait for this window's handle before a Save asked for too early gives up.
+    save_waiting: u8,
 }
 
 /// Clears its flag when dropped, however the worker holding it ends.
@@ -683,6 +687,7 @@ impl Editor {
             new_requested: false,
             closed: false,
             saving: Arc::default(),
+            save_waiting: 0,
         }
     }
 
@@ -720,6 +725,7 @@ impl Editor {
             }
         }
         self.attach_title_bar(&ctx);
+        self.retry_save(&ctx);
         self.settle_window(&ctx);
         self.popup_guard.begin_frame(&ctx);
         self.shortcuts(&ctx);
@@ -760,9 +766,20 @@ impl Editor {
         ctx.request_repaint();
     }
 
-    /// Owner for dialogs: this window, or the shell's until this one is found.
-    fn owner(&mut self) -> HWND {
-        self.own_hwnd().unwrap_or(self.root_hwnd as HWND)
+    /// A Save asked for before this window's handle was known runs once it is.
+    fn retry_save(&mut self, ctx: &egui::Context) {
+        if self.save_waiting == 0 {
+            return;
+        }
+        self.save_waiting -= 1;
+        if self.own_hwnd().is_some() {
+            self.save_waiting = 0;
+            self.save_as(ctx);
+        } else if self.save_waiting == 0 {
+            self.say("Couldn't open Save: this window isn't ready. Try again in a moment".into());
+        } else {
+            ctx.request_repaint();
+        }
     }
 
     /// First frames only: move to the chosen corner, then keep the window inside its monitor once
@@ -919,6 +936,13 @@ impl Editor {
     /// takes a moment to encode, a long recording a moment to copy. A second Save while one is under
     /// way is ignored.
     fn save_as(&mut self, ctx: &egui::Context) {
+        // The dialog is modal to its owner, which must be this window: owned by the shell's, on
+        // another thread's terms, it would block the home window or the recording bar instead.
+        let Some(owner) = self.own_hwnd() else {
+            self.save_waiting = SAVE_WAIT_FRAMES;
+            ctx.request_repaint();
+            return;
+        };
         if self.saving.swap(true, Ordering::AcqRel) {
             return;
         }
@@ -927,13 +951,17 @@ impl Editor {
             snip.finish_text();
         }
         // Window handles are plain numbers to Windows; this one is only used to own the dialog.
-        let (owner, report) = (self.owner() as isize, self.notifier(ctx));
+        let (owner, report) = (owner as isize, self.notifier(ctx));
         let job: Box<dyn FnOnce() + Send> = match &self.content {
             Content::Snip(snip) => {
                 let (start, name, image) = (win::pictures_dir().map(|d| d.join("Screenshots")), format!("Snip {}", win::timestamp()), snip.flattened());
                 Box::new(move || {
                     let _busy = busy;
-                    let Some(path) = win::ask_save_path(owner as HWND, start.as_deref(), &name, ("PNG image", "png")) else { return };
+                    let path = match win::ask_save_path(owner as HWND, start.as_deref(), &name, ("PNG image", "png")) {
+                        Ok(Some(path)) => path,
+                        Ok(None) => return,
+                        Err(e) => return report.send(format!("Couldn't save: {e}")),
+                    };
                     let png = win::encode_png(&image);
                     // Let go of the picture once it is encoded, so the editor's next mark needn't copy it.
                     drop(image);
@@ -946,7 +974,11 @@ impl Editor {
                 let from = v.path.clone();
                 Box::new(move || {
                     let _busy = busy;
-                    let Some(path) = win::ask_save_path(owner as HWND, start.as_deref(), &name, ("MP4 video", "mp4")) else { return };
+                    let path = match win::ask_save_path(owner as HWND, start.as_deref(), &name, ("MP4 video", "mp4")) {
+                        Ok(Some(path)) => path,
+                        Ok(None) => return,
+                        Err(e) => return report.send(format!("Couldn't save: {e}")),
+                    };
                     report.send(saved_note(&path, std::fs::copy(&from, &path).map(|_| ()).map_err(|e| e.to_string())));
                 })
             }
@@ -2461,9 +2493,11 @@ Arc::ptr_eq(&snip.flattened(), &shown), "a current canvas is reused, not re-burn
         let fresh = Snip::new(white(10, 10), Tools::default());
         let mut ed = Editor::new(Content::Snip(Box::new(fresh)), "t".into(), ViewportId::ROOT, 0, None, Default::default(), MIN_EDIT_W);
         // As if a Save dialog were open: another Save must return at once and open nothing.
+        ed.hwnd = Some(1);
         ed.saving.store(true, Ordering::Release);
         ed.save_as(&ctx);
         assert!(ed.saving.load(Ordering::Acquire), "the first save still owns the flag");
+        assert_eq!(ed.save_waiting, 0);
         // The worker frees it however it ends, a panic included.
         let busy = Busy(ed.saving.clone());
         let _ = std::thread::spawn(move || {
@@ -2472,6 +2506,23 @@ Arc::ptr_eq(&snip.flattened(), &shown), "a current canvas is reused, not re-burn
         })
         .join();
         assert!(!ed.saving.load(Ordering::Acquire), "a new Save can start");
+    }
+
+    #[test]
+    fn a_save_before_the_window_is_found_waits_for_it_and_never_borrows_the_shells() {
+        let ctx = egui::Context::default();
+        let fresh = Snip::new(white(10, 10), Tools::default());
+        let mut ed = Editor::new(Content::Snip(Box::new(fresh)), "no window has this title 7f3a".into(), ViewportId::ROOT, 0, None, Default::default(), MIN_EDIT_W);
+        ed.save_as(&ctx);
+        assert!(!ed.saving.load(Ordering::Acquire), "no dialog yet: there is no window of its own to own it");
+        assert_eq!(ed.save_waiting, SAVE_WAIT_FRAMES);
+        for _ in 0..SAVE_WAIT_FRAMES {
+            assert!(ed.note.is_none());
+            ed.retry_save(&ctx);
+        }
+        assert_eq!(ed.save_waiting, 0);
+        assert!(!ed.saving.load(Ordering::Acquire));
+        assert!(ed.note.is_some(), "giving up says so");
     }
 
     #[test]

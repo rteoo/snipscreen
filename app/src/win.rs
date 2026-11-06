@@ -499,7 +499,8 @@ pub fn timestamp() -> String {
     )
 }
 
-/// Native "Save as" dialog, modal to `owner`. `None` when the person cancels.
+/// Native "Save as" dialog, modal to `owner`. `Ok(None)` when the person cancels; an error when
+/// the dialog failed (a path longer than it can hand back, say).
 /// `kind` is (description, extension), e.g. ("PNG image", "png"). Runs on any thread: the dialog's
 /// shell views need a single-threaded COM apartment, which a worker thread gets here for the call.
 /// `owner` may belong to another thread; it is disabled while the dialog is up.
@@ -508,7 +509,8 @@ pub fn ask_save_path(
     start_dir: Option<&std::path::Path>,
     name: &str,
     (description, extension): (&str, &str),
-) -> Option<PathBuf> {
+) -> Result<Option<PathBuf>, String> {
+    use windows_sys::Win32::UI::Controls::Dialogs::{CommDlgExtendedError, FNERR_BUFFERTOOSMALL};
     let mut buf = [0u16; 1024];
     let initial = wide(name);
     buf[..initial.len()].copy_from_slice(&initial);
@@ -529,14 +531,20 @@ pub fn ask_save_path(
     // in another kind of apartment (RPC_E_CHANGED_MODE) is left as it was.
     let com = unsafe { CoInitializeEx(null(), (COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) as u32) } >= 0;
     let chosen = unsafe { GetSaveFileNameW(&mut ofn) } != 0;
+    // Read before anything else can call into the dialog library on this thread.
+    let failure = if chosen { 0 } else { unsafe { CommDlgExtendedError() } };
     if com {
         unsafe { CoUninitialize() };
     }
-    if !chosen {
-        return None;
+    match failure {
+        _ if chosen => {
+            let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+            Ok(Some(PathBuf::from(String::from_utf16_lossy(&buf[..len]))))
+        }
+        0 => Ok(None),
+        FNERR_BUFFERTOOSMALL => Err(format!("the path is longer than the {} characters Save can take", buf.len() - 1)),
+        code => Err(format!("the Save dialog failed (error {code:#x})")),
     }
-    let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
-    Some(PathBuf::from(String::from_utf16_lossy(&buf[..len])))
 }
 
 #[link(name = "user32")]
