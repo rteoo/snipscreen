@@ -1478,8 +1478,8 @@ fn sample_image(w: usize, h: usize) -> ColorImage {
 fn sample_strokes() -> Vec<markup::Stroke> {
     let line = |a: Pos2, b: Pos2| (0..=20).map(|i| a + (b - a) * (i as f32 / 20.0)).collect::<Vec<_>>();
     vec![
-        markup::Stroke { ink: markup::Ink::Highlighter, color: Color32::from_rgb(0xff, 0xe6, 0x00), width: 18.0, points: line(pos2(270.0, 140.0), pos2(450.0, 140.0)) },
-        markup::Stroke { ink: markup::Ink::Pen, color: Color32::from_rgb(0xe8, 0x1c, 0x24), width: 4.0, points: line(pos2(520.0, 300.0), pos2(700.0, 420.0)) },
+        markup::Stroke { on_dark: false, ink: markup::Ink::Highlighter, color: Color32::from_rgb(0xff, 0xe6, 0x00), width: 18.0, points: line(pos2(270.0, 140.0), pos2(450.0, 140.0)) },
+        markup::Stroke { on_dark: false, ink: markup::Ink::Pen, color: Color32::from_rgb(0xe8, 0x1c, 0x24), width: 4.0, points: line(pos2(520.0, 300.0), pos2(700.0, 420.0)) },
     ]
 }
 

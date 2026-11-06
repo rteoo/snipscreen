@@ -520,7 +520,9 @@ impl Snip {
                     let width_px = width * k;
                     if resp.drag_started() || resp.clicked() {
                         if let Some(p) = origin {
-                            *drawing = Some(Mark::Stroke(Stroke { ink, color, width: width_px, points: vec![to_px(p)] }));
+                            // The highlighter picks how it blends from what it starts on, as shown, and keeps it for the stroke.
+                            let on_dark = ink == Ink::Highlighter && markup::is_dark_under(&canvas.shown, to_px(p), width_px / 2.0);
+                            *drawing = Some(Mark::Stroke(Stroke { ink, color, width: width_px, points: vec![to_px(p)], on_dark }));
                         }
                     }
                     if let (Some(Mark::Stroke(s)), Some(p)) = (drawing.as_mut(), pointer) {
@@ -1618,7 +1620,7 @@ mod tests {
     fn undo_drops_a_stroke_in_progress() {
         let mut doc = Doc::new(white(100, 80));
         doc.crop(Rect::from_min_max(pos2(10.0, 10.0), pos2(60.0, 50.0)));
-        let mut drawing = Some(Mark::Stroke(Stroke { ink: Ink::Pen, color: Color32::RED, width: 4.0, points: vec![pos2(1.0, 1.0)] }));
+        let mut drawing = Some(Mark::Stroke(Stroke { on_dark: false, ink: Ink::Pen, color: Color32::RED, width: 4.0, points: vec![pos2(1.0, 1.0)] }));
         step_history(&mut doc, &mut None, &mut drawing, false);
         assert!(drawing.is_none(), "a stroke in the old image's coordinates must not land on the restored one");
     }
@@ -1849,7 +1851,7 @@ mod tests {
     #[test]
     fn copy_and_save_use_the_canvas_picture_only_while_it_is_current() {
         let mut snip = Snip::new(white(8, 8), Tools::default());
-        let stroke = || Stroke { ink: Ink::Pen, color: Color32::RED, width: 2.0, points: vec![pos2(1.0, 1.0), pos2(6.0, 6.0)] };
+        let stroke = || Stroke { on_dark: false, ink: Ink::Pen, color: Color32::RED, width: 2.0, points: vec![pos2(1.0, 1.0), pos2(6.0, 6.0)] };
         snip.doc.add_mark(stroke());
         assert_eq!(*snip.flattened(), snip.doc.flatten(), "no canvas yet: flattened from the doc");
         let ctx = egui::Context::default();
@@ -1939,6 +1941,17 @@ Arc::ptr_eq(&snip.flattened(), &shown), "a current canvas is reused, not re-burn
             drag_and_compare(&mut snip, &PATH[1..]);
         }
     }
+    #[test]
+    fn the_highlighter_screens_on_a_dark_snip_and_multiplies_on_a_light_one_exactly_as_saved() {
+        for (base, dark) in [(Color32::from_rgb(28, 30, 34), true), (Color32::from_rgb(250, 250, 248), false)] {
+            let mut snip = Snip::new(ColorImage::new([300, 200], vec![base; 60000]), Tools { tool: Tool::Highlighter, ..Tools::default() });
+            drag_and_compare(&mut snip, &PATH);
+            assert!(matches!(&*snip.doc.marks[0], Mark::Stroke(s) if s.on_dark == dark), "on a {base:?} snip");
+            // A second stroke starting on the first keeps reading the picture as shown.
+            drag_and_compare(&mut snip, &PATH[1..]);
+        }
+    }
+
     #[test]
     fn shapes_show_exactly_what_is_saved_while_they_are_dragged() {
         for (kind, _, _) in SHAPES {
@@ -2174,7 +2187,7 @@ Arc::ptr_eq(&snip.flattened(), &shown), "a current canvas is reused, not re-burn
 
         editors.with(a, |e| {
             let Content::Snip(s) = &mut e.content else { panic!("a snip") };
-            s.doc.add_mark(Stroke { ink: Ink::Pen, color: Color32::RED, width: 2.0, points: vec![pos2(1.0, 1.0)] });
+            s.doc.add_mark(Stroke { on_dark: false, ink: Ink::Pen, color: Color32::RED, width: 2.0, points: vec![pos2(1.0, 1.0)] });
         });
         let undo = |id| editors.with(id, |e| e.snip().is_some_and(|s| s.doc.can_undo())).unwrap();
         assert!(undo(a) && !undo(b), "undo stacks are separate");
@@ -2414,6 +2427,34 @@ Arc::ptr_eq(&snip.flattened(), &shown), "a current canvas is reused, not re-burn
         click(&mut ed, button(0.0));
         assert_eq!(draft_text(&mut ed), None, "switching tools places it");
         assert_eq!(snip_of(&mut ed).doc.marks.len(), 1);
+    }
+
+    /// Writes review renders, made by the same rasteriser as a saved snip, into `SNIPSCREEN_RENDER_DIR`.
+    #[test]
+    #[ignore = "writes PNGs for a person to look at"]
+    fn render_samples_for_review() {
+        let Ok(dir) = std::env::var("SNIPSCREEN_RENDER_DIR") else { return };
+        let dir = PathBuf::from(dir);
+        let lines = ["The quick brown fox jumps over", "the lazy dog, then naps again.", "(this line multiplied, as before)"];
+        for (name, bg, fg) in [("highlighter-on-light", Color32::from_rgb(250, 250, 248), PEN_COLORS[0]), ("highlighter-on-dark", Color32::from_rgb(30, 31, 34), Color32::from_gray(225))] {
+            let mut d = Doc::new(ColorImage::new([560, 190], vec![bg; 560 * 190]));
+            for (i, line) in lines.iter().enumerate() {
+                d.add_mark(Text { text: line.to_string(), color: fg, size: 30.0, outline: false, pos: pos2(20.0, 16.0 + i as f32 * 56.0) });
+            }
+            for (i, color) in [HIGHLIGHT_COLORS[0], HIGHLIGHT_COLORS[3], HIGHLIGHT_COLORS[0]].into_iter().enumerate() {
+                let y = 16.0 + i as f32 * 56.0 + 20.0;
+                let points = vec![pos2(16.0, y), pos2(500.0, y)];
+                let on_dark = i < 2 && markup::is_dark_under(&d.flatten(), points[0], 15.0);
+                d.add_mark(Stroke { ink: Ink::Highlighter, color, width: 30.0, points, on_dark });
+            }
+            win::save_png(&dir.join(format!("{name}.png")), &d.flatten()).expect("render saved");
+        }
+        let pasted = clean("Tab\there, emoji \u{1F600} skipped\r\nnext line");
+        let mut d = Doc::new(gradient(900, 420));
+        for (i, (size, color)) in [(24.0, PEN_COLORS[2]), (96.0, PEN_COLORS[3])].into_iter().enumerate() {
+            d.add_mark(Text { text: format!("{size} pt: {pasted}"), color, size, outline: true, pos: pos2(16.0, 10.0 + i as f32 * 80.0) });
+        }
+        win::save_png(&dir.join("text-24-and-96-pt.png"), &d.flatten()).expect("render saved");
     }
 
     /// One headless frame of the snip's canvas without mirroring its uploads, for timing.
