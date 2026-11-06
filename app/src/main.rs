@@ -4,6 +4,7 @@ mod audio;
 mod icons;
 mod markup;
 mod recorder;
+mod widgets;
 mod win;
 
 use std::path::PathBuf;
@@ -12,40 +13,26 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use eframe::egui::{
-    self, pos2, vec2, Align, Align2, Color32, ColorImage, CornerRadius, CursorIcon, Event, FontId,
+    self, pos2, vec2, Align, Align2, Color32, ColorImage, CursorIcon, Event, FontId,
     Key, KeyboardShortcut, Layout, Modifiers, Pos2, Rect, RichText, Sense, Shape, StrokeKind,
     TextureHandle, TextureOptions, Vec2, ViewportCommand, WindowLevel,
 };
 use icons::Icon;
 use markup::{Doc, Ink, PxRect, Stroke};
+use widgets::{
+    dim_outside, divider, dropdown, icon_button, style, take_escape, escape_for_app, Note, PopupClickGuard, ACCENT, BTN, BUTTON_BG,
+    BUTTON_HOVER, DIM, DIVIDER_W, GAP, GROUP_GAP, ICON, ICON_OFF, MIN_WINDOW_H, MIN_WINDOW_W, OUTLINE, TOOLBAR_BG,
+};
 use windows_sys::Win32::Foundation::HWND;
 
-const ACCENT: Color32 = Color32::from_rgb(0xff, 0xb6, 0x34);
-const TOOLBAR_BG: Color32 = Color32::from_rgb(0x20, 0x20, 0x20);
-const CANVAS_BG: Color32 = Color32::from_rgb(0x2c, 0x2c, 0x2c);
-const BUTTON_BG: Color32 = Color32::from_rgb(0x2d, 0x2d, 0x2d);
-const BUTTON_HOVER: Color32 = Color32::from_rgb(0x34, 0x34, 0x34);
-const OUTLINE: Color32 = Color32::from_rgb(0x45, 0x45, 0x45);
-const DIVIDER: Color32 = Color32::from_rgb(0x31, 0x31, 0x31);
-const ICON: Color32 = Color32::from_rgb(0xe8, 0xe8, 0xe8);
-const ICON_OFF: Color32 = Color32::from_rgb(0x6b, 0x6b, 0x6b);
-const BTN: Vec2 = vec2(36.0, 34.0);
-const GAP: f32 = 4.0;
-const DIVIDER_W: f32 = 13.0;
-/// Narrowest window that fits the capture, markup (with the crop buttons) and output groups side by side.
-const MIN_WINDOW_W: f32 = 520.0;
-const MIN_WINDOW_H: f32 = 240.0;
 /// Measured: capture group ~298 + markup with crop buttons 350 + output group 133 + 2 gaps + 24 toolbar margin = 837.
 const MIN_EDIT_W: f32 = 850.0;
-/// Clear space kept between the toolbar groups.
-const GROUP_GAP: f32 = 16.0;
 const MIN_ZOOM: f32 = 0.05;
 const MAX_ZOOM: f32 = 8.0;
 /// Snip zoom change per Ctrl+Plus / Ctrl+Minus press.
 const ZOOM_STEP: f32 = 1.25;
 /// Empty space kept around the snip inside the scrolling canvas, in points.
 const CANVAS_MARGIN: Vec2 = vec2(32.0, 32.0);
-const DIM: Color32 = Color32::from_black_alpha(120);
 /// Time for the window's hide animation to finish before the screen is copied.
 const HIDE_SETTLE: Duration = Duration::from_millis(250);
 
@@ -198,28 +185,7 @@ const fn row_width(items: &[f32]) -> f32 {
 }
 /// Extra bar height while a message is showing under the controls.
 const BAR_NOTE_H: f32 = 28.0;
-/// How long a message stays up once something is drawing it.
-const NOTE_SECS: f64 = 4.0;
 const FRAME_TITLE: &str = "Snipscreen recording area";
-
-/// A message for the user. Its clock starts the first time a view draws it, so
-/// one raised while the picker or the recording bar owns the window (nothing
-/// draws it there) is still on screen when the normal window comes back.
-struct Note {
-    msg: String,
-    until: Option<f64>,
-}
-
-impl Note {
-    fn new(msg: String) -> Self {
-        Self { msg, until: None }
-    }
-
-    /// Starts the clock on the first call; false once it has run out.
-    fn visible(&mut self, now: f64) -> bool {
-        now <= *self.until.get_or_insert(now + NOTE_SECS)
-    }
-}
 
 struct ScreenshotJob {
     path: PathBuf,
@@ -611,17 +577,7 @@ impl App {
 
     /// The message to draw right now, if any; the first draw starts its clock.
     fn live_note(&mut self, ctx: &egui::Context) -> Option<String> {
-        let now = ctx.input(|i| i.time);
-        let note = self.note.as_mut()?;
-        let first_draw = note.until.is_none();
-        if !note.visible(now) {
-            self.note = None;
-            return None;
-        }
-        if first_draw {
-            ctx.request_repaint_after(Duration::from_secs_f64(NOTE_SECS + 0.1));
-        }
-        Some(note.msg.clone())
+        widgets::live_note(&mut self.note, ctx)
     }
 }
 
@@ -781,14 +737,8 @@ impl App {
 
     fn capture_controls(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
-        let (rect, resp) = ui.allocate_exact_size(vec2(80.0, BTN.y), Sense::click());
-        let p = ui.painter();
-        p.rect_filled(rect, 4.0, if resp.hovered() { BUTTON_HOVER } else { BUTTON_BG });
-        let icon = Rect::from_center_size(rect.left_center() + vec2(20.0, 0.0), vec2(18.0, 18.0));
-        icons::paint(p, icon, Icon::Plus, ACCENT, None);
-        p.text(rect.left_center() + vec2(36.0, 0.0), Align2::LEFT_CENTER, "New", FontId::proportional(14.0), ICON);
         let tip = new_tooltip(self.mode, self.hotkey_rx.is_some(), self.hotkey_note.as_deref());
-        if resp.on_hover_text(tip).clicked() {
+        if widgets::new_button(ui, &tip).clicked() {
             self.start_snip(&ctx);
         }
         ui.add_space(8.0);
@@ -983,20 +933,9 @@ impl App {
 
     /// `video_top` is the top of the content area while the video view is showing.
     fn toast(&mut self, ctx: &egui::Context, video_top: Option<f32>) {
-        let Some(msg) = self.live_note(ctx) else { return };
-        let (align, offset) = toast_anchor(video_top);
-        egui::Area::new(egui::Id::unique("toast"))
-            .anchor(align, offset)
-            .order(egui::Order::Foreground)
-            .interactable(false)
-            .show(ctx, |ui| {
-                egui::Frame::new()
-                    .fill(BUTTON_BG)
-                    .stroke((1.0, OUTLINE))
-                    .corner_radius(6)
-                    .inner_margin(egui::Margin::symmetric(14, 8))
-                    .show(ui, |ui| ui.label(RichText::new(msg.as_str()).color(ICON)));
-            });
+        if let Some(msg) = self.live_note(ctx) {
+            widgets::toast(ctx, &msg, video_top);
+        }
     }
 
     fn countdown_view(&mut self, ui: &mut egui::Ui, end: Instant) {
@@ -1718,20 +1657,6 @@ impl CanvasTex {
     }
 }
 
-fn dim_outside(painter: &egui::Painter, all: Rect, keep: Rect) {
-    let keep = keep.intersect(all);
-    for r in [
-        Rect::from_min_max(all.min, pos2(all.max.x, keep.min.y)),
-        Rect::from_min_max(pos2(all.min.x, keep.max.y), all.max),
-        Rect::from_min_max(pos2(all.min.x, keep.min.y), pos2(keep.min.x, keep.max.y)),
-        Rect::from_min_max(pos2(keep.max.x, keep.min.y), pos2(all.max.x, keep.max.y)),
-    ] {
-        if r.is_positive() {
-            painter.rect_filled(r, 0.0, DIM);
-        }
-    }
-}
-
 fn size_tag(painter: &egui::Painter, shown: Rect, px: Vec2) {
     let text = format!("{:.0} × {:.0}", px.x, px.y);
     let galley = painter.layout_no_wrap(text, FontId::proportional(12.0), Color32::WHITE);
@@ -1755,37 +1680,6 @@ fn window_hwnd(cc: &eframe::CreationContext<'_>) -> isize {
         Ok(RawWindowHandle::Win32(h)) => h.hwnd.get(),
         _ => 0,
     }
-}
-
-fn style(ctx: &egui::Context) {
-    ctx.set_theme(egui::Theme::Dark);
-    // Ctrl+Plus/Minus/0 zoom the snip (see `read_keys`), not egui's whole UI.
-    ctx.options_mut(|o| o.zoom_with_keyboard = false);
-    ctx.style_mut_of(egui::Theme::Dark, |s| {
-        s.spacing.button_padding = vec2(10.0, 5.0);
-        s.spacing.interact_size.y = 30.0;
-        s.visuals.selection.bg_fill = Color32::from_rgb(0x3d, 0x3d, 0x3d);
-        s.visuals.selection.stroke.color = Color32::WHITE;
-        s.visuals.panel_fill = TOOLBAR_BG;
-        s.visuals.window_fill = TOOLBAR_BG;
-        s.visuals.extreme_bg_color = CANVAS_BG;
-        s.visuals.widgets.noninteractive.bg_stroke.color = DIVIDER;
-        s.visuals.slider_trailing_fill = true;
-        s.visuals.widgets.inactive.bg_fill = BUTTON_BG;
-        s.visuals.widgets.inactive.weak_bg_fill = BUTTON_BG;
-        s.visuals.widgets.hovered.weak_bg_fill = BUTTON_HOVER;
-        for w in [
-            &mut s.visuals.widgets.inactive,
-            &mut s.visuals.widgets.hovered,
-            &mut s.visuals.widgets.active,
-            &mut s.visuals.widgets.open,
-            &mut s.visuals.widgets.noninteractive,
-        ] {
-            w.corner_radius = CornerRadius::same(4);
-        }
-        s.text_styles.insert(egui::TextStyle::Body, FontId::proportional(14.0));
-        s.text_styles.insert(egui::TextStyle::Button, FontId::proportional(14.0));
-    });
 }
 
 fn main() -> eframe::Result {
@@ -1852,27 +1746,6 @@ fn auto_note(copied: Option<Result<(), String>>, saved: Option<Result<(), String
         parts.push(format!("Couldn't auto-save: {e}"));
     }
     (!parts.is_empty()).then(|| parts.join(" · "))
-}
-
-/// A popup that closes on a click outside lets that click through to whatever lies beneath it.
-/// This notices when a canvas click only dismissed a popup, so it doesn't also draw.
-#[derive(Default)]
-struct PopupClickGuard {
-    open_at_press: bool,
-}
-
-impl PopupClickGuard {
-    /// Call once per frame before any popup is shown: the press that starts a click sees the popups as they were.
-    fn begin_frame(&mut self, ctx: &egui::Context) {
-        if ctx.input(|i| i.pointer.any_pressed()) {
-            self.open_at_press = egui::Popup::is_any_open(ctx);
-        }
-    }
-
-    /// True for a click that was open at the press and is closed now. Drags leave the popup open, so they still draw.
-    fn swallows(&self, ctx: &egui::Context, clicked: bool) -> bool {
-        clicked && self.open_at_press && !egui::Popup::is_any_open(ctx)
-    }
 }
 
 const SCROLL_ID: &str = "snip_scroll";
@@ -1983,17 +1856,6 @@ fn drain(rx: &Receiver<()>) -> bool {
     rx.try_iter().count() > 0
 }
 
-/// Esc cancels the innermost thing: an open popup or menu closes itself on Esc, so while one is open
-/// the key is left alone, and otherwise it is consumed so only one action reacts to it.
-fn take_escape(ctx: &egui::Context) -> bool {
-    let popup_open = egui::Popup::is_any_open(ctx);
-    ctx.input_mut(|i| escape_for_app(i, popup_open))
-}
-
-fn escape_for_app(i: &mut egui::InputState, popup_open: bool) -> bool {
-    !popup_open && i.consume_key(Modifiers::NONE, Key::Escape)
-}
-
 /// `popup_open`: a popup or menu is showing. `focused`: a widget holds keyboard focus.
 fn read_keys(i: &mut egui::InputState, popup_open: bool, focused: bool) -> Keys {
     let cmd = |k| KeyboardShortcut::new(Modifiers::COMMAND, k);
@@ -2018,19 +1880,6 @@ fn read_keys(i: &mut egui::InputState, popup_open: bool, focused: bool) -> Keys 
     }
 }
 
-fn icon_button(ui: &mut egui::Ui, icon: Icon, ink: Option<Color32>, selected: bool, enabled: bool, tip: &str) -> egui::Response {
-    let (rect, resp) = ui.allocate_exact_size(BTN, if enabled { Sense::click() } else { Sense::hover() });
-    let p = ui.painter();
-    if selected {
-        p.rect(rect, 4.0, BUTTON_BG, (1.0, OUTLINE), StrokeKind::Inside);
-    } else if enabled && resp.hovered() {
-        p.rect_filled(rect, 4.0, BUTTON_BG);
-    }
-    let color = if enabled { ICON } else { ICON_OFF };
-    icons::paint(p, Rect::from_center_size(rect.center(), vec2(20.0, 20.0)), icon, color, ink);
-    resp.on_hover_text(tip)
-}
-
 /// The New button's tooltip; the global shortcut is only advertised while it is registered.
 /// `note` is why it isn't (none in a screenshot run, which never tries).
 fn new_tooltip(mode: Mode, hotkey_registered: bool, note: Option<&str>) -> String {
@@ -2043,36 +1892,6 @@ fn new_tooltip(mode: Mode, hotkey_registered: bool, note: Option<&str>) -> Strin
         (false, Some(why)) => format!("{what} (Ctrl+N). {why}"),
         (false, None) => format!("{what} (Ctrl+N)"),
     }
-}
-
-/// Where the toast sits: bottom centre, except over the video view, whose Play
-/// and "Show in folder" buttons live down there, so it drops from the top of the content instead.
-fn toast_anchor(video_top: Option<f32>) -> (Align2, Vec2) {
-    match video_top {
-        Some(top) => (Align2::CENTER_TOP, vec2(0.0, top + 8.0)),
-        None => (Align2::CENTER_BOTTOM, vec2(0.0, -20.0)),
-    }
-}
-
-/// Icon plus a small chevron; `badge` writes a number by the icon (timer seconds).
-fn dropdown(ui: &mut egui::Ui, icon: Icon, badge: Option<u64>) -> egui::Response {
-    let (rect, resp) = ui.allocate_exact_size(vec2(52.0, BTN.y), Sense::click());
-    let p = ui.painter();
-    if resp.hovered() {
-        p.rect_filled(rect, 4.0, BUTTON_BG);
-    }
-    let icon_rect = Rect::from_center_size(rect.left_center() + vec2(18.0, 0.0), vec2(20.0, 20.0));
-    icons::paint(p, icon_rect, icon, ICON, None);
-    icons::paint(p, Rect::from_center_size(rect.right_center() - vec2(13.0, 0.0), vec2(12.0, 12.0)), Icon::Chevron, ICON, None);
-    if let Some(n) = badge {
-        p.text(icon_rect.right_bottom() + vec2(1.0, 2.0), Align2::CENTER_BOTTOM, n.to_string(), FontId::proportional(10.0), ACCENT);
-    }
-    resp
-}
-
-fn divider(ui: &mut egui::Ui) {
-    let (rect, _) = ui.allocate_exact_size(vec2(DIVIDER_W, BTN.y), Sense::hover());
-    ui.painter().line_segment([rect.center_top() + vec2(0.0, 7.0), rect.center_bottom() - vec2(0.0, 7.0)], (1.0, DIVIDER));
 }
 
 /// A see-through, click-through window with a dashed outline just outside
@@ -2136,29 +1955,12 @@ mod tests {
     }
 
     #[test]
-    fn note_clock_starts_when_first_drawn() {
-        let mut n = Note::new("x".into());
-        // Raised at t=0 but only drawn from t=100: it still gets its full time.
-        assert!(n.visible(100.0));
-        assert!(n.visible(100.0 + NOTE_SECS));
-        assert!(!n.visible(100.0 + NOTE_SECS + 0.01));
-    }
-
-    #[test]
     fn new_tooltip_only_promises_a_registered_hotkey() {
         assert_eq!(new_tooltip(Mode::Photo, true, None), "New snip (Ctrl+N, or Alt+Shift+S anywhere)");
         assert_eq!(new_tooltip(Mode::Video, true, None), "New recording (Ctrl+N, or Alt+Shift+S anywhere)");
         let taken = new_tooltip(Mode::Photo, false, Some("Alt+Shift+S is already used by another app"));
         assert_eq!(taken, "New snip (Ctrl+N). Alt+Shift+S is already used by another app");
         assert!(!new_tooltip(Mode::Video, false, None).contains("Alt+Shift+S"));
-    }
-
-    #[test]
-    fn toast_leaves_the_video_buttons_alone() {
-        assert_eq!(toast_anchor(None), (Align2::CENTER_BOTTOM, vec2(0.0, -20.0)));
-        let (align, offset) = toast_anchor(Some(48.0));
-        assert_eq!(align, Align2::CENTER_TOP);
-        assert!(offset.y > 48.0, "below the toolbar");
     }
 
     #[test]
@@ -2346,22 +2148,6 @@ mod tests {
     }
 
     #[test]
-    fn esc_is_consumed_so_a_second_reader_does_not_also_act() {
-        let ctx = egui::Context::default();
-        let input = egui::RawInput {
-            events: vec![Event::Key { key: Key::Escape, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE }],
-            ..Default::default()
-        };
-        let (mut first, mut second) = (false, false);
-        let mut out = ctx.run_ui(input, |ui| {
-            first = take_escape(ui.ctx());
-            second = take_escape(ui.ctx());
-        });
-        out.textures_delta.clear();
-        assert!(first && !second);
-    }
-
-    #[test]
     fn markup_group_never_overlaps_its_neighbours() {
         // Group widths as laid out by `toolbar`: capture 298, output 133, markup with crop buttons 350.
         let (left_end, out_w, width) = (12.0 + 298.0, 133.0, 350.0);
@@ -2379,85 +2165,6 @@ mod tests {
         assert_eq!(markup_x(500.0, 200.0, 100.0, 900.0), 400.0);
         assert_eq!(markup_x(500.0, 300.0, 100.0, 600.0), 284.0, "pushed left by the output group");
         assert_eq!(markup_x(500.0, 800.0, 100.0, 1000.0), 116.0, "pulled right by the capture group");
-    }
-
-    /// One frame of a toolbar with a click-outside popup over a canvas; returns whether the canvas would draw.
-    fn popup_frame(ctx: &egui::Context, guard: &mut PopupClickGuard, events: Vec<Event>, open: bool) -> bool {
-        let input = egui::RawInput {
-            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(800.0, 600.0))),
-            events,
-            ..Default::default()
-        };
-        let mut draws = false;
-        let mut out = ctx.run_ui(input, |ui| {
-            guard.begin_frame(ui.ctx());
-            egui::Panel::top("t").show(ui, |ui| {
-                let pen = ui.button("pen");
-                egui::Popup::from_response(&pen)
-                    .open_memory(open.then_some(egui::SetOpenCommand::Bool(true)))
-                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
-                    .show(|ui| ui.label("options"));
-            });
-            egui::CentralPanel::default().show(ui, |ui| {
-                let resp = ui.allocate_response(ui.available_size(), Sense::click_and_drag());
-                draws = (resp.clicked() || resp.drag_started()) && !guard.swallows(ui.ctx(), resp.clicked());
-            });
-        });
-        out.textures_delta.clear();
-        draws
-    }
-
-    fn click(ctx: &egui::Context, guard: &mut PopupClickGuard, at: Pos2) -> bool {
-        let btn = |pressed| Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
-        popup_frame(ctx, guard, vec![Event::PointerMoved(at)], false);
-        popup_frame(ctx, guard, vec![btn(true)], false);
-        popup_frame(ctx, guard, vec![btn(false)], false)
-    }
-
-    #[test]
-    fn click_that_closes_a_popup_does_not_draw() {
-        let (ctx, mut guard) = (egui::Context::default(), PopupClickGuard::default());
-        for _ in 0..3 {
-            popup_frame(&ctx, &mut guard, vec![], false);
-        }
-        popup_frame(&ctx, &mut guard, vec![], true);
-        popup_frame(&ctx, &mut guard, vec![], false);
-        assert!(egui::Popup::is_any_open(&ctx), "popup should be open before the click");
-        assert!(!click(&ctx, &mut guard, pos2(400.0, 400.0)), "the dismissing click must not reach the canvas");
-        assert!(!egui::Popup::is_any_open(&ctx), "click outside should have closed the popup");
-        assert!(click(&ctx, &mut guard, pos2(400.0, 400.0)), "the next click draws as usual");
-    }
-
-    #[test]
-    fn esc_closes_an_open_popup_first_and_cancels_only_on_the_next_press() {
-        let ctx = egui::Context::default();
-        let esc = || Event::Key { key: Key::Escape, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE };
-        // Same order as `ui`: the shortcut reader runs before the toolbar shows the popup.
-        let frame = |events: Vec<Event>, open: bool| {
-            let input = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(800.0, 600.0))), events, ..Default::default() };
-            let mut cancels = false;
-            let mut out = ctx.run_ui(input, |ui| {
-                cancels = take_escape(ui.ctx());
-                egui::Panel::top("t").show(ui, |ui| {
-                    let b = ui.button("menu");
-                    egui::Popup::from_response(&b)
-                        .open_memory(open.then_some(egui::SetOpenCommand::Bool(true)))
-                        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
-                        .show(|ui| ui.label("options"));
-                });
-            });
-            out.textures_delta.clear();
-            cancels
-        };
-        for _ in 0..3 {
-            frame(vec![], false);
-        }
-        frame(vec![], true);
-        frame(vec![], false);
-        assert!(egui::Popup::is_any_open(&ctx), "popup should be open");
-        assert!(!frame(vec![esc()], false), "first Esc belongs to the popup");
-        assert!(!egui::Popup::is_any_open(&ctx), "and it closed the popup");
-        assert!(frame(vec![esc()], false), "second Esc cancels");
     }
 
     #[test]
