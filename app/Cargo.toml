@@ -1,6 +1,6 @@
 [package]
 name = "snipscreen"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 
 [dependencies]
@@ -36,6 +36,9 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Com",
     "Win32_System_SystemInformation",
 ] }
+
+[build-dependencies]
+winresource = "0.1.34"
 
 [profile.release]
 opt-level = 3
