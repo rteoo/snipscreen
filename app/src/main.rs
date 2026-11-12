@@ -5,6 +5,7 @@ mod editor;
 mod icons;
 mod markup;
 mod notify;
+mod ocr;
 mod recorder;
 mod settings;
 mod settings_window;

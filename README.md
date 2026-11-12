@@ -34,6 +34,7 @@ installed per user or run portable. It is a sibling of [SnipType](https://github
 - A small Settings window: the snip shortcut, what happens after a snip, auto-copy, auto-save, and start with Windows.
 - Pen (6 colours), a highlighter that blends into the picture (4 colours), shapes (arrow, line, rectangle, ellipse; rectangles and ellipses can be filled), text in Geist with a size slider and a contrasting outline, eraser, crop with a frame and handles, and 50-step undo/redo.
 - Placed marks stay editable: the Select tool moves and resizes them, changes their colour, size, fill or outline, and deletes them.
+- Scan text reads the text in a snip with Windows' own OCR (every installed language at once, so English and accented text both come out right), then copies all of it or the words you pick, as plain text or formatted: Markdown (the default), rich text for Word, Outlook and Teams, or WhatsApp's markup. Headings, paragraphs, lists and tables are kept.
 - Each snip opens in its own editor window, so several can be open at once.
 - What you see is what you save: the screen and the saved PNG use the same rasteriser.
 - Zoom with Ctrl+wheel (anchored on the cursor) or Ctrl+Plus, Ctrl+Minus, and Ctrl+0.
@@ -103,7 +104,8 @@ completely.
 | --- | --- |
 | Alt+Shift+S | New snip, from anywhere in Windows (change it in Settings) |
 | Ctrl+N | New snip |
-| Ctrl+C | Copy the snip with markup |
+| Ctrl+C | Copy the snip with markup (with Scan text on and words picked: copy those words) |
+| Ctrl+A | Pick every word (Scan text) |
 | Ctrl+S | Save as PNG, or save the recording as MP4 |
 | Ctrl+Z | Undo |
 | Ctrl+Y or Ctrl+Shift+Z | Redo |
@@ -114,7 +116,7 @@ completely.
 | Delete or Backspace | Delete the selected mark (Select tool) |
 | Enter | Place the text, or apply the crop |
 | Shift+Enter | New line in the text |
-| Esc | Close a menu, or cancel the text, crop, mark drag or selection, countdown, picking, or recording bar |
+| Esc | Close a menu, or cancel the text, crop, mark drag or selection, countdown, picking, or recording bar; with Scan text on, drop the picked words, then turn it off |
 
 Alt+Shift+S is the default because Win+Shift+S and Print Screen belong to the
 system Snipping Tool. If another app already holds the shortcut, Settings says
@@ -184,6 +186,7 @@ without driving the desktop.
 | `app/src/main.rs` | Home window, state machine, picker, recording bar, CLI |
 | `app/src/editor.rs` | Editor windows: toolbar, canvas, copy and save |
 | `app/src/markup.rs` | Snip document: marks (strokes, shapes, text), crop, undo, and the rasteriser |
+| `app/src/ocr.rs` | Scan text: Windows OCR, and the text laid out as plain text, Markdown, rich text or WhatsApp markup |
 | `app/src/tray.rs` | Tray icon, single instance, global shortcut, start with Windows |
 | `app/src/notify.rs` | Windows notifications with a preview, and the `snipscreen:` link |
 | `app/src/settings.rs`, `settings_window.rs` | Saved settings and the Settings window |

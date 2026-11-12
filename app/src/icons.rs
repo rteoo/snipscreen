@@ -37,6 +37,8 @@ pub enum Icon {
     /// A "T", with a dot of the text's ink.
     Text,
     Crop,
+    /// Lines of text between corner brackets: pick out the text in a snip.
+    ScanText,
     Check,
     Close,
     Undo,
@@ -57,7 +59,7 @@ pub enum Icon {
 }
 
 /// Every icon, in declaration order (`ALL[i] as usize == i`), which indexes `ART`.
-const ALL: [Icon; 34] = [
+const ALL: [Icon; 35] = [
     Icon::Plus,
     Icon::Rectangle,
     Icon::Window,
@@ -76,6 +78,7 @@ const ALL: [Icon; 34] = [
     Icon::Ellipse,
     Icon::Text,
     Icon::Crop,
+    Icon::ScanText,
     Icon::Check,
     Icon::Close,
     Icon::Undo,
@@ -119,6 +122,7 @@ fn svg(icon: Icon) -> &'static str {
         Icon::Ellipse => bi!("circle"),
         Icon::Text => bi!("fonts"),
         Icon::Crop => bi!("crop"),
+        Icon::ScanText => bi!("scan-text"),
         Icon::Check => bi!("check-lg"),
         Icon::Close => bi!("x-lg"),
         Icon::Undo => bi!("arrow-counterclockwise"),
