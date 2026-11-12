@@ -775,11 +775,12 @@ pub fn open_path(path: &std::path::Path) -> Result<(), String> {
     std::process::Command::new("explorer").arg(path).spawn().map(|_| ()).map_err(|e| e.to_string())
 }
 
-/// Opens Explorer with the file selected.
+/// Opens Explorer with the file selected. Explorer wants `/select,"<path>"`: given the whole
+/// argument in quotes, as `Command::arg` writes one with a space in it, it ignores it and opens its
+/// default folder. Windows paths can't contain `"`, so the raw argument needs no escaping.
 pub fn show_in_folder(path: &std::path::Path) -> Result<(), String> {
-    let mut arg = std::ffi::OsString::from("/select,");
-    arg.push(path);
-    std::process::Command::new("explorer").arg(arg).spawn().map(|_| ()).map_err(|e| e.to_string())
+    use std::os::windows::process::CommandExt;
+    std::process::Command::new("explorer").raw_arg(format!("/select,\"{}\"", path.display())).spawn().map(|_| ()).map_err(|e| e.to_string())
 }
 
 /// A top-level window of ours by its exact title. Another program's window with the same title is
