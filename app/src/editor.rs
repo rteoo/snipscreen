@@ -19,6 +19,7 @@ use windows_sys::Win32::Foundation::HWND;
 
 use crate::icons::{self, Icon};
 use crate::markup::{self, Doc, Ink, Mark, PxRect, Shape, ShapeKind, Stroke, Text, TextRaster, Tiles};
+use crate::notify;
 use crate::ocr;
 use crate::widgets::{
     self, dim_outside, divider, escape_for_app, icon_button, Note, Notifier, PopupClickGuard, ACCENT, BTN, BUTTON_HOVER, DIVIDER_W, GAP, GROUP_GAP, ICON,
@@ -26,9 +27,9 @@ use crate::widgets::{
 };
 use crate::win;
 
-/// Measured: bar padding 8 + New button 72 + markup with crop buttons 454 + output group 117 + 2 group gaps
-/// + padding 8 + caption buttons 138 = 829.
-pub const MIN_EDIT_W: f32 = 832.0;
+/// Measured: bar padding 8 + New button 72 + markup with crop buttons 454 + output group 153 + 2 group gaps
+/// + padding 8 + caption buttons 138 = 865.
+pub const MIN_EDIT_W: f32 = 868.0;
 const MIN_ZOOM: f32 = 0.05;
 const MAX_ZOOM: f32 = 8.0;
 /// Snip zoom change per Ctrl+Plus / Ctrl+Minus press.
@@ -1646,6 +1647,9 @@ impl Editor {
                 if icon_button(ui, Icon::Save, None, false, true, "Save as (Ctrl+S)").clicked() {
                     self.save_as(&ctx);
                 }
+                if icon_button(ui, Icon::Paint, None, false, true, "Edit in Paint").clicked() {
+                    self.edit_in_paint(&ctx);
+                }
             }
         }
     }
@@ -1660,6 +1664,19 @@ impl Editor {
                 Ok(()) => "Copied to clipboard".to_string(),
                 Err(e) => format!("Couldn't copy: {e}"),
             });
+        });
+    }
+
+    /// Opens the snip, markup and all, in Paint, on a worker (the PNG takes a moment to encode).
+    fn edit_in_paint(&mut self, ctx: &egui::Context) {
+        let Content::Snip(snip) = &mut self.content else { return };
+        snip.finish_text();
+        let (image, report) = (snip.flattened(), self.notifier(ctx));
+        std::thread::spawn(move || {
+            let opened = notify::local_dir().ok_or_else(|| "couldn't find your local AppData folder".to_string()).and_then(|d| write_for_paint(&d.join("paint"), &image)).and_then(|p| win::open_in_paint(&p));
+            if let Err(e) = opened {
+                report.send(format!("Couldn't open Paint: {e}"));
+            }
         });
     }
 
@@ -1806,6 +1823,41 @@ impl Editor {
 
 /// Copies the recording to `to`. Choosing the recording itself (the dialog starts in its folder
 /// under its name) is already done: copying a file onto itself fails with a sharing violation.
+/// Copies opened in Paint that are kept: Paint saves into the copy, so the newest stay for a while.
+const PAINT_FILES: usize = 20;
+
+/// Writes `image` into `dir` as `Snip <timestamp>.png` (Paint shows the name, and its Save keeps
+/// it), after deleting all but the newest `PAINT_FILES - 1` copies made earlier. Returns its path.
+fn write_for_paint(dir: &std::path::Path, image: &ColorImage) -> Result<PathBuf, String> {
+    use std::io::Write;
+    std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    prune_snips(dir, PAINT_FILES - 1);
+    let png = win::encode_png(image)?;
+    let (path, mut file) = win::create_unique(&dir.join(format!("Snip {}.png", win::timestamp())))?;
+    if let Err(e) = file.write_all(&png) {
+        drop(file);
+        let _ = std::fs::remove_file(&path);
+        return Err(format!("{}: {e}", path.display()));
+    }
+    Ok(path)
+}
+
+/// Deletes the `Snip *.png` files in `dir` beyond the newest `keep`, by when they were last written.
+fn prune_snips(dir: &std::path::Path, keep: usize) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let mut snips: Vec<(std::time::SystemTime, PathBuf)> = entries
+        .filter_map(|e| {
+            let e = e.ok()?;
+            let name = e.file_name().into_string().ok()?;
+            (name.starts_with("Snip ") && name.ends_with(".png")).then(|| Some((e.metadata().ok()?.modified().ok()?, e.path())))?
+        })
+        .collect();
+    snips.sort_by_key(|s| std::cmp::Reverse(s.0));
+    for (_, path) in snips.into_iter().skip(keep) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
 fn copy_recording(from: &std::path::Path, to: &std::path::Path) -> Result<(), String> {
     if std::fs::canonicalize(from).is_ok_and(|f| std::fs::canonicalize(to).is_ok_and(|t| f == t)) {
         return Ok(());
@@ -2731,6 +2783,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_copy_for_paint_is_the_snip_and_only_the_newest_copies_stay() {
+        let dir = std::env::temp_dir().join(format!("snipscreen-paint-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Someone else's file in the folder is never touched.
+        std::fs::write(dir.join("notes.txt"), "keep").unwrap();
+        let image = gradient(40, 30);
+        let mut made = Vec::new();
+        for _ in 0..PAINT_FILES + 3 {
+            made.push(write_for_paint(&dir, &image).unwrap());
+            // Distinct write times, so "newest" is well defined.
+            std::thread::sleep(std::time::Duration::from_millis(15));
+        }
+        let left: Vec<PathBuf> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().path()).collect();
+        let pngs: Vec<&PathBuf> = left.iter().filter(|p| p.extension().is_some_and(|e| e == "png")).collect();
+        assert_eq!(pngs.len(), PAINT_FILES, "the newest {PAINT_FILES} copies stay");
+        assert!(made[made.len() - PAINT_FILES..].iter().all(|p| p.exists()) && !made[0].exists());
+        assert!(dir.join("notes.txt").exists());
+        let back = notify::load_png(made.last().unwrap()).unwrap();
+        assert!(back.pixels == image.pixels, "Paint gets the snip as shown");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn saving_a_recording_onto_itself_keeps_it() {
         let dir = std::env::temp_dir().join(format!("snipscreen-save-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -2875,9 +2951,9 @@ mod tests {
         assert_eq!(edit_window_size(vec2(5000.0, 5000.0), wide), wide * 0.85);
     }
 
-    /// Group widths as laid out by `Editor::toolbar`: New button 80, output 117, markup with crop buttons 454.
+    /// Group widths as laid out by `Editor::toolbar`: New button 80, output 153, markup with crop buttons 454.
     const NEW_END: f32 = BAR_PAD + 72.0;
-    const OUT_W: f32 = 117.0;
+    const OUT_W: f32 = 153.0;
     const MARKUP_W: f32 = 454.0;
     /// Right end of the controls row: the caption buttons and the padding before them.
     const ROW_END_GAP: f32 = BAR_PAD + 3.0 * CAPTION_W;

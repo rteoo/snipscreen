@@ -346,6 +346,16 @@ pub fn copy_text(owner: HWND, text: &std::ffi::OsStr) -> Result<(), String> {
     }
 }
 
+/// Opens `path` in Paint: `mspaint.exe`, in System32 up to Windows 10 and an app alias for the
+/// Store's Paint on Windows 11, both found on the PATH.
+pub fn open_in_paint(path: &Path) -> Result<(), String> {
+    match std::process::Command::new("mspaint.exe").arg(path).spawn() {
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err("Paint isn't installed (it's free in the Microsoft Store)".into()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
 /// Puts an HTML fragment on the clipboard as rich text (Word, Outlook, Teams and browsers paste it
 /// with its headings, lists and tables), with `plain` beside it for apps that take only text.
 pub fn copy_html(owner: HWND, fragment: &str, plain: &str) -> Result<(), String> {

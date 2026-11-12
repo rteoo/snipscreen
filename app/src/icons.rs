@@ -45,6 +45,8 @@ pub enum Icon {
     Redo,
     Save,
     Copy,
+    /// A painter's palette: open the snip in Paint.
+    Paint,
     More,
     Camera,
     Video,
@@ -59,7 +61,7 @@ pub enum Icon {
 }
 
 /// Every icon, in declaration order (`ALL[i] as usize == i`), which indexes `ART`.
-const ALL: [Icon; 35] = [
+const ALL: [Icon; 36] = [
     Icon::Plus,
     Icon::Rectangle,
     Icon::Window,
@@ -85,6 +87,7 @@ const ALL: [Icon; 35] = [
     Icon::Redo,
     Icon::Save,
     Icon::Copy,
+    Icon::Paint,
     Icon::More,
     Icon::Camera,
     Icon::Video,
@@ -129,6 +132,7 @@ fn svg(icon: Icon) -> &'static str {
         Icon::Redo => bi!("arrow-clockwise"),
         Icon::Save => bi!("floppy"),
         Icon::Copy => bi!("copy"),
+        Icon::Paint => bi!("palette"),
         Icon::More => bi!("three-dots"),
         Icon::Camera => bi!("camera"),
         Icon::Video => bi!("camera-video"),
