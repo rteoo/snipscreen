@@ -665,8 +665,9 @@ impl App {
     /// Where an auto-saved snip goes, when auto-save is on.
     fn save_path(&self) -> Option<Result<PathBuf, String>> {
         self.settings.auto_save.then(|| {
-            win::pictures_dir()
-                .map(|dir| dir.join("Screenshots").join(format!("Snip {}.png", win::timestamp())))
+            self.settings
+                .screenshots()
+                .map(|dir| dir.join(format!("Snip {}.png", win::timestamp())))
                 .ok_or_else(|| "couldn't find your Pictures folder".to_string())
         })
     }
@@ -714,7 +715,8 @@ impl App {
             self.snip_editors.push((id, Some(editor)));
             return;
         }
-        let folders: Vec<PathBuf> = [win::pictures_dir().map(|d| d.join("Screenshots")), notify::recent_dir()].into_iter().flatten().collect();
+        // The chosen folder and the default one: a notification from before the folder changed still opens.
+        let folders: Vec<PathBuf> = [self.settings.screenshots(), settings::default_screenshots(), notify::recent_dir()].into_iter().flatten().collect();
         if !notify::may_open(&path, &folders) {
             self.show_home(ctx);
             self.say(ctx, format!("SnipScreen only opens its own snips, not {}", path.display()));
@@ -793,7 +795,7 @@ impl App {
         let (save_to, copy, hwnd) = (self.save_path(), self.settings.auto_copy, self.hwnd);
         self.spawn_worker(move || {
             let Delivered { copied, saved } = copy_and_save(hwnd, &image, copy, save_to);
-            if let Some(msg) = auto_note(copied, saved.map(|r| r.map(|_| ()))) {
+            if let Some(msg) = auto_note(copied, saved) {
                 report.send(msg);
             }
         });
@@ -1009,7 +1011,7 @@ impl eframe::App for App {
         self.reveal_picker(ctx);
         self.settle_window(ctx);
         self.sync_escape_hotkey();
-        self.editors.set_new_tip(self.new_tip());
+        self.editors.share(editor::Shared { tip: self.new_tip(), screenshots: self.settings.screenshots(), recordings: self.settings.recordings() });
         self.close_when_no_window_is_left(ctx);
         self.persist();
     }
@@ -1079,7 +1081,7 @@ impl App {
                 self.open_settings(ui.ctx());
             }
             if ui.button("Open the Screenshots folder").clicked() {
-                if let Some(dir) = win::pictures_dir().map(|d| d.join("Screenshots")) {
+                if let Some(dir) = self.settings.screenshots() {
                     let _ = std::fs::create_dir_all(&dir);
                     let _ = std::process::Command::new("explorer").arg(dir).spawn();
                 }
@@ -1389,7 +1391,7 @@ impl App {
 
     fn start_recording(&mut self, ctx: &egui::Context) {
         let Stage::Recording(bar) = &mut self.stage else { return };
-        let Some(dir) = win::videos_dir() else {
+        let Some(dir) = self.settings.recordings() else {
             self.say(ctx, "Couldn't find your Videos folder".into());
             return;
         };
@@ -1397,7 +1399,7 @@ impl App {
             area: bar.area,
             system_sound: self.settings.record_system,
             microphone: self.settings.record_mic.then(|| self.settings.mic.clone()),
-            path: dir.join("Screen Recordings").join(format!("Screen Recording {}.mp4", win::timestamp())),
+            path: dir.join(format!("Screen Recording {}.mp4", win::timestamp())),
         };
         let (tx, c) = (self.rec_tx.clone(), ctx.clone());
         bar.rec = Some(recorder::start(settings, move |event| {
@@ -1434,10 +1436,11 @@ impl App {
                 match result {
                     Ok(f) => {
                         let thumb = f.first_frame.map(|img| ctx.load_texture("recording", img, TextureOptions::LINEAR));
+                        let saved = format!("Saved to {}", folder_of(&f.path));
                         let video = VideoResult { path: f.path, seconds: f.seconds, size: f.size, thumb };
                         let mut msg = match f.stopped_early {
-                            Some(why) => format!("Recording stopped early ({why}) · Saved to Videos\\Screen Recordings"),
-                            None => "Saved to Videos\\Screen Recordings".to_string(),
+                            Some(why) => format!("Recording stopped early ({why}) · {saved}"),
+                            None => saved,
                         };
                         for n in notes {
                             msg.push_str(" · ");
@@ -2023,7 +2026,7 @@ struct Written {
     copied: Option<Result<(), String>>,
     /// The PNG added to it; `None` when there was no bitmap to add it to.
     png: Option<Result<(), String>>,
-    /// Into the reserved file in Pictures\Screenshots.
+    /// Into the reserved file in the screenshots folder.
     saved: Option<Result<PathBuf, String>>,
     /// Into `recent`, for a snip that wasn't auto-saved.
     kept: Option<Result<(), String>>,
@@ -2063,7 +2066,7 @@ fn fill(path: PathBuf, mut file: std::fs::File, bytes: Result<&Vec<u8>, String>)
 /// The editor's message when the notification failed: why, plus what copy and save did.
 fn not_shown(why: &str, copied: Option<Result<(), String>>, saved: Option<Result<PathBuf, String>>) -> String {
     let mut msg = format!("Couldn't show the notification ({why}), so the snip opened here");
-    if let Some(note) = auto_note(copied, saved.map(|r| r.map(|_| ()))) {
+    if let Some(note) = auto_note(copied, saved) {
         msg.push_str(" · ");
         msg.push_str(&note);
     }
@@ -2080,7 +2083,7 @@ fn toast_text(copied: &Option<Result<(), String>>, saved: &Option<Result<PathBuf
     };
     let mut status = Vec::new();
     if let Some(Ok(p)) = saved {
-        status.push(format!("Saved to Pictures\\Screenshots as {}", p.file_name().map_or(String::new(), |n| n.to_string_lossy().into_owned())));
+        status.push(format!("Saved to {} as {}", folder_of(p), p.file_name().map_or(String::new(), |n| n.to_string_lossy().into_owned())));
     }
     if let Some(Err(e)) = copied {
         status.push(format!("Couldn't copy: {e}"));
@@ -2101,13 +2104,13 @@ fn toast_text(copied: &Option<Result<(), String>>, saved: &Option<Result<PathBuf
 
 /// Toast for a new snip's automatic copy and save; `None` when each job that ran succeeded and
 /// only the copy was asked for, since the clipboard needs no announcement.
-fn auto_note(copied: Option<Result<(), String>>, saved: Option<Result<(), String>>) -> Option<String> {
+fn auto_note(copied: Option<Result<(), String>>, saved: Option<Result<PathBuf, String>>) -> Option<String> {
     let copy_err = copied.as_ref().and_then(|r| r.as_ref().err());
     let save_err = saved.as_ref().and_then(|r| r.as_ref().err());
     let mut parts = Vec::new();
     match (&copied, &saved) {
-        (Some(Ok(())), Some(Ok(()))) => parts.push("Copied, and saved to Pictures\\Screenshots".to_string()),
-        (_, Some(Ok(()))) => parts.push("Saved to Pictures\\Screenshots".to_string()),
+        (Some(Ok(())), Some(Ok(p))) => parts.push(format!("Copied, and saved to {}", folder_of(p))),
+        (_, Some(Ok(p))) => parts.push(format!("Saved to {}", folder_of(p))),
         (Some(Ok(())), Some(Err(_))) => parts.push("Copied to clipboard".to_string()),
         _ => {}
     }
@@ -2118,6 +2121,11 @@ fn auto_note(copied: Option<Result<(), String>>, saved: Option<Result<(), String
         parts.push(format!("Couldn't auto-save: {e}"));
     }
     (!parts.is_empty()).then(|| parts.join(" · "))
+}
+
+/// The folder a saved file is in, as messages name it ("Pictures\\Screenshots").
+fn folder_of(file: &std::path::Path) -> String {
+    settings::short_dir(file.parent().unwrap_or(file))
 }
 
 /// True on the frame the primary button comes up over `resp`. egui reports a press held longer than
@@ -2313,16 +2321,19 @@ mod tests {
     #[test]
     fn auto_note_reports_what_each_job_did() {
         let ok = || Some(Ok(()));
+        let saved = || Some(Ok(PathBuf::from(r"C:\Users\a\Pictures\Screenshots\Snip 1.png")));
         let err = |m: &str| Some(Err(m.to_string()));
-        assert_eq!(auto_note(ok(), ok()).as_deref(), Some("Copied, and saved to Pictures\\Screenshots"));
-        assert_eq!(auto_note(None, ok()).as_deref(), Some("Saved to Pictures\\Screenshots"));
+        let failed = |m: &str| Some(Err::<PathBuf, String>(m.to_string()));
+        assert_eq!(auto_note(ok(), saved()).as_deref(), Some("Copied, and saved to Pictures\\Screenshots"));
+        assert_eq!(auto_note(None, saved()).as_deref(), Some("Saved to Pictures\\Screenshots"));
+        assert_eq!(auto_note(None, Some(Ok(PathBuf::from(r"D:\Snips\Snip 1.png")))).as_deref(), Some("Saved to D:\\Snips"), "a chosen folder is named");
         assert_eq!(auto_note(ok(), None), None);
         assert_eq!(auto_note(None, None), None);
-        assert_eq!(auto_note(err("busy"), ok()).as_deref(), Some("Saved to Pictures\\Screenshots · Couldn't copy: busy"));
-        assert_eq!(auto_note(ok(), err("disk full")).as_deref(), Some("Copied to clipboard · Couldn't auto-save: disk full"));
+        assert_eq!(auto_note(err("busy"), saved()).as_deref(), Some("Saved to Pictures\\Screenshots · Couldn't copy: busy"));
+        assert_eq!(auto_note(ok(), failed("disk full")).as_deref(), Some("Copied to clipboard · Couldn't auto-save: disk full"));
         assert_eq!(auto_note(err("busy"), None).as_deref(), Some("Couldn't copy: busy"));
-        assert_eq!(auto_note(None, err("disk full")).as_deref(), Some("Couldn't auto-save: disk full"));
-        assert_eq!(auto_note(err("busy"), err("disk full")).as_deref(), Some("Couldn't copy: busy · Couldn't auto-save: disk full"));
+        assert_eq!(auto_note(None, failed("disk full")).as_deref(), Some("Couldn't auto-save: disk full"));
+        assert_eq!(auto_note(err("busy"), failed("disk full")).as_deref(), Some("Couldn't copy: busy · Couldn't auto-save: disk full"));
     }
 
     #[test]

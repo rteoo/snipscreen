@@ -165,6 +165,10 @@ pub struct Settings {
     pub record_mic: bool,
     /// `None` is the Windows default microphone.
     pub mic: Option<String>,
+    /// Where snips are saved; `None` is Pictures\Screenshots (see `screenshots`).
+    pub screenshots_dir: Option<PathBuf>,
+    /// Where recordings are saved; `None` is Videos\Screen Recordings (see `recordings`).
+    pub recordings_dir: Option<PathBuf>,
 }
 
 impl Default for Settings {
@@ -181,8 +185,42 @@ impl Default for Settings {
             record_system: true,
             record_mic: false,
             mic: None,
+            screenshots_dir: None,
+            recordings_dir: None,
         }
     }
+}
+
+/// Pictures\Screenshots, as the Snipping Tool saves.
+pub fn default_screenshots() -> Option<PathBuf> {
+    crate::win::pictures_dir().map(|d| d.join("Screenshots"))
+}
+
+/// Videos\Screen Recordings, as the Snipping Tool saves.
+pub fn default_recordings() -> Option<PathBuf> {
+    crate::win::videos_dir().map(|d| d.join("Screen Recordings"))
+}
+
+/// A folder as messages name it: its last two parts ("Pictures\Screenshots"), or all of it when it
+/// has fewer ("D:\Snips").
+pub fn short_dir(dir: &Path) -> String {
+    let names: Vec<_> = dir.components().filter_map(|c| match c {
+        std::path::Component::Normal(n) => Some(n.to_string_lossy()),
+        _ => None,
+    }).collect();
+    match names.len() {
+        0 | 1 => dir.display().to_string(),
+        n => format!("{}\\{}", names[n - 2], names[n - 1]),
+    }
+}
+
+/// A folder setting's value: empty for the default, otherwise a full path.
+fn folder(value: &str) -> Option<Option<PathBuf>> {
+    if value.is_empty() {
+        return Some(None);
+    }
+    let p = PathBuf::from(value);
+    p.is_absolute().then_some(Some(p))
 }
 
 fn word<T: Copy + PartialEq>(table: &[(T, &'static str)], v: T) -> &'static str {
@@ -210,6 +248,16 @@ fn parse_bool(s: &str) -> Option<bool> {
 }
 
 impl Settings {
+    /// Where snips are saved: the chosen folder, or Pictures\Screenshots.
+    pub fn screenshots(&self) -> Option<PathBuf> {
+        self.screenshots_dir.clone().or_else(default_screenshots)
+    }
+
+    /// Where recordings are saved: the chosen folder, or Videos\Screen Recordings.
+    pub fn recordings(&self) -> Option<PathBuf> {
+        self.recordings_dir.clone().or_else(default_recordings)
+    }
+
     pub fn serialize(&self) -> String {
         let lines = [
             "# SnipScreen settings. Edit while SnipScreen is closed; unreadable values reset to their defaults.".to_string(),
@@ -224,6 +272,8 @@ impl Settings {
             format!("record_system={}", bool_word(self.record_system)),
             format!("record_mic={}", bool_word(self.record_mic)),
             format!("mic={}", self.mic.as_deref().unwrap_or("")),
+            format!("screenshots_dir={}", self.screenshots_dir.as_ref().map_or(String::new(), |p| p.display().to_string())),
+            format!("recordings_dir={}", self.recordings_dir.as_ref().map_or(String::new(), |p| p.display().to_string())),
         ];
         lines.join("\r\n") + "\r\n"
     }
@@ -255,6 +305,8 @@ impl Settings {
                 "delay" => value.parse().ok().filter(|d| DELAYS.contains(d)).map(|v| s.delay = v).is_some(),
                 "record_system" => parse_bool(value).map(|v| s.record_system = v).is_some(),
                 "record_mic" => parse_bool(value).map(|v| s.record_mic = v).is_some(),
+                "screenshots_dir" => folder(value).map(|v| s.screenshots_dir = v).is_some(),
+                "recordings_dir" => folder(value).map(|v| s.recordings_dir = v).is_some(),
                 "mic" => {
                     s.mic = (!value.is_empty()).then(|| value.to_string());
                     true
@@ -400,10 +452,31 @@ mod tests {
             record_system: false,
             record_mic: true,
             mic: Some("{0.0.1.00000000}.{a=b c}".into()),
+            screenshots_dir: Some(PathBuf::from(r"D:\OneDrive\Imagens\Capturas = tela")),
+            recordings_dir: Some(PathBuf::from(r"\\nas\vídeos")),
         };
         let text = s.serialize();
         assert!(text.contains("shortcut=Win+Ctrl+F12\r\n"), "{text}");
         assert_eq!(Settings::parse(&text), (s, vec![]));
+    }
+
+    #[test]
+    fn folders_default_until_chosen_and_must_be_full_paths() {
+        let (s, bad) = Settings::parse("screenshots_dir=Snips\nrecordings_dir=\n");
+        assert_eq!(bad, ["screenshots_dir"], "a relative folder would land wherever the app was started");
+        assert_eq!((s.screenshots_dir, s.recordings_dir), (None, None));
+        let s = Settings { screenshots_dir: Some(PathBuf::from(r"D:\Snips")), ..Settings::default() };
+        assert_eq!(s.screenshots(), Some(PathBuf::from(r"D:\Snips")));
+        assert_eq!(s.recordings(), default_recordings());
+    }
+
+    #[test]
+    fn short_dir_names_the_last_two_folders() {
+        assert_eq!(short_dir(Path::new(r"C:\Users\a\Pictures\Screenshots")), r"Pictures\Screenshots");
+        assert_eq!(short_dir(Path::new(r"D:\Snips")), r"D:\Snips");
+        // A share's server and name are one part, so a folder at its top is named in full.
+        assert_eq!(short_dir(Path::new(r"\\nas\share\vídeos")), r"\\nas\share\vídeos");
+        assert_eq!(short_dir(Path::new(r"\\nas\share\a\vídeos")), r"a\vídeos");
     }
 
     #[test]

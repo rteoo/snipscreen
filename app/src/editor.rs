@@ -582,10 +582,10 @@ pub struct Editor {
     note: Option<Note>,
     note_tx: Sender<String>,
     note_rx: Receiver<String>,
-    /// The New button's tooltip, copied each frame from `shared_tip`, which the shell keeps current (it
+    /// The New button's tooltip and the save folders, copied each frame from `shared_from`, which the shell keeps current (it
     /// knows the capture mode and hotkey).
-    new_tip: String,
-    shared_tip: Arc<Mutex<String>>,
+    shared: Shared,
+    shared_from: Arc<Mutex<Shared>>,
     /// New button or Ctrl+N pressed; the shell starts the capture.
     new_requested: bool,
     /// The window's close button was pressed; the shell drops this editor.
@@ -1333,7 +1333,7 @@ impl Snip {
 }
 
 impl Editor {
-    fn new(content: Content, title: String, viewport: ViewportId, root_hwnd: isize, place: Option<[i32; 2]>, shared_tip: Arc<Mutex<String>>, min_width: f32) -> Self {
+    fn new(content: Content, title: String, viewport: ViewportId, root_hwnd: isize, place: Option<[i32; 2]>, shared_from: Arc<Mutex<Shared>>, min_width: f32) -> Self {
         let (note_tx, note_rx) = channel();
         Self {
             content,
@@ -1351,8 +1351,8 @@ impl Editor {
             note: None,
             note_tx,
             note_rx,
-            new_tip: String::new(),
-            shared_tip,
+            shared: Shared::default(),
+            shared_from,
             new_requested: false,
             closed: false,
             saving: Arc::default(),
@@ -1387,10 +1387,10 @@ impl Editor {
         while let Ok(msg) = self.note_rx.try_recv() {
             self.say(msg);
         }
-        // The shell holds this lock only to replace the string, so a busy one just waits for the next frame.
-        if let Ok(tip) = self.shared_tip.try_lock() {
-            if *tip != self.new_tip {
-                self.new_tip.clone_from(&tip);
+        // The shell holds this lock only to replace what changed, so a busy one just waits for the next frame.
+        if let Ok(shared) = self.shared_from.try_lock() {
+            if *shared != self.shared {
+                self.shared.clone_from(&shared);
             }
         }
         self.attach_title_bar(&ctx);
@@ -1590,7 +1590,7 @@ impl Editor {
             let layout = |l| egui::UiBuilder::new().max_rect(row).layout(l);
 
             let mut left = ui.new_child(layout(Layout::left_to_right(Align::Center)));
-            if widgets::new_button(&mut left, &self.new_tip).clicked() {
+            if widgets::new_button(&mut left, &self.shared.tip).clicked() {
                 self.request_new(&left.ctx().clone());
             }
             let left_end = left.min_rect().max.x;
@@ -1617,9 +1617,13 @@ impl Editor {
         let ctx = ui.ctx().clone();
         let more = icon_button(ui, Icon::More, None, false, true, "More");
         egui::Popup::menu(&more).show(|ui| {
-            if ui.button("Open the Screenshots folder").clicked() {
-                if let Some(dir) = win::pictures_dir().map(|d| d.join("Screenshots")) {
-                    let _ = std::fs::create_dir_all(&dir);
+            let (label, folder) = match self.content {
+                Content::Snip(_) => ("Open the Screenshots folder", &self.shared.screenshots),
+                Content::Video(_) => ("Open the Screen Recordings folder", &self.shared.recordings),
+            };
+            if ui.button(label).clicked() {
+                if let Some(dir) = folder {
+                    let _ = std::fs::create_dir_all(dir);
                     let _ = std::process::Command::new("explorer").arg(dir).spawn();
                 }
             }
@@ -1739,7 +1743,7 @@ impl Editor {
         let (owner, report) = (owner as isize, self.notifier(ctx));
         let job: Box<dyn FnOnce() + Send> = match &self.content {
             Content::Snip(snip) => {
-                let (start, name, image) = (win::pictures_dir().map(|d| d.join("Screenshots")), format!("Snip {}", win::timestamp()), snip.flattened());
+                let (start, name, image) = (self.shared.screenshots.clone(), format!("Snip {}", win::timestamp()), snip.flattened());
                 Box::new(move || {
                     let _busy = busy;
                     let path = match win::ask_save_path(owner as HWND, start.as_deref(), &name, ("PNG image", "png")) {
@@ -1754,7 +1758,7 @@ impl Editor {
                 })
             }
             Content::Video(v) => {
-                let start = win::videos_dir().map(|d| d.join("Screen Recordings"));
+                let start = self.shared.recordings.clone();
                 let name = v.path.file_stem().map_or_else(|| "Screen Recording".into(), |n| n.to_string_lossy().into_owned());
                 let from = v.path.clone();
                 Box::new(move || {
@@ -1901,8 +1905,17 @@ pub struct Editors {
     slots: Vec<Slot>,
     next: u64,
     icon: Option<Arc<egui::IconData>>,
-    /// The New buttons' tooltip, shared with every editor.
-    new_tip: Arc<Mutex<String>>,
+    /// What every editor takes from the shell.
+    shared: Arc<Mutex<Shared>>,
+}
+
+/// What the shell keeps current for every editor window: the New button's tooltip (the shell knows
+/// the capture mode and hotkey) and the folders snips and recordings are saved in (Save As starts there).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Shared {
+    pub tip: String,
+    pub screenshots: Option<PathBuf>,
+    pub recordings: Option<PathBuf>,
 }
 
 /// What the editor windows asked of the shell since the last `Editors::poll`.
@@ -1914,7 +1927,7 @@ pub struct Requests {
 
 impl Editors {
     pub fn new(icon: Option<Arc<egui::IconData>>) -> Self {
-        Self { slots: Vec::new(), next: 0, icon, new_tip: Arc::default() }
+        Self { slots: Vec::new(), next: 0, icon, shared: Arc::default() }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -1982,7 +1995,7 @@ impl Editors {
             let step = CASCADE * (self.slots.len() % 8) as i32;
             [x + step, y + step]
         });
-        let editor = Editor::new(content, title.clone(), id, root_hwnd, corner, self.new_tip.clone(), min_w);
+        let editor = Editor::new(content, title.clone(), id, root_hwnd, corner, self.shared.clone(), min_w);
         let report = editor.notifier(ctx);
         let note_tx = editor.note_tx.clone();
         self.slots.push(Slot { id, title, builder, editor: Arc::new(Mutex::new(editor)), note_tx });
@@ -2017,12 +2030,12 @@ impl Editors {
         req
     }
 
-    /// Keeps every New button's tooltip in step with the shell's capture mode and hotkey. Each editor
-    /// picks the new text up on its next frame.
-    pub fn set_new_tip(&mut self, tip: String) {
-        let mut shared = self.new_tip.lock().unwrap_or_else(PoisonError::into_inner);
-        if *shared != tip {
-            *shared = tip;
+    /// Keeps every editor in step with the shell: the New buttons' tooltip (capture mode and hotkey)
+    /// and the save folders. Each editor picks the change up on its next frame.
+    pub fn share(&mut self, now: Shared) {
+        let mut shared = self.shared.lock().unwrap_or_else(PoisonError::into_inner);
+        if *shared != now {
+            *shared = now;
         }
     }
 
@@ -4199,13 +4212,13 @@ Arc::ptr_eq(&snip.flattened(), &shown), "a current canvas is reused, not re-burn
         // Hold the editor as its own frame would; on this thread a blocking lock would never return.
         let held = editors.slots[0].editor.clone();
         let guard = held.lock().unwrap();
-        editors.set_new_tip("New snip (Alt+Shift+S)".into());
+        editors.share(Shared { tip: "New snip (Alt+Shift+S)".into(), ..Shared::default() });
         editors.newest_notifier(&ctx).expect("a notifier without the lock").send("Saved".into());
         assert!(editors.with(a, |_| ()).is_none(), "a busy editor is skipped, not waited for");
         assert_eq!(editors.poll(), Requests::default());
         drop(guard);
         frame(&ctx, &editors, vec![]);
-        assert_eq!(editors.with(a, |e| (e.new_tip.clone(), e.note.as_ref().map(|n| n.msg.clone()))).unwrap(), ("New snip (Alt+Shift+S)".to_string(), Some("Saved".to_string())));
+        assert_eq!(editors.with(a, |e| (e.shared.tip.clone(), e.note.as_ref().map(|n| n.msg.clone()))).unwrap(), ("New snip (Alt+Shift+S)".to_string(), Some("Saved".to_string())));
     }
 
     #[test]
@@ -4213,11 +4226,12 @@ Arc::ptr_eq(&snip.flattened(), &shown), "a current canvas is reused, not re-burn
         let ctx = egui::Context::default();
         let mut editors = Editors::new(None);
         let (a, _, _) = editors.open_snip(&ctx, white(10, 10), 0, None);
-        editors.set_new_tip("New recording (Ctrl+N)".into());
+        let folders = Shared { tip: "New recording (Ctrl+N)".into(), screenshots: Some(PathBuf::from(r"D:\Snips")), recordings: None };
+        editors.share(folders.clone());
         let (b, _, _) = editors.open_snip(&ctx, white(10, 10), 0, None);
         frame(&ctx, &editors, vec![]);
         for id in [a, b] {
-            assert_eq!(editors.with(id, |e| e.new_tip.clone()).unwrap(), "New recording (Ctrl+N)");
+            assert_eq!(editors.with(id, |e| e.shared.clone()).unwrap(), folders);
         }
     }
 
