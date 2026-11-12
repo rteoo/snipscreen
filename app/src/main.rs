@@ -721,7 +721,8 @@ impl App {
             self.snip_editors.push((id, Some(editor)));
             return;
         }
-        // The chosen folder and the default one: a notification from before the folder changed still opens.
+        // The chosen folder and the default one, so a notification for a snip saved in the default folder
+        // still opens after a change (one saved in an earlier chosen folder doesn't).
         let folders: Vec<PathBuf> = [self.settings.screenshots(), settings::default_screenshots(), notify::recent_dir()].into_iter().flatten().collect();
         if !notify::may_open(&path, &folders) {
             self.show_home(ctx);

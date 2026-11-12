@@ -217,6 +217,8 @@ const KEEP_ON_PICTURE: f32 = 16.0;
 /// Text sizes a corner drag can reach, in image pixels (a text already outside keeps its size as a bound).
 const TEXT_MIN_PX: f32 = 4.0;
 const TEXT_MAX_PX: f32 = 1024.0;
+/// The Text option's sizes, in points. Text typed again takes its own size, which can be outside.
+const TEXT_PT: std::ops::RangeInclusive<f32> = 10.0..=96.0;
 
 /// How far a mark's ink reaches past its `Mark::frame`, in image pixels: half its line, the thin
 /// edge of a filled shape (a text's frame holds all of it).
@@ -902,7 +904,7 @@ impl Snip {
         let ((color, width), palette, range) = match tool {
             Tool::Highlighter => (&mut self.tools.highlighter, &HIGHLIGHT_COLORS[..], 6.0..=48.0),
             Tool::Shape => (&mut self.tools.shape, &PEN_COLORS[..], 1.0..=24.0),
-            Tool::Text => (&mut self.tools.text, &PEN_COLORS[..], 10.0..=96.0),
+            Tool::Text => (&mut self.tools.text, &PEN_COLORS[..], TEXT_PT),
             _ => (&mut self.tools.pen, &PEN_COLORS[..], 1.0..=24.0),
         };
         swatches(ui, palette, color);
@@ -928,7 +930,7 @@ impl Snip {
         let sized = !matches!(&m, Mark::Shape(s) if filled_box(s.kind, s.fill));
         let (palette, range) = match &m {
             Mark::Stroke(s) if s.ink == Ink::Highlighter => (&HIGHLIGHT_COLORS[..], 6.0..=48.0),
-            Mark::Text(_) => (&PEN_COLORS[..], 10.0..=96.0),
+            Mark::Text(_) => (&PEN_COLORS[..], TEXT_PT),
             _ => (&PEN_COLORS[..], 1.0..=24.0),
         };
         let (color, size_px) = match &mut m {
@@ -1015,8 +1017,9 @@ impl Snip {
             let origin = ctx.input(|i| i.pointer.press_origin()).or(pointer);
             let swallowed = guard.swallows(&ctx, resp.clicked());
             match tools.tool {
-                _ if swallowed => {}
-                // Scan text takes the pointer, to pick words, until it is turned off.
+                // Scan text takes the pointer, to pick words, until it is turned off. It runs on a
+                // swallowed click too (only the click is ignored), so the dimming and the worker's
+                // result are never skipped for a frame.
                 _ if scan.is_some() => {
                     let s = scan.as_mut().expect("checked");
                     if let Some(rx) = &s.reading {
@@ -1047,7 +1050,7 @@ impl Snip {
                     if resp.drag_stopped() {
                         s.anchor = None;
                     }
-                    if resp.clicked() {
+                    if resp.clicked() && !swallowed {
                         s.picked = pointer.and_then(|p| ocr::word_at(lines, to_px(p), reach, false)).map(|w| (w, w));
                     }
                     if s.anchor.is_some() || resp.hover_pos().is_some_and(|p| ocr::word_at(lines, to_px(p), reach, false).is_some()) {
@@ -1059,6 +1062,7 @@ impl Snip {
                         }
                     }
                 }
+                _ if swallowed => {}
                 // The crop frame takes the pointer from whichever tool is chosen until it is applied or cancelled.
                 _ if crop.is_some() => {
                     let frame = crop.unwrap_or(Rect::NOTHING);
@@ -1128,7 +1132,7 @@ impl Snip {
                                 reopen_text(doc, i, tools, drawing, draft, reediting, k);
                                 (*selected, *mark_drag) = (None, None);
                                 if let Some(Mark::Text(t)) = drawing.as_ref() {
-                                    draft.move_to(caret_near(t, None, to_px(p)));
+                                    draft.move_to(caret_near(t, to_px(p)));
                                 }
                             }
                         }
@@ -1200,14 +1204,16 @@ impl Snip {
                             };
                             if typing_here {
                                 if let Some(Mark::Text(t)) = drawing.as_ref() {
-                                    draft.move_to(caret_near(t, canvas.live.text.as_ref(), to_px(p)));
+                                    draft.move_to(caret_near(t, to_px(p)));
                                 }
                             } else if let Some(i) = { place_typed(canvas, doc, take_typed(drawing, draft, ime_taken), reediting); text_at(doc, to_px(p)) } {
                                 reopen_text(doc, i, tools, drawing, draft, reediting, k);
                                 if let Some(Mark::Text(t)) = drawing.as_ref() {
-                                    draft.move_to(caret_near(t, None, to_px(p)));
+                                    draft.move_to(caret_near(t, to_px(p)));
                                 }
                             } else {
+                                // New text starts at a size the option offers, whatever text was typed again before.
+                                tools.text.1 = tools.text.1.clamp(*TEXT_PT.start(), *TEXT_PT.end());
                                 let mut t = Text { text: String::new(), color: tools.text.0, size: tools.text.1 * k, outline: tools.text_outline, pos: to_px(p) };
                                 t.pos.y -= t.line_height() / 2.0;
                                 *drawing = Some(Mark::Text(t));
@@ -1865,10 +1871,11 @@ impl Editor {
     }
 }
 
-/// Copies the recording to `to`. Choosing the recording itself (the dialog starts in its folder
-/// under its name) is already done: copying a file onto itself fails with a sharing violation.
 /// Copies opened in Paint that are kept: Paint saves into the copy, so the newest stay for a while.
 const PAINT_FILES: usize = 20;
+/// A copy written to this long after it was made was saved by Paint (or someone), so it is the
+/// user's work and is never pruned. Our own write takes milliseconds.
+const PAINT_EDITED_AFTER: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Writes `image` into `dir` as `Snip <timestamp>.png` (Paint shows the name, and its Save keeps
 /// it), after deleting all but the newest `PAINT_FILES - 1` copies made earlier. Returns its path.
@@ -1887,13 +1894,21 @@ fn write_for_paint(dir: &std::path::Path, image: &ColorImage) -> Result<PathBuf,
 }
 
 /// Deletes the `Snip *.png` files in `dir` beyond the newest `keep`, by when they were last written.
+/// A copy saved into after it was made (`PAINT_EDITED_AFTER`) is kept and not counted: deleting it
+/// could lose the only copy of an edit made in Paint.
 fn prune_snips(dir: &std::path::Path, keep: usize) {
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     let mut snips: Vec<(std::time::SystemTime, PathBuf)> = entries
         .filter_map(|e| {
             let e = e.ok()?;
             let name = e.file_name().into_string().ok()?;
-            (name.starts_with("Snip ") && name.ends_with(".png")).then(|| Some((e.metadata().ok()?.modified().ok()?, e.path())))?
+            if !(name.starts_with("Snip ") && name.ends_with(".png")) {
+                return None;
+            }
+            let meta = e.metadata().ok()?;
+            let (made, written) = (meta.created().ok()?, meta.modified().ok()?);
+            let edited = written.duration_since(made).is_ok_and(|d| d > PAINT_EDITED_AFTER);
+            (!edited).then(|| (written, e.path()))
         })
         .collect();
     snips.sort_by_key(|s| std::cmp::Reverse(s.0));
@@ -1902,6 +1917,8 @@ fn prune_snips(dir: &std::path::Path, keep: usize) {
     }
 }
 
+/// Copies the recording to `to`. Choosing the recording itself (the dialog starts in its folder
+/// under its name) is already done: copying a file onto itself fails with a sharing violation.
 fn copy_recording(from: &std::path::Path, to: &std::path::Path) -> Result<(), String> {
     if std::fs::canonicalize(from).is_ok_and(|f| std::fs::canonicalize(to).is_ok_and(|t| f == t)) {
         return Ok(());
@@ -2642,8 +2659,8 @@ fn with_preedit(t: &Text, preedit: &str, caret: usize) -> Text {
 }
 
 /// The char boundary of `t` nearest `p` (image pixels) on the line `p` is on: where a click puts
-/// the caret. `raster` is the text's own, laid out already, when there is one.
-fn caret_near(t: &Text, raster: Option<&TextRaster>, p: Pos2) -> usize {
+/// the caret. Laid out from `t` itself: the live raster may show an input method's preedit too.
+fn caret_near(t: &Text, p: Pos2) -> usize {
     let line = ((p.y - t.pos.y) / t.line_height()).floor().max(0.0) as usize;
     let mut start = 0;
     let mut lines = t.text.split('\n').peekable();
@@ -2654,8 +2671,7 @@ fn caret_near(t: &Text, raster: Option<&TextRaster>, p: Pos2) -> usize {
         }
     }
     let end = start + t.text[start..].find('\n').unwrap_or(t.text.len() - start);
-    let at = |i: usize| raster.map_or_else(|| t.caret_at(i), |r| r.caret_at(i)).x;
-    (start..=end).filter(|&i| t.text.is_char_boundary(i)).min_by(|&a, &b| (at(a) - p.x).abs().total_cmp(&(at(b) - p.x).abs())).unwrap_or(end)
+    t.caret_nearest(start, end, p.x)
 }
 
 /// What a change to the draft is, for grouping changes into undo steps.
@@ -2917,12 +2933,24 @@ mod tests {
 
     #[test]
     fn a_copy_for_paint_is_the_snip_and_only_the_newest_copies_stay() {
+        /// Removes the folder however the test ends.
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
         let dir = std::env::temp_dir().join(format!("snipscreen-paint-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
+        let _cleanup = Cleanup(dir.clone());
         // Someone else's file in the folder is never touched.
         std::fs::write(dir.join("notes.txt"), "keep").unwrap();
         let image = gradient(40, 30);
+        // The oldest copy, saved into by Paint a while after it was made, is the user's work.
+        let edited = write_for_paint(&dir, &image).unwrap();
+        let made_at = std::fs::metadata(&edited).unwrap().created().unwrap();
+        std::fs::File::options().write(true).open(&edited).unwrap().set_modified(made_at + PAINT_EDITED_AFTER * 2).unwrap();
         let mut made = Vec::new();
         for _ in 0..PAINT_FILES + 3 {
             made.push(write_for_paint(&dir, &image).unwrap());
@@ -2931,13 +2959,13 @@ mod tests {
         }
         let left: Vec<PathBuf> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().path()).collect();
         let pngs: Vec<&PathBuf> = left.iter().filter(|p| p.extension().is_some_and(|e| e == "png")).collect();
-        assert_eq!(pngs.len(), PAINT_FILES, "the newest {PAINT_FILES} copies stay");
+        assert_eq!(pngs.len(), PAINT_FILES + 1, "the newest {PAINT_FILES} copies stay, and the edited one");
+        assert!(edited.exists(), "a copy Paint saved into is never pruned");
         // (The oldest copy's name may be in use again: a copy made in the same second takes the first free name.)
         assert!(made[made.len() - PAINT_FILES..].iter().all(|p| p.exists()), "the newest ones are the ones kept");
         assert!(dir.join("notes.txt").exists());
         let back = notify::load_png(made.last().unwrap()).unwrap();
         assert!(back.pixels == image.pixels, "Paint gets the snip as shown");
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -4620,11 +4648,14 @@ Arc::ptr_eq(&snip.flattened(), &shown), "a current canvas is reused, not re-burn
         snip.step(false);
         assert_eq!(texts(&snip), ["typo"], "and one undo brings it back");
 
-        // Away from any text the Text tool still starts new text.
+        // Away from any text the Text tool still starts new text, at a size the option offers even
+        // after a text bigger than that (enlarged with Select) was typed in again.
+        snip.tools.text.1 = 300.0;
         let away = pos2(490.0 + 200.0, 300.0 + 150.0);
         canvas_frame(&ctx, &mut snip, &mut screen, vec![Event::PointerMoved(away), pointer(away, true)]);
         canvas_frame(&ctx, &mut snip, &mut screen, vec![pointer(away, false)]);
-        assert!(matches!(&snip.drawing, Some(Mark::Text(t)) if t.text.is_empty()) && snip.reediting.is_none());
+        assert!(matches!(&snip.drawing, Some(Mark::Text(t)) if t.text.is_empty() && t.size == *TEXT_PT.end()) && snip.reediting.is_none());
+        assert_eq!(snip.tools.text.1, *TEXT_PT.end());
     }
 
     #[test]
@@ -4666,6 +4697,16 @@ Arc::ptr_eq(&snip.flattened(), &shown), "a current canvas is reused, not re-burn
             press(&mut snip, &mut screen, vec![pointer(target, false)]);
             assert_eq!(text(&snip), ("^aXb\nção".into(), want), "a click at {target:?}");
         }
+        // While an input method shows its composition inside the line, the screen's layout has it
+        // and the text doesn't: a click is placed by the text's own layout (and never panics).
+        let click = |snip: &mut Snip, screen: &mut Screen, target: Pos2| {
+            press(snip, screen, vec![Event::PointerMoved(target), pointer(target, true)]);
+            press(snip, screen, vec![pointer(target, false)]);
+        };
+        click(&mut snip, &mut screen, gap(1));
+        press(&mut snip, &mut screen, vec![Event::Ime(egui::ImeEvent::Preedit { text: "日本".into(), active_range_chars: None })]);
+        click(&mut snip, &mut screen, gap(3));
+        assert_eq!(text(&snip), ("^aXb\nção".into(), 3), "a click mid-composition");
         assert!(snip.doc.marks.is_empty(), "clicking in the text never places it");
     }
 
