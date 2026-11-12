@@ -203,6 +203,8 @@ pub struct Tools {
     pub highlighter: (Color32, f32),
     pub shape_kind: ShapeKind,
     pub shape: (Color32, f32),
+    /// Rectangles and ellipses come out filled.
+    pub shape_fill: bool,
     /// Colour and font size in screen points.
     pub text: (Color32, f32),
     pub text_outline: bool,
@@ -216,6 +218,7 @@ impl Default for Tools {
             highlighter: (HIGHLIGHT_COLORS[0], 18.0),
             shape_kind: ShapeKind::Arrow,
             shape: (PEN_COLORS[2], 4.0),
+            shape_fill: false,
             text: (PEN_COLORS[2], 24.0),
             text_outline: true,
         }
@@ -480,6 +483,9 @@ impl Snip {
         if tool == Tool::Text {
             ui.checkbox(&mut self.tools.text_outline, "Outline");
         }
+        if tool == Tool::Shape && matches!(self.tools.shape_kind, ShapeKind::Rectangle | ShapeKind::Ellipse) {
+            ui.checkbox(&mut self.tools.shape_fill, "Fill");
+        }
     }
 
     fn canvas(&mut self, ui: &mut egui::Ui, guard: &PopupClickGuard) {
@@ -582,7 +588,7 @@ impl Snip {
                         if let Some(p) = origin {
                             let (color, width) = tools.shape;
                             let p = to_px(p);
-                            *drawing = Some(Mark::Shape(Shape { kind: tools.shape_kind, color, width: width * k, from: p, to: p }));
+                            *drawing = Some(Mark::Shape(Shape { kind: tools.shape_kind, color, width: width * k, from: p, to: p, fill: tools.shape_fill }));
                         }
                     }
                     if let (Some(Mark::Shape(s)), Some(p)) = (drawing.as_mut(), resp.interact_pointer_pos()) {
@@ -2622,6 +2628,7 @@ Arc::ptr_eq(&snip.flattened(), &shown), "a current canvas is reused, not re-burn
             highlighter: (HIGHLIGHT_COLORS[2], 30.0),
             shape_kind: ShapeKind::Ellipse,
             shape: (PEN_COLORS[4], 12.0),
+            shape_fill: true,
             text: (PEN_COLORS[1], 40.0),
             text_outline: false,
         };
@@ -3171,7 +3178,7 @@ Arc::ptr_eq(&snip.flattened(), &shown), "a current canvas is reused, not re-burn
             let pos = pos2(100.0 + (i % 4) as f32 * 900.0, 100.0 + (i / 4) as f32 * 400.0);
             d.add_mark(Text { text: "Label 12345\nsecond line".into(), color: PEN_COLORS[2], size: 96.0, outline: true, pos });
         }
-        d.add_mark(Shape { kind: ShapeKind::Line, color: Color32::RED, width: 4.0, from: pos2(3700.0, 2100.0), to: pos2(3710.0, 2100.0) });
+        d.add_mark(Shape { kind: ShapeKind::Line, color: Color32::RED, width: 4.0, from: pos2(3700.0, 2100.0), to: pos2(3710.0, 2100.0), fill: false });
         let (mut erase, mut undo, mut redo, mut hits) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         for _ in 0..5 {
             let before = d.marks.clone();
