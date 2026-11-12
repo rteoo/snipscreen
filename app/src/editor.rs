@@ -2799,7 +2799,8 @@ mod tests {
         let left: Vec<PathBuf> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().path()).collect();
         let pngs: Vec<&PathBuf> = left.iter().filter(|p| p.extension().is_some_and(|e| e == "png")).collect();
         assert_eq!(pngs.len(), PAINT_FILES, "the newest {PAINT_FILES} copies stay");
-        assert!(made[made.len() - PAINT_FILES..].iter().all(|p| p.exists()) && !made[0].exists());
+        // (The oldest copy's name may be in use again: a copy made in the same second takes the first free name.)
+        assert!(made[made.len() - PAINT_FILES..].iter().all(|p| p.exists()), "the newest ones are the ones kept");
         assert!(dir.join("notes.txt").exists());
         let back = notify::load_png(made.last().unwrap()).unwrap();
         assert!(back.pixels == image.pixels, "Paint gets the snip as shown");
