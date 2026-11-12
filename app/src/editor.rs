@@ -1004,7 +1004,7 @@ impl Editor {
                     Ok(()) => "Video copied to clipboard".to_string(),
                     Err(e) => format!("Couldn't copy the video: {e}"),
                 },
-                CopyAs::Path => match win::copy_text(hwnd as HWND, &path.to_string_lossy()) {
+                CopyAs::Path => match win::copy_text(hwnd as HWND, path.as_os_str()) {
                     Ok(()) => "Path copied to clipboard".to_string(),
                     Err(e) => format!("Couldn't copy the path: {e}"),
                 },
