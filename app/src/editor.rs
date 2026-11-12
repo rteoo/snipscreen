@@ -1041,7 +1041,7 @@ impl Editor {
                         Ok(None) => return,
                         Err(e) => return report.send(format!("Couldn't save: {e}")),
                     };
-                    report.send(saved_note(&path, std::fs::copy(&from, &path).map(|_| ()).map_err(|e| e.to_string())));
+                    report.send(saved_note(&path, copy_recording(&from, &path)));
                 })
             }
         };
@@ -1090,6 +1090,15 @@ impl Editor {
             }
         }
     }
+}
+
+/// Copies the recording to `to`. Choosing the recording itself (the dialog starts in its folder
+/// under its name) is already done: copying a file onto itself fails with a sharing violation.
+fn copy_recording(from: &std::path::Path, to: &std::path::Path) -> Result<(), String> {
+    if std::fs::canonicalize(from).is_ok_and(|f| std::fs::canonicalize(to).is_ok_and(|t| f == t)) {
+        return Ok(());
+    }
+    std::fs::copy(from, to).map(|_| ()).map_err(|e| e.to_string())
 }
 
 fn saved_note(path: &std::path::Path, result: Result<(), String>) -> String {
@@ -1912,6 +1921,23 @@ fn read_keys(i: &mut egui::InputState, popup_open: bool, focused: bool) -> Keys 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn saving_a_recording_onto_itself_keeps_it() {
+        let dir = std::env::temp_dir().join(format!("snipscreen-save-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (rec, copy) = (dir.join("Rec.mp4"), dir.join("Copy.mp4"));
+        std::fs::write(&rec, b"video").unwrap();
+        // Same file under another spelling of its path: different case, `.` segment.
+        let same = copy_recording(&rec, &dir.join(".").join("REC.MP4"));
+        let other = copy_recording(&rec, &copy);
+        let (kept, copied) = (std::fs::read(&rec), std::fs::read(&copy));
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(same, Ok(()));
+        assert_eq!(other, Ok(()));
+        assert_eq!(kept.unwrap(), b"video");
+        assert_eq!(copied.unwrap(), b"video");
+    }
     use crate::widgets::{BAR_PAD, CAPTION_W};
 
     fn white(w: usize, h: usize) -> ColorImage {
