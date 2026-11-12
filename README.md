@@ -31,7 +31,7 @@ installed per user or run portable. It is a sibling of [SnipType](https://github
 - Delay timer (3, 5, or 10 seconds) with a visible countdown that Esc cancels.
 - A notification with a preview after each snip; clicking it opens the snip in the editor, even after a restart.
 - Lives in the notification area, optionally starts with Windows, and keeps one copy running.
-- A small Settings window: the snip shortcut, what happens after a snip, auto-copy, auto-save, and start with Windows.
+- A small Settings window: the snip shortcut, what happens after a snip, auto-copy, auto-save, where snips and recordings are saved, and start with Windows.
 - Pen (6 colours), a highlighter that blends into the picture (4 colours), shapes (arrow, line, rectangle, ellipse; rectangles and ellipses can be filled), text in Geist with a size slider and a contrasting outline, eraser, crop with a frame and handles, and 50-step undo/redo.
 - Edit in Paint opens the snip, markup included, in Paint.
 - Placed marks stay editable: the Select tool moves and resizes them, changes their colour, size, fill or outline, and deletes them.

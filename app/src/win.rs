@@ -346,6 +346,44 @@ pub fn copy_text(owner: HWND, text: &std::ffi::OsStr) -> Result<(), String> {
     }
 }
 
+/// Asks for a folder with Windows' own folder picker, modal to `owner` and opening at `start`.
+/// `Ok(None)` when it was cancelled. Call it off the UI thread: it runs until the person answers.
+pub fn pick_folder(owner: HWND, start: Option<&Path>, title: &str) -> Result<Option<PathBuf>, String> {
+    use windows::core::{HRESULT, HSTRING};
+    use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE};
+    use windows::Win32::UI::Shell::{FileOpenDialog, IFileOpenDialog, IShellItem, SHCreateItemFromParsingName, FOS_FORCEFILESYSTEM, FOS_PATHMUSTEXIST, FOS_PICKFOLDERS, SIGDN_FILESYSPATH};
+    use std::os::windows::ffi::OsStringExt;
+    // ERROR_CANCELLED as an HRESULT: the person closed the picker.
+    const CANCELLED: HRESULT = HRESULT(0x8007_04C7_u32 as i32);
+    unsafe {
+        // The dialog is a COM object that needs a single-threaded apartment on this thread.
+        let init = CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+        let result = (|| -> windows::core::Result<Option<PathBuf>> {
+            let dialog: IFileOpenDialog = CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER)?;
+            dialog.SetOptions(dialog.GetOptions()? | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST)?;
+            dialog.SetTitle(&HSTRING::from(title))?;
+            if let Some(dir) = start.filter(|d| d.is_dir()) {
+                if let Ok(item) = SHCreateItemFromParsingName::<_, _, IShellItem>(&HSTRING::from(dir.as_os_str()), None) {
+                    dialog.SetFolder(&item)?;
+                }
+            }
+            match dialog.Show(Some(windows::Win32::Foundation::HWND(owner))) {
+                Ok(()) => {}
+                Err(e) if e.code() == CANCELLED => return Ok(None),
+                Err(e) => return Err(e),
+            }
+            let raw = dialog.GetResult()?.GetDisplayName(SIGDN_FILESYSPATH)?;
+            let path = PathBuf::from(std::ffi::OsString::from_wide(raw.as_wide()));
+            CoTaskMemFree(Some(raw.0 as *const c_void));
+            Ok(Some(path))
+        })();
+        if init.is_ok() {
+            CoUninitialize();
+        }
+        result.map_err(|e| e.message())
+    }
+}
+
 /// Opens `path` in Paint: `mspaint.exe`, in System32 up to Windows 10 and an app alias for the
 /// Store's Paint on Windows 11, both found on the PATH.
 pub fn open_in_paint(path: &Path) -> Result<(), String> {
@@ -1213,6 +1251,28 @@ fn wide_os(s: &std::ffi::OsStr) -> Vec<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Opens the real folder picker and closes it at once with a message to that dialog (its own
+    /// process's window, by its title): the COM set-up and a cancel must come back as `Ok(None)`.
+    #[test]
+    #[ignore = "shows the folder picker on the desktop for a moment"]
+    fn the_folder_picker_opens_and_a_close_is_a_cancel() {
+        use windows_sys::Win32::UI::WindowsAndMessaging::WM_CLOSE;
+        const TITLE: &str = "SnipScreen picker test";
+        let closer = std::thread::spawn(|| {
+            for _ in 0..200 {
+                if let Some(h) = find_window(TITLE) {
+                    unsafe { PostMessageW(h, WM_CLOSE, 0, 0) };
+                    return true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            false
+        });
+        let picked = pick_folder(null_mut(), Some(&std::env::temp_dir()), TITLE);
+        assert!(closer.join().unwrap(), "the picker showed up with its title");
+        assert_eq!(picked, Ok(None));
+    }
 
     #[test]
     fn cf_html_offsets_point_at_the_document_and_the_fragment() {
