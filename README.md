@@ -138,20 +138,21 @@ A dashed outline marks exactly what is being recorded and stays out of the video
 | Interruptions | Through UAC, the lock screen, full-screen apps, and resolution changes, the last image repeats until the screen is readable again |
 | Devices | A microphone that is slow to start or unplugged leaves silence instead of stopping the recording; an unplugged one shows a "!" note on the bar |
 | Errors | A recording that stops early is finalized and kept, and the toast says why |
-| Files | `Videos\Screen Recordings\Screen Recording <timestamp>.mp4`, never overwriting an existing file |
+| Files | `Screen Recording <timestamp>.mp4` in `Videos\Screen Recordings` (or the folder chosen in Settings), never overwriting an existing file |
 
 ## Data safety and privacy
 
 SnipScreen writes only the files you create:
 
-- Snips auto-save to `Pictures\Screenshots\Snip <timestamp>.png`.
-- Recordings go to `Videos\Screen Recordings\Screen Recording <timestamp>.mp4`.
+- Snips auto-save to `Snip <timestamp>.png` in `Pictures\Screenshots`, or the folder chosen in Settings.
+- Recordings go to `Screen Recording <timestamp>.mp4` in `Videos\Screen Recordings`, or the folder chosen in Settings.
 - Two files from the same second get ` (2)`, ` (3)`, and so on instead of overwriting each other.
 
 Besides those, it keeps:
 
 - Your choices in `%APPDATA%\SnipScreen\settings.ini`.
 - Notification previews and snips you didn't auto-save in `%LOCALAPPDATA%\SnipScreen\recent`, pruned to the newest 20.
+- Snips opened with Edit in Paint in `%LOCALAPPDATA%\SnipScreen\paint`, pruned to the newest 20. A copy you saved in Paint is never pruned.
 - Per-user registry entries for start with Windows, notifications, and the `snipscreen:` link a notification opens. The uninstaller removes them.
 
 It keeps no history or logs, and it makes no network requests.

@@ -111,8 +111,17 @@ fn languages() -> Result<Vec<String>, String> {
             tags.push(tag);
         }
     }
-    tags.truncate(MAX_LANGUAGES);
+    keep_english(&mut tags);
     Ok(tags)
+}
+
+/// Cuts `tags` to `MAX_LANGUAGES`, never leaving out English: it leads the merge (see `recognize`).
+fn keep_english(tags: &mut Vec<String>) {
+    if let Some(i) = tags.iter().position(|t| t.to_ascii_lowercase().starts_with("en")).filter(|&i| i >= MAX_LANGUAGES) {
+        let en = tags.remove(i);
+        tags.insert(MAX_LANGUAGES - 1, en);
+    }
+    tags.truncate(MAX_LANGUAGES);
 }
 
 /// One language's reading of the prepared picture, in image pixels.
@@ -638,6 +647,16 @@ mod tests {
         let en = vec![line(0.0, 0.0, 10.0, "Aqäo rapida"), line(0.0, 20.0, 10.0, "I'll test")];
         let pt = vec![line(0.5, 0.5, 10.0, "Ação rápida"), line(0.0, 20.0, 10.0, "1'11 test")];
         assert_eq!(plain(&merge(en, &[pt])), "Ação rápida\nI'll test");
+    }
+
+    #[test]
+    fn english_is_kept_when_more_languages_are_installed_than_are_run() {
+        let mut tags: Vec<String> = ["pt-BR", "de-DE", "fr-FR", "es-ES", "en-US"].map(String::from).to_vec();
+        keep_english(&mut tags);
+        assert_eq!(tags, ["pt-BR", "de-DE", "en-US"]);
+        let mut tags: Vec<String> = ["en-GB", "pt-BR", "de-DE", "fr-FR"].map(String::from).to_vec();
+        keep_english(&mut tags);
+        assert_eq!(tags, ["en-GB", "pt-BR", "de-DE"]);
     }
 
     #[test]

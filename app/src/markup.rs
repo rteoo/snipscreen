@@ -360,6 +360,25 @@ impl Text {
         Self::font().map_or(self.pos, |f| self.lay_out(&f, Pen::start(self), byte, |_| {}))
     }
 
+    /// The char boundary in `start..=end`, one line of the text (no line break inside), whose caret is
+    /// nearest `x`; the first of equally near ones. One pass, however long the line.
+    pub fn caret_nearest(&self, start: usize, end: usize, x: f32) -> usize {
+        let Some(f) = Self::font() else { return start };
+        let advances = f.glyph_metrics(skrifa::instance::Size::new(self.size), skrifa::instance::LocationRef::default());
+        let charmap = f.charmap();
+        let mut cx = self.lay_out(&f, Pen::start(self), start, |_| {}).x;
+        let mut best = (start, (cx - x).abs());
+        for (i, ch) in self.text[start..end].char_indices() {
+            if let Some(id) = charmap.map(ch) {
+                cx += advances.advance_width(id).unwrap_or(0.0);
+            }
+            if (cx - x).abs() < best.1 {
+                best = (start + i + ch.len_utf8(), (cx - x).abs());
+            }
+        }
+        best.0
+    }
+
     /// Every glyph that draws something, flattened and placed, in reading order.
     fn placed(&self) -> Vec<Placed> {
         let mut layout = Layout::default();
@@ -2670,5 +2689,18 @@ mod tests {
         d.undo();
         assert!(d.render_runs(&all(&d)) == shown, "undo renders it again, the same");
         assert_eq!(d.texts.len(), 1);
+    }
+
+    #[test]
+    fn the_nearest_caret_is_the_one_laying_out_each_gap_finds() {
+        let t = Text { text: "top\nAção é 日本 ok\u{0}!".into(), color: Color32::BLACK, size: 24.0, outline: false, pos: Pos2::new(7.0, 3.0) };
+        let (start, end) = (4, t.text.len());
+        let gaps: Vec<usize> = (start..=end).filter(|&i| t.text.is_char_boundary(i)).collect();
+        let nearest = |x: f32| *gaps.iter().min_by(|&&a, &&b| (t.caret_at(a).x - x).abs().total_cmp(&(t.caret_at(b).x - x).abs())).unwrap();
+        let (left, right) = (t.caret_at(start).x, t.caret_at(end).x);
+        for i in -4..=60 {
+            let x = left - 10.0 + (right - left + 20.0) * i as f32 / 56.0;
+            assert_eq!(t.caret_nearest(start, end, x), nearest(x), "at x = {x}");
+        }
     }
 }
