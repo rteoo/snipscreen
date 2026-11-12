@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/rteoo/snipscreen/releases/tag/v0.2.1"><img src="https://img.shields.io/badge/stable-v0.2.1-blue.svg" alt="Stable v0.2.1"></a>
+  <a href="https://github.com/rteoo/snipscreen/releases/tag/v0.3.0"><img src="https://img.shields.io/badge/stable-v0.3.0-blue.svg" alt="Stable v0.3.0"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT license"></a>
 </p>
 
@@ -32,12 +32,13 @@ installed per user or run portable. It is a sibling of [SnipType](https://github
 - A notification with a preview after each snip; clicking it opens the snip in the editor, even after a restart.
 - Lives in the notification area, optionally starts with Windows, and keeps one copy running.
 - A small Settings window: the snip shortcut, what happens after a snip, auto-copy, auto-save, and start with Windows.
-- Pen (6 colours), a highlighter that blends into the picture (4 colours), shapes (arrow, line, rectangle, ellipse), text in Geist with a size slider and a contrasting outline, eraser, crop with a frame and handles, and 50-step undo/redo.
+- Pen (6 colours), a highlighter that blends into the picture (4 colours), shapes (arrow, line, rectangle, ellipse; rectangles and ellipses can be filled), text in Geist with a size slider and a contrasting outline, eraser, crop with a frame and handles, and 50-step undo/redo.
+- Placed marks stay editable: the Select tool moves and resizes them, changes their colour, size, fill or outline, and deletes them.
 - Each snip opens in its own editor window, so several can be open at once.
 - What you see is what you save: the screen and the saved PNG use the same rasteriser.
 - Zoom with Ctrl+wheel (anchored on the cursor) or Ctrl+Plus, Ctrl+Minus, and Ctrl+0.
 - Automatic copy and auto-save, each with a toast that reports what really happened.
-- Screen recording to MP4 (H.264 + AAC, 30 fps) with system sound and a chosen microphone.
+- Screen recording to MP4 (H.264 + AAC, 30 fps) with system sound and a chosen microphone; the result window copies the video or its path.
 - Recordings survive UAC prompts, the lock screen, full-screen apps, and resolution changes.
 - A recording that stops early keeps everything captured up to that point.
 - Portrait (rotated) monitors record upright.
@@ -45,9 +46,9 @@ installed per user or run portable. It is a sibling of [SnipType](https://github
 
 ## Quick start
 
-Download `SnipscreenSetup-0.2.1.exe` from the
-[stable v0.2.1 release](https://github.com/rteoo/snipscreen/releases/tag/v0.2.1)
-and run it, or extract the portable `Snipscreen-0.2.1-windows-x64.zip` and run
+Download `SnipscreenSetup-0.3.0.exe` from the
+[stable v0.3.0 release](https://github.com/rteoo/snipscreen/releases/tag/v0.3.0)
+and run it, or extract the portable `Snipscreen-0.3.0-windows-x64.zip` and run
 `snipscreen.exe`. To build from source with Rust and the MSVC build tools (which
 include the Windows SDK) installed:
 
@@ -63,7 +64,7 @@ Use `cargo run` for a development build.
 ### Releases and installer
 
 The current stable release is
-[`v0.2.1`](https://github.com/rteoo/snipscreen/releases/tag/v0.2.1):
+[`v0.3.0`](https://github.com/rteoo/snipscreen/releases/tag/v0.3.0):
 
 | Platform | Package |
 | --- | --- |
@@ -110,9 +111,10 @@ completely.
 | Ctrl+Plus / Ctrl+Minus | Zoom in or out |
 | Ctrl+0 | Fit the snip to the window |
 | Shift (while drawing a shape) | Keep lines at 45° and boxes square |
+| Delete or Backspace | Delete the selected mark (Select tool) |
 | Enter | Place the text, or apply the crop |
 | Shift+Enter | New line in the text |
-| Esc | Close a menu, or cancel the text, crop, countdown, picking, or recording bar |
+| Esc | Close a menu, or cancel the text, crop, mark drag or selection, countdown, picking, or recording bar |
 
 Alt+Shift+S is the default because Win+Shift+S and Print Screen belong to the
 system Snipping Tool. If another app already holds the shortcut, Settings says
@@ -201,4 +203,6 @@ SnipScreen is released under the [MIT License](LICENSE).
 ## Third-party notices
 
 - **Geist** (Geist SemiBold, embedded for text marks) is © The Geist Project Authors and licensed under the [SIL Open Font License 1.1](app/assets/fonts/OFL.txt). The installer ships that licence as `licenses\Geist-OFL.txt` in the install folder.
+- **Inter Tight** (Inter Tight Regular, the interface font) is © The Inter Project Authors and licensed under the [SIL Open Font License 1.1](app/assets/fonts/InterTight-OFL.txt), shipped as `licenses\InterTight-OFL.txt`.
+- **Bootstrap Icons** (the toolbar icons) are © The Bootstrap Authors and licensed under the [MIT License](app/assets/icons/LICENSE), shipped as `licenses\BootstrapIcons-LICENSE.txt`.
 - The Rust crates SnipScreen is built from (among them egui/eframe, skrifa and vello_cpu) are licensed under MIT and/or Apache-2.0; their notices are in each crate's source.
