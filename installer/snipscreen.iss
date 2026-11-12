@@ -66,8 +66,10 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; Flags: unchecked
 Source: "{#MyBuildDir}\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\README.md"; DestDir: "{app}"; Flags: ignoreversion
-; The embedded Geist font's licence (SIL OFL 1.1 asks for it to travel with the font).
+; The embedded Geist and Inter Tight fonts' licences (SIL OFL 1.1 asks for it to travel with the font), and Bootstrap Icons' MIT licence.
 Source: "..\app\assets\fonts\OFL.txt"; DestDir: "{app}\licenses"; DestName: "Geist-OFL.txt"; Flags: ignoreversion
+Source: "..\app\assets\fonts\InterTight-OFL.txt"; DestDir: "{app}\licenses"; DestName: "InterTight-OFL.txt"; Flags: ignoreversion
+Source: "..\app\assets\icons\LICENSE"; DestDir: "{app}\licenses"; DestName: "BootstrapIcons-LICENSE.txt"; Flags: ignoreversion
 
 [Icons]
 ; The same AppUserModelID the app sets on itself (notify.rs), so the running

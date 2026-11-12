@@ -34,7 +34,7 @@ pub const BAR_PAD: f32 = 8.0;
 pub const CAPTION_W: f32 = 46.0;
 pub const BTN: Vec2 = vec2(32.0, 32.0);
 /// Toolbar icons are drawn this many points square.
-pub const GLYPH: f32 = 18.0;
+pub const GLYPH: f32 = 16.0;
 /// Control sizes: `FULL` for the toolbars, `COMPACT` for the picker's helper bar.
 #[derive(Clone, Copy)]
 pub struct Scale {
@@ -64,7 +64,17 @@ pub const DASH_SHADOW: Color32 = Color32::from_black_alpha(130);
 /// How long a message stays up once something is drawing it.
 pub const NOTE_SECS: f64 = 4.0;
 
+/// egui's default fonts with Inter Tight Regular (SIL OFL 1.1, `assets/fonts/InterTight-OFL.txt`) first for proportional text,
+/// so glyphs Inter Tight lacks (emoji, symbols) still fall back to the defaults.
+fn fonts() -> egui::FontDefinitions {
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert("Inter Tight".into(), std::sync::Arc::new(egui::FontData::from_static(include_bytes!("../assets/fonts/InterTight-Regular.ttf"))));
+    fonts.families.entry(egui::FontFamily::Proportional).or_default().insert(0, "Inter Tight".into());
+    fonts
+}
+
 pub fn style(ctx: &egui::Context) {
+    ctx.set_fonts(fonts());
     ctx.set_theme(egui::Theme::Dark);
     // Ctrl+Plus/Minus/0 zoom the snip (see `editor::read_keys`), not egui's whole UI.
     ctx.options_mut(|o| o.zoom_with_keyboard = false);

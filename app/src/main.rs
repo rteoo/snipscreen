@@ -1509,7 +1509,7 @@ impl App {
                         _ => (Icon::Record, "Start"),
                     };
                     let dark = Color32::from_rgb(0x1a, 0x1a, 0x1a);
-                    icons::paint(p, Rect::from_center_size(rect.left_center() + vec2(24.0, 0.0), vec2(18.0, 18.0)), icon, dark, None);
+                    icons::paint(p, Rect::from_center_size(rect.left_center() + vec2(24.0, 0.0), vec2(16.0, 16.0)), icon, dark, None);
                     p.text(rect.left_center() + vec2(42.0, 0.0), Align2::LEFT_CENTER, label, FontId::proportional(14.0), dark);
                     if resp.clicked() && !saving {
                         if recording { stop = true } else { start = true }
