@@ -165,6 +165,8 @@ pub struct Settings {
     pub record_mic: bool,
     /// `None` is the Windows default microphone.
     pub mic: Option<String>,
+    /// The sound output whose sound is recorded; `None` is the Windows default one.
+    pub system_device: Option<String>,
     /// Where snips are saved; `None` is Pictures\Screenshots (see `screenshots`).
     pub screenshots_dir: Option<PathBuf>,
     /// Where recordings are saved; `None` is Videos\Screen Recordings (see `recordings`).
@@ -185,6 +187,7 @@ impl Default for Settings {
             record_system: true,
             record_mic: false,
             mic: None,
+            system_device: None,
             screenshots_dir: None,
             recordings_dir: None,
         }
@@ -272,6 +275,7 @@ impl Settings {
             format!("record_system={}", bool_word(self.record_system)),
             format!("record_mic={}", bool_word(self.record_mic)),
             format!("mic={}", self.mic.as_deref().unwrap_or("")),
+            format!("system_device={}", self.system_device.as_deref().unwrap_or("")),
             format!("screenshots_dir={}", self.screenshots_dir.as_ref().map_or(String::new(), |p| p.display().to_string())),
             format!("recordings_dir={}", self.recordings_dir.as_ref().map_or(String::new(), |p| p.display().to_string())),
         ];
@@ -309,6 +313,10 @@ impl Settings {
                 "recordings_dir" => folder(value).map(|v| s.recordings_dir = v).is_some(),
                 "mic" => {
                     s.mic = (!value.is_empty()).then(|| value.to_string());
+                    true
+                }
+                "system_device" => {
+                    s.system_device = (!value.is_empty()).then(|| value.to_string());
                     true
                 }
                 _ => true,
@@ -452,6 +460,7 @@ mod tests {
             record_system: false,
             record_mic: true,
             mic: Some("{0.0.1.00000000}.{a=b c}".into()),
+            system_device: Some("{0.0.0.00000000}.{d e}".into()),
             screenshots_dir: Some(PathBuf::from(r"D:\OneDrive\Imagens\Capturas = tela")),
             recordings_dir: Some(PathBuf::from(r"\\nas\vídeos")),
         };

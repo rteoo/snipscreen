@@ -1,6 +1,7 @@
 #![windows_subsystem = "windows"]
 
 mod audio;
+mod device_menu;
 mod editor;
 mod icons;
 mod markup;
@@ -115,12 +116,14 @@ enum Stage {
     Recording(Box<RecBar>),
 }
 
-// Recording bar controls, left to right: Start, clock, mic, mic menu, system sound, divider, close, and the "!" warning (shown only when there are notes, but always budgeted for).
+// Recording bar controls, left to right: Start, clock, mic, mic menu, system sound, its menu, divider, close, and the "!" warning (shown only when there are notes, but always budgeted for).
 const REC_START_W: f32 = 104.0;
 const REC_CLOCK_W: f32 = 84.0;
 const REC_CHEVRON_W: f32 = 16.0;
 const REC_WARN_W: f32 = 12.0;
-const REC_ROW: [f32; 8] = [REC_START_W, REC_CLOCK_W, BTN.x, REC_CHEVRON_W, BTN.x, DIVIDER_W, BTN.x, REC_WARN_W];
+const REC_ROW: [f32; 9] = [REC_START_W, REC_CLOCK_W, BTN.x, REC_CHEVRON_W, BTN.x, REC_CHEVRON_W, DIVIDER_W, BTN.x, REC_WARN_W];
+/// A click on a menu's arrow just after the menu closed (that click took its focus) doesn't reopen it.
+const MENU_REOPEN: Duration = Duration::from_millis(300);
 const BAR_PAD: f32 = 8.0;
 const BAR_BORDER: f32 = 1.0;
 /// Spare room so rounding to whole pixels at fractional scales never clips a control.
@@ -216,7 +219,9 @@ struct App {
 
     screenshot: Option<ScreenshotJob>,
 
-    mics: Vec<audio::Mic>,
+    /// The recording bar's open sound menu, and which menu last closed when (see `MENU_REOPEN`).
+    device_menu: Option<device_menu::DeviceMenu>,
+    menu_closed: Option<(audio::Flow, Instant)>,
     rec_tx: Sender<recorder::Event>,
     rec_rx: Receiver<recorder::Event>,
     /// Snips announced by a notification, kept for an instant open when it is clicked.
@@ -306,7 +311,8 @@ impl App {
             home_visible: !hidden,
             popup_guard: PopupClickGuard::default(),
             screenshot: None,
-            mics: Vec::new(),
+            device_menu: None,
+            menu_closed: None,
             rec_tx,
             rec_rx,
             recent: notify::Recent::new(RECENT_SNIPS, RECENT_BYTES, RECENT_AGE),
@@ -1397,7 +1403,7 @@ impl App {
         };
         let settings = recorder::Settings {
             area: bar.area,
-            system_sound: self.settings.record_system,
+            system_sound: self.settings.record_system.then(|| self.settings.system_device.clone()),
             microphone: self.settings.record_mic.then(|| self.settings.mic.clone()),
             path: dir.join(format!("Screen Recording {}.mp4", win::timestamp())),
         };
@@ -1457,6 +1463,7 @@ impl App {
     /// Back from the bar to the normal window.
     fn close_rec_bar(&mut self, ctx: &egui::Context) {
         self.stage = Stage::Idle;
+        self.device_menu = None;
         win::exclude_from_capture(self.hwnd as HWND, false);
         self.return_home(ctx);
         self.place_window(ctx);
@@ -1484,6 +1491,8 @@ impl App {
             ctx.request_repaint_after(Duration::from_millis(250));
         }
         let (mut start, mut stop, mut close) = (false, false, false);
+        // An arrow clicked this frame: which menu, and the arrow's rect (points, in this window).
+        let mut menu_click: Option<(audio::Flow, Rect)> = None;
         let saving = bar.saving;
         let notes = bar.notes.join("\n");
         if !recording && take_escape(&ctx) {
@@ -1523,42 +1532,32 @@ impl App {
                     let (t, _) = ui.allocate_exact_size(vec2(REC_CLOCK_W, BTN.y), Sense::hover());
                     ui.painter().text(t.center(), Align2::CENTER_CENTER, clock, FontId::monospace(14.0), ICON);
 
+                    let open = self.device_menu.as_ref().map(|m| m.flow);
+                    let mut arrow = |ui: &mut egui::Ui, flow: audio::Flow, tip: &str| {
+                        let (r, resp) = ui.allocate_exact_size(vec2(REC_CHEVRON_W, BTN.y), if recording { Sense::hover() } else { Sense::click() });
+                        if open == Some(flow) {
+                            ui.painter().rect_filled(r, 4.0, BUTTON_HOVER);
+                        } else if resp.hovered() && !recording {
+                            ui.painter().rect_filled(r, 4.0, BUTTON_BG);
+                        }
+                        icons::paint(ui.painter(), Rect::from_center_size(r.center(), vec2(12.0, 12.0)), Icon::Chevron, if recording { ICON_OFF } else { ICON }, None);
+                        if resp.on_hover_text(tip).clicked() {
+                            menu_click = Some((flow, r));
+                        }
+                    };
                     let mic_icon = if self.settings.record_mic { Icon::Mic } else { Icon::MicOff };
                     let mic_tip = if self.settings.record_mic { "Mute microphone" } else { "Unmute microphone" };
                     if icon_button(ui, mic_icon, None, false, !recording, mic_tip).clicked() {
                         self.settings.record_mic = !self.settings.record_mic;
                     }
-                    let (chev, chev_resp) = ui.allocate_exact_size(vec2(REC_CHEVRON_W, BTN.y), if recording { Sense::hover() } else { Sense::click() });
-                    icons::paint(ui.painter(), Rect::from_center_size(chev.center(), vec2(12.0, 12.0)), Icon::Chevron, if recording { ICON_OFF } else { ICON }, None);
-                    if chev_resp.clicked() {
-                        self.mics = audio::microphones();
-                    }
-                    egui::Popup::menu(&chev_resp).show(|ui| {
-                        if ui.selectable_label(!self.settings.record_mic, "Mute").clicked() {
-                            self.settings.record_mic = false;
-                        }
-                        ui.separator();
-                        for (i, m) in self.mics.iter().enumerate() {
-                            let chosen = self.settings.record_mic
-                                && match &self.settings.mic {
-                                    Some(id) => *id == m.id,
-                                    None => i == 0,
-                                };
-                            if ui.selectable_label(chosen, &m.name).clicked() {
-                                self.settings.record_mic = true;
-                                self.settings.mic = Some(m.id.clone());
-                            }
-                        }
-                        if self.mics.is_empty() {
-                            ui.weak("No microphones found");
-                        }
-                    });
+                    arrow(ui, audio::Flow::Input, "Choose the microphone");
 
                     let sys_icon = if self.settings.record_system { Icon::SystemSound } else { Icon::SystemSoundOff };
                     let sys_tip = if self.settings.record_system { "Mute system audio" } else { "Unmute system audio" };
                     if icon_button(ui, sys_icon, None, false, !recording, sys_tip).clicked() {
                         self.settings.record_system = !self.settings.record_system;
                     }
+                    arrow(ui, audio::Flow::Output, "Choose the sound output to record");
                     divider(ui);
                     let close_tip = if recording { "Stop and save" } else { "Close (Esc)" };
                     if icon_button(ui, Icon::Close, None, false, !saving, close_tip).clicked() {
@@ -1572,6 +1571,7 @@ impl App {
                 });
             });
 
+        self.device_menus(&ctx, menu_click, [bx, by], ppp, work, recording || start || saving);
         if start {
             self.start_recording(&ctx);
         }
@@ -1585,6 +1585,60 @@ impl App {
         }
         if close {
             self.close_rec_bar(&ctx);
+        }
+    }
+
+    /// Opens, shows and closes the recording bar's sound menus. `menu_click` is an arrow clicked this
+    /// frame, with its rect in the bar window, whose client area is at `client` (screen pixels, `ppp`
+    /// per point) on a monitor with work area `work`. No menu shows once recording starts.
+    fn device_menus(&mut self, ctx: &egui::Context, menu_click: Option<(audio::Flow, Rect)>, client: [i32; 2], ppp: f32, work: [i32; 4], busy: bool) {
+        if busy {
+            self.device_menu = None;
+            return;
+        }
+        if let Some((flow, r)) = menu_click {
+            let just_closed = self.menu_closed.is_some_and(|(f, t)| f == flow && t.elapsed() < MENU_REOPEN);
+            let same = self.device_menu.as_ref().is_some_and(|m| m.flow == flow);
+            self.device_menu = None;
+            if !same && !just_closed {
+                let (on, chosen) = self.sound_choice(flow);
+                let mut menu = device_menu::DeviceMenu::open(flow);
+                let size = menu.size(on, chosen.as_deref()) * ppp;
+                let x = client[0] + (r.left() * ppp).round() as i32;
+                let below = client[1] + (r.bottom() * ppp).round() as i32 + 4;
+                // Under the arrow, or above the bar when the monitor ends first; kept on the monitor sideways.
+                let y = if below + size.y as i32 <= work[1] + work[3] { below } else { client[1] - size.y as i32 - 4 };
+                let x = x.clamp(work[0], (work[0] + work[2] - size.x as i32).max(work[0]));
+                menu.place([x, y]);
+                self.device_menu = Some(menu);
+            }
+        }
+        let Some(flow) = self.device_menu.as_ref().map(|m| m.flow) else { return };
+        let (on, chosen) = self.sound_choice(flow);
+        let Some(menu) = self.device_menu.as_mut() else { return };
+        let (choice, done) = menu.show(ctx, on, chosen.as_deref());
+        if let Some(c) = choice {
+            let (record, device) = match flow {
+                audio::Flow::Input => (&mut self.settings.record_mic, &mut self.settings.mic),
+                audio::Flow::Output => (&mut self.settings.record_system, &mut self.settings.system_device),
+            };
+            match c {
+                device_menu::Choice::Off => *record = false,
+                device_menu::Choice::Default => (*record, *device) = (true, None),
+                device_menu::Choice::Device(id) => (*record, *device) = (true, Some(id)),
+            }
+        }
+        if done {
+            self.device_menu = None;
+            self.menu_closed = Some((flow, Instant::now()));
+        }
+    }
+
+    /// Whether a sound is recorded, and the device chosen for it (`None`: the Windows default).
+    fn sound_choice(&self, flow: audio::Flow) -> (bool, Option<String>) {
+        match flow {
+            audio::Flow::Input => (self.settings.record_mic, self.settings.mic.clone()),
+            audio::Flow::Output => (self.settings.record_system, self.settings.system_device.clone()),
         }
     }
 

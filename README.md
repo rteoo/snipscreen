@@ -40,7 +40,7 @@ installed per user or run portable. It is a sibling of [SnipType](https://github
 - What you see is what you save: the screen and the saved PNG use the same rasteriser.
 - Zoom with Ctrl+wheel (anchored on the cursor) or Ctrl+Plus, Ctrl+Minus, and Ctrl+0.
 - Automatic copy and auto-save, each with a toast that reports what really happened.
-- Screen recording to MP4 (H.264 + AAC, 30 fps) with system sound and a chosen microphone; the result window copies the video or its path.
+- Screen recording to MP4 (H.264 + AAC, 30 fps) with the computer's sound and a microphone, each picked from the recording bar (the Windows default, or a chosen device; a muted microphone is marked); the result window copies the video or its path.
 - Recordings survive UAC prompts, the lock screen, full-screen apps, and resolution changes.
 - A recording that stops early keeps everything captured up to that point.
 - Portrait (rotated) monitors record upright.
@@ -195,7 +195,8 @@ without driving the desktop.
 | `app/src/settings.rs`, `settings_window.rs` | Saved settings and the Settings window |
 | `app/src/widgets.rs` | Shared look: colours, title bar, buttons, toasts |
 | `app/src/recorder.rs` | MP4 recording through DXGI Desktop Duplication and Media Foundation |
-| `app/src/audio.rs` | WASAPI loopback and microphone capture |
+| `app/src/audio.rs` | WASAPI loopback and microphone capture, and the device lists |
+| `app/src/device_menu.rs` | The recording bar's sound device menus |
 | `app/src/win.rs` | Win32: screen grab, clipboard, dialogs, title bar |
 | `app/src/icons.rs` | Vector toolbar icons |
 | `app/assets/` | App icon sources (`.svg`), renders (`.png`), and `snipscreen.ico`, which `app/build.rs` embeds in the `.exe` |

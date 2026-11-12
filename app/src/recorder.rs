@@ -51,7 +51,8 @@ const AUDIO_GAP: i64 = TICKS / 2;
 pub struct Settings {
     /// Screen pixels to record: x, y, width, height.
     pub area: [i32; 4],
-    pub system_sound: bool,
+    /// `Some(None)` records what the default sound output plays, `Some(Some(id))` a chosen one.
+    pub system_sound: Option<Option<String>>,
     /// `Some(None)` records the default microphone, `Some(Some(id))` a chosen one.
     pub microphone: Option<Option<String>>,
     pub path: PathBuf,
@@ -164,11 +165,16 @@ fn record(
         notes.push("Only the part on one screen is recorded".to_string());
     }
     let wanted = [
-        s.system_sound.then_some((Source::System, "the computer's sound")),
-        s.microphone.clone().map(|id| (Source::Microphone(id), "the microphone")),
+        s.system_sound.clone().map(|id| (Source::System(id), "the computer's sound", "sound output")),
+        s.microphone.clone().map(|id| (Source::Microphone(id), "the microphone", "microphone")),
     ];
-    for (source, name) in wanted.into_iter().flatten() {
-        match Capture::start(source, clock) {
+    for (source, name, device) in wanted.into_iter().flatten() {
+        // A chosen device that is unplugged (or won't open) gives way to the Windows default one.
+        let opened = Capture::start(source.clone(), clock).or_else(|e| match source.on_default() {
+            Some(fallback) => Capture::start(fallback, clock).inspect(|_| notes.push(format!("The chosen {device} couldn't be opened ({e}), so the Windows default one is recorded"))),
+            None => Err(e),
+        });
+        match opened {
             Ok(c) => {
                 captures.push(c);
                 names.push(name);
@@ -1115,7 +1121,7 @@ mod tests {
         let _desktop = desktop();
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("target").join("test-realtime.mp4");
         let _ = std::fs::remove_file(&path);
-        let settings = Settings { area: [0, 0, 1280, 720], system_sound: true, microphone: None, path: path.clone() };
+        let settings = Settings { area: [0, 0, 1280, 720], system_sound: Some(None), microphone: None, path: path.clone() };
         let (tx, rx) = std::sync::mpsc::channel();
         let mut rec = start(settings, move |e| {
             if let Event::Done(r) = e {

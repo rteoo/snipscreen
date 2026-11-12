@@ -1,5 +1,6 @@
-//! Sound capture for recordings: the computer's own output (WASAPI loopback)
-//! and the default microphone, both delivered as 48 kHz stereo f32.
+//! Sound capture for recordings: what a playback device plays (WASAPI loopback) and a microphone,
+//! the Windows default ones or chosen ones, both delivered as 48 kHz stereo f32. Also lists the
+//! devices for the recording bar's menus.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -18,6 +19,7 @@ use windows::Win32::Media::Audio::{
     AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM, AUDCLNT_STREAMFLAGS_LOOPBACK,
     AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY, WAVEFORMATEX,
 };
+use windows::Win32::Media::Audio::Endpoints::IAudioEndpointVolume;
 use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_MULTITHREADED};
 
 pub const RATE: u32 = 48_000;
@@ -30,40 +32,85 @@ const DRIFT: i64 = RATE as i64 / 25;
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Source {
-    /// Whatever the computer is playing.
-    System,
+    /// What a playback device is playing, by device id; `None` is the Windows default.
+    System(Option<String>),
     /// A microphone by device id; `None` is the Windows default.
     Microphone(Option<String>),
 }
 
-pub struct Mic {
-    pub id: String,
-    pub name: String,
+impl Source {
+    /// The same kind of source on the Windows default device, for a chosen device that won't open.
+    pub fn on_default(&self) -> Option<Source> {
+        match self {
+            Source::System(Some(_)) => Some(Source::System(None)),
+            Source::Microphone(Some(_)) => Some(Source::Microphone(None)),
+            _ => None,
+        }
+    }
 }
 
-/// Active microphones, the Windows default first.
-pub fn microphones() -> Vec<Mic> {
+/// Microphones, or the playback devices whose sound can be recorded.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Flow {
+    Input,
+    Output,
+}
+
+/// A connected sound device.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Device {
+    pub id: String,
+    pub name: String,
+    /// Muted in Windows: a microphone muted there records silence.
+    pub muted: bool,
+}
+
+/// The connected devices of one flow, the Windows default first, and which one that is.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct Devices {
+    pub list: Vec<Device>,
+    pub default: Option<String>,
+}
+
+impl Devices {
+    pub fn name_of(&self, id: &str) -> Option<&str> {
+        self.list.iter().find(|d| d.id == id).map(|d| d.name.as_str())
+    }
+}
+
+/// The active devices of `flow`. Empty when Windows' sound service can't be reached.
+pub fn devices(flow: Flow) -> Devices {
+    let data_flow = if flow == Flow::Input { eCapture } else { eRender };
     unsafe {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
         let Ok(devices) = CoCreateInstance::<_, IMMDeviceEnumerator>(&MMDeviceEnumerator, None, CLSCTX_ALL) else {
-            return Vec::new();
+            return Devices::default();
         };
-        let default = devices.GetDefaultAudioEndpoint(eCapture, eConsole).ok().and_then(|d| device_id(&d));
-        let Ok(list) = devices.EnumAudioEndpoints(eCapture, DEVICE_STATE_ACTIVE) else { return Vec::new() };
-        let mut mics: Vec<Mic> = (0..list.GetCount().unwrap_or(0))
+        let default = devices.GetDefaultAudioEndpoint(data_flow, eConsole).ok().and_then(|d| device_id(&d));
+        let Ok(list) = devices.EnumAudioEndpoints(data_flow, DEVICE_STATE_ACTIVE) else { return Devices::default() };
+        let mut list: Vec<Device> = (0..list.GetCount().unwrap_or(0))
             .filter_map(|i| list.Item(i).ok())
             .filter_map(|d| {
                 let id = device_id(&d)?;
-                let store = d.OpenPropertyStore(STGM_READ).ok()?;
-                let value = store.GetValue(&PKEY_Device_FriendlyName).ok()?;
-                let text = PropVariantToStringAlloc(&value).ok()?;
-                let name = text.to_string().unwrap_or_default();
-                CoTaskMemFree(Some(text.0 as *const _));
-                Some(Mic { id, name })
+                let name = friendly_name(&d).unwrap_or_else(|| "Unnamed device".into());
+                // A device without a volume control can't be muted there.
+                let muted = d.Activate::<IAudioEndpointVolume>(CLSCTX_ALL, None).and_then(|v| v.GetMute()).is_ok_and(|m| m.as_bool());
+                Some(Device { id, name, muted })
             })
             .collect();
-        mics.sort_by_key(|m| Some(&m.id) != default.as_ref());
-        mics
+        list.sort_by_key(|d| Some(&d.id) != default.as_ref());
+        Devices { list, default }
+    }
+}
+
+unsafe fn friendly_name(d: &IMMDevice) -> Option<String> {
+    unsafe {
+        let store = d.OpenPropertyStore(STGM_READ).ok()?;
+        let value = store.GetValue(&PKEY_Device_FriendlyName).ok()?;
+        let text = PropVariantToStringAlloc(&value).ok()?;
+        let name = text.to_string().ok();
+        CoTaskMemFree(Some(text.0 as *const _));
+        name.filter(|n| !n.is_empty())
     }
 }
 
@@ -156,9 +203,12 @@ fn open(source: &Source) -> Result<Client, String> {
         let devices: IMMDeviceEnumerator =
             CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).map_err(|e| fail("sound devices", e))?;
         let device = match source {
-            Source::System => devices
+            Source::System(None) => devices
                 .GetDefaultAudioEndpoint(eRender, eConsole)
                 .map_err(|e| fail("no speakers or headphones found", e))?,
+            Source::System(Some(id)) => devices
+                .GetDevice(&HSTRING::from(id.as_str()))
+                .map_err(|e| fail("that sound output is gone", e))?,
             Source::Microphone(None) => devices
                 .GetDefaultAudioEndpoint(eCapture, eConsole)
                 .map_err(|e| fail("no microphone found", e))?,
@@ -178,7 +228,7 @@ fn open(source: &Source) -> Result<Client, String> {
         };
         // Windows converts whatever the device runs at into our format.
         let mut flags = AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
-        if *source == Source::System {
+        if matches!(source, Source::System(_)) {
             flags |= AUDCLNT_STREAMFLAGS_LOOPBACK;
         }
         let buffer_100ns = 2_000_000; // 200 ms
@@ -428,12 +478,39 @@ mod tests {
     /// Needs sound devices; run with `cargo test -- --ignored`.
     #[test]
     #[ignore]
-    fn lists_microphones_by_name() {
-        let mics = microphones();
-        for m in &mics {
-            println!("mic: {}", m.name);
+    fn lists_devices_by_name_with_the_default_first() {
+        for flow in [Flow::Input, Flow::Output] {
+            let d = devices(flow);
+            for x in &d.list {
+                println!("{flow:?}: {}{}", x.name, if x.muted { " (muted)" } else { "" });
+            }
+            assert!(d.list.iter().all(|x| !x.name.is_empty() && !x.id.is_empty()));
+            if let Some(first) = d.list.first() {
+                assert_eq!(Some(&first.id), d.default.as_ref(), "the Windows default comes first");
+            }
         }
-        assert!(mics.iter().all(|m| !m.name.is_empty() && !m.id.is_empty()));
+    }
+
+    #[test]
+    fn a_chosen_device_falls_back_to_the_default_of_its_kind() {
+        assert_eq!(Source::Microphone(Some("x".into())).on_default(), Some(Source::Microphone(None)));
+        assert_eq!(Source::System(Some("x".into())).on_default(), Some(Source::System(None)));
+        assert_eq!(Source::System(None).on_default(), None, "the default has nothing to fall back to");
+    }
+
+    /// Needs two sound outputs; run with `cargo test -- --ignored`. Each output, default or not,
+    /// opens for loopback by its id and keeps time.
+    #[test]
+    #[ignore]
+    fn every_output_can_be_recorded_by_its_id() {
+        for d in devices(Flow::Output).list {
+            let cap = Capture::start(Source::System(Some(d.id.clone())), Instant::now()).unwrap_or_else(|e| panic!("{}: {e}", d.name));
+            std::thread::sleep(Duration::from_millis(400));
+            let got = cap.samples.lock().unwrap().len() / CHANNELS;
+            drop(cap);
+            assert!(got > RATE as usize / 4, "{}: only {got} frames in 0.4 s", d.name);
+        }
+        assert!(Capture::start(Source::System(Some("{0.0.0.00000000}.{no-such-device}".into())), Instant::now()).is_err(), "an unknown id fails, so the recorder falls back");
     }
 
     /// Needs a sound output device; run with `cargo test -- --ignored`.
@@ -441,7 +518,7 @@ mod tests {
     #[ignore]
     fn loopback_keeps_time_even_when_silent() {
         let clock = Instant::now();
-        let cap = Capture::start(Source::System, clock).expect("open loopback");
+        let cap = Capture::start(Source::System(None), clock).expect("open loopback");
         std::thread::sleep(Duration::from_millis(1000));
         let got = cap.samples.lock().unwrap().len() / CHANNELS;
         drop(cap);
