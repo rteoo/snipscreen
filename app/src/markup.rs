@@ -87,11 +87,28 @@ pub struct Shape {
     pub width: f32,
     pub from: Pos2,
     pub to: Pos2,
+    /// A rectangle or ellipse filled with `color` and edged with a thin line in a contrasting colour.
+    /// Ignored by lines and arrows.
+    pub fill: bool,
 }
 
 impl Shape {
+    fn filled(&self) -> bool {
+        self.fill && matches!(self.kind, ShapeKind::Rectangle | ShapeKind::Ellipse)
+    }
+
+    /// Half the width of the line drawn: the shape's own, or a filled shape's thin edge.
     fn radius(&self) -> f32 {
-        (self.width * 0.5).max(0.5)
+        if self.filled() {
+            (self.width * 0.15).clamp(0.75, 1.5)
+        } else {
+            (self.width * 0.5).max(0.5)
+        }
+    }
+
+    /// The colour of the line: the shape's own, or the edge's, which stands out from the fill.
+    fn line_color(&self) -> Color32 {
+        if self.filled() { contrast(self.color) } else { self.color }
     }
 
     /// End of the shaft and the head's corners (tip first). The head grows with the line width and
@@ -137,6 +154,10 @@ impl Shape {
 
     fn footprint(&self, tiles: &mut Tiles) {
         let reach = self.radius() + 1.0;
+        if self.filled() {
+            tiles.add(Rect::from_two_pos(self.from, self.to).expand(reach));
+            return;
+        }
         for (a, b) in self.segments() {
             tiles.add_segment(a, b, reach);
         }
@@ -149,24 +170,54 @@ impl Shape {
     fn paint(&self, segments: &[(Pos2, Pos2)], head: Option<[Pos2; 3]>, patch: &mut ColorImage, at: [usize; 2]) {
         let r = patch_rect(patch, at);
         let mut cover = vec![0f32; patch.pixels.len()];
+        let bounds = Rect::from_two_pos(self.from, self.to);
+        if self.filled() {
+            match self.kind {
+                ShapeKind::Rectangle => cover_box(&mut cover, r, bounds),
+                _ => cover_ellipse(&mut cover, r, bounds),
+            }
+            composite(patch, &mut cover, self.color);
+        }
         match self.kind {
-            ShapeKind::Rectangle => cover_box_outline(&mut cover, r, Rect::from_two_pos(self.from, self.to), self.radius()),
+            ShapeKind::Rectangle => cover_box_outline(&mut cover, r, bounds, self.radius()),
             _ => cover_segments(&mut cover, r, segments.iter().copied(), self.radius()),
         }
         if let Some(head) = head {
             cover_triangle(&mut cover, r, head);
         }
-        for (px, &k) in patch.pixels.iter_mut().zip(&cover) {
-            if k > 0.0 {
-                *px = over(*px, self.color, k);
-            }
-        }
+        composite(patch, &mut cover, self.line_color());
     }
 
     fn touches(&self, p: Pos2, radius: f32) -> bool {
-        let reach = self.width * 0.5 + radius;
-        self.segments().into_iter().any(|(a, b)| dist_to_segment(p, a, b) <= reach)
+        let reach = self.radius() + radius;
+        let r = Rect::from_two_pos(self.from, self.to);
+        let inside = match self.kind {
+            ShapeKind::Rectangle => r.contains(p),
+            _ => ellipse_distance(p, r) <= 0.0,
+        };
+        (self.filled() && inside)
+            || self.segments().into_iter().any(|(a, b)| dist_to_segment(p, a, b) <= reach)
             || (self.kind == ShapeKind::Arrow && triangle_distance(p, self.arrow().1) <= radius)
+    }
+}
+
+/// Opaque `ink` over `patch` at the coverage in `cover`, which is left cleared for the next layer.
+fn composite(patch: &mut ColorImage, cover: &mut [f32], ink: Color32) {
+    for (px, k) in patch.pixels.iter_mut().zip(cover.iter_mut()) {
+        if *k > 0.0 {
+            *px = over(*px, ink, *k);
+            *k = 0.0;
+        }
+    }
+}
+
+/// White against dark or colourful ink, near-black against light ink.
+pub fn contrast(color: Color32) -> Color32 {
+    let [r, g, b, _] = color.to_array().map(|v| v as f32 / 255.0);
+    if 0.2126 * r + 0.7152 * g + 0.0722 * b > 0.5 {
+        Color32::from_rgb(0x1f, 0x1f, 0x1f)
+    } else {
+        Color32::WHITE
     }
 }
 
@@ -235,12 +286,7 @@ impl Text {
 
     /// White under dark or colourful text, near-black under light text.
     pub fn halo_color(&self) -> Color32 {
-        let [r, g, b, _] = self.color.to_array().map(|v| v as f32 / 255.0);
-        if 0.2126 * r + 0.7152 * g + 0.0722 * b > 0.5 {
-            Color32::from_rgb(0x1f, 0x1f, 0x1f)
-        } else {
-            Color32::WHITE
-        }
+        contrast(self.color)
     }
 
     /// Lays the text out from `from` (the start, or a checkpoint of an earlier layout of a text
@@ -1137,6 +1183,48 @@ fn cover_box_outline(cover: &mut [f32], r: PxRect, rect: Rect, half: f32) {
     }
 }
 
+/// Raises `cover` to the exact area coverage of the filled rectangle `rect`.
+fn cover_box(cover: &mut [f32], r: PxRect, rect: Rect) {
+    let overlap = |lo: f32, hi: f32, p: f32| (hi.min(p + 1.0) - lo.max(p)).clamp(0.0, 1.0);
+    let bw = r.x1 - r.x0;
+    let (x0, x1) = ((rect.min.x.floor().max(0.0) as usize).max(r.x0), (rect.max.x.ceil().max(0.0) as usize).min(r.x1));
+    let (y0, y1) = ((rect.min.y.floor().max(0.0) as usize).max(r.y0), (rect.max.y.ceil().max(0.0) as usize).min(r.y1));
+    for y in y0..y1 {
+        let cy = overlap(rect.min.y, rect.max.y, y as f32);
+        for x in x0..x1 {
+            let slot = &mut cover[(y - r.y0) * bw + (x - r.x0)];
+            *slot = slot.max(cy * overlap(rect.min.x, rect.max.x, x as f32));
+        }
+    }
+}
+
+/// Approximate signed distance from `p` to the edge of the ellipse inscribed in `rect` (negative
+/// inside): the implicit function over its gradient, exact on the edge, which is all antialiasing needs.
+fn ellipse_distance(p: Pos2, rect: Rect) -> f32 {
+    let (a, b) = ((rect.width() / 2.0).max(1e-3), (rect.height() / 2.0).max(1e-3));
+    let d = p - rect.center();
+    let (qx, qy) = (d.x / a, d.y / b);
+    let grad = eframe::egui::vec2(qx / a, qy / b).length();
+    if grad < 1e-6 {
+        return -a.min(b);
+    }
+    (qx * qx + qy * qy - 1.0) / (2.0 * grad)
+}
+
+/// Raises `cover` to the antialiased coverage of the filled ellipse inscribed in `rect`.
+fn cover_ellipse(cover: &mut [f32], r: PxRect, rect: Rect) {
+    let bw = r.x1 - r.x0;
+    let (x0, x1) = ((rect.min.x.floor().max(0.0) as usize).max(r.x0), (rect.max.x.ceil().max(0.0) as usize).min(r.x1));
+    let (y0, y1) = ((rect.min.y.floor().max(0.0) as usize).max(r.y0), (rect.max.y.ceil().max(0.0) as usize).min(r.y1));
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let c = (0.5 - ellipse_distance(Pos2::new(x as f32 + 0.5, y as f32 + 0.5), rect)).clamp(0.0, 1.0);
+            let slot = &mut cover[(y - r.y0) * bw + (x - r.x0)];
+            *slot = slot.max(c);
+        }
+    }
+}
+
 /// Signed distance from `p` to a triangle (negative inside). Exact inside and along the edges,
 /// slightly short just past a corner, which keeps tips sharp.
 fn triangle_distance(p: Pos2, t: [Pos2; 3]) -> f32 {
@@ -1588,7 +1676,7 @@ mod tests {
     }
 
     fn shape(kind: ShapeKind, width: f32, from: (f32, f32), to: (f32, f32)) -> Mark {
-        Mark::Shape(Shape { kind, color: Color32::RED, width, from: Pos2::new(from.0, from.1), to: Pos2::new(to.0, to.1) })
+        Mark::Shape(Shape { kind, color: Color32::RED, width, from: Pos2::new(from.0, from.1), to: Pos2::new(to.0, to.1), fill: false })
     }
 
     #[test]
@@ -1808,6 +1896,37 @@ mod tests {
         for (x, y) in [(30, 30), (11, 11), (5, 30)] {
             assert_eq!(at(x, y), Color32::WHITE, "off the circle at ({x}, {y})");
         }
+    }
+
+    #[test]
+    fn filled_shapes_take_the_ink_inside_a_thin_contrasting_edge() {
+        let grey = Color32::from_gray(128);
+        for kind in [ShapeKind::Rectangle, ShapeKind::Ellipse] {
+            let filled = Mark::Shape(Shape { kind, color: Color32::RED, width: 8.0, from: Pos2::new(10.0, 10.0), to: Pos2::new(50.0, 50.0), fill: true });
+            let mut img = ColorImage::new([60, 60], vec![grey; 3600]);
+            burn(&mut img, &filled);
+            let at = |x: usize, y: usize| img.pixels[y * 60 + x];
+            for (x, y) in [(30, 30), (13, 30), (30, 46)] {
+                assert_eq!(at(x, y), Color32::RED, "{kind:?} filled at ({x}, {y})");
+            }
+            // Red is dark enough for a white edge, and the edge stays thin whatever the size.
+            assert_eq!(at(10, 30), Color32::WHITE, "{kind:?} edge");
+            assert_eq!(at(7, 30), grey, "{kind:?} outside");
+            let mut doc = Doc::new(ColorImage::new([60, 60], vec![grey; 3600]));
+            doc.add_mark(filled.clone());
+            assert!(doc.hits(Pos2::new(30.0, 30.0), 1.0), "{kind:?}: a filled shape is hit anywhere inside");
+            let Mark::Shape(mut hollow) = filled else { unreachable!() };
+            hollow.fill = false;
+            let mut doc = Doc::new(ColorImage::new([60, 60], vec![grey; 3600]));
+            doc.add_mark(hollow);
+            assert!(!doc.hits(Pos2::new(30.0, 30.0), 1.0), "{kind:?}: an outline is only hit on its line");
+        }
+        // Lines and arrows ignore the fill.
+        let mut a = white(60, 60);
+        let mut b = white(60, 60);
+        burn(&mut a, &shape(ShapeKind::Arrow, 4.0, (10.0, 10.0), (50.0, 50.0)));
+        burn(&mut b, &Mark::Shape(Shape { kind: ShapeKind::Arrow, color: Color32::RED, width: 4.0, from: Pos2::new(10.0, 10.0), to: Pos2::new(50.0, 50.0), fill: true }));
+        assert!(a.pixels == b.pixels);
     }
 
     #[test]
