@@ -993,6 +993,25 @@ impl Editor {
         });
     }
 
+    /// Puts the recording (as a file, for pasting into Explorer or a chat) or its path on the
+    /// clipboard, on a worker: the clipboard may be held by another program for a moment.
+    fn copy_video(&mut self, ctx: &egui::Context, what: CopyAs) {
+        let Content::Video(v) = &self.content else { return };
+        let (path, hwnd, report) = (v.path.clone(), self.root_hwnd, self.notifier(ctx));
+        std::thread::spawn(move || {
+            report.send(match what {
+                CopyAs::File => match win::copy_file(hwnd as HWND, &path) {
+                    Ok(()) => "Video copied to clipboard".to_string(),
+                    Err(e) => format!("Couldn't copy the video: {e}"),
+                },
+                CopyAs::Path => match win::copy_text(hwnd as HWND, &path.to_string_lossy()) {
+                    Ok(()) => "Path copied to clipboard".to_string(),
+                    Err(e) => format!("Couldn't copy the path: {e}"),
+                },
+            });
+        });
+    }
+
     /// Asks where to save, then writes the file, all on a worker thread: the dialog is modal to this
     /// window alone, so the other windows (the recording bar among them) keep running, and a big PNG
     /// takes a moment to encode, a long recording a moment to copy. A second Save while one is under
@@ -1074,11 +1093,17 @@ impl Editor {
         let secs = v.seconds.round() as u64;
         let info = format!("Screen recording · {}:{:02} · {} × {}", secs / 60, secs % 60, v.size[0], v.size[1]);
         p.text(shown.center_bottom() + vec2(0.0, 22.0), Align2::CENTER_CENTER, info, FontId::proportional(14.0), ICON);
-        let buttons = Rect::from_center_size(shown.center_bottom() + vec2(0.0, 62.0), vec2(220.0, 32.0));
+        let buttons = Rect::from_center_size(shown.center_bottom() + vec2(0.0, 62.0), vec2(440.0, 32.0));
         let path = v.path.clone();
         let mut row = ui.new_child(egui::UiBuilder::new().max_rect(buttons).layout(Layout::left_to_right(Align::Center)));
         let button = |ui: &mut egui::Ui, text: &str| ui.add(egui::Button::new(text).fill(BUTTON_HOVER).min_size(vec2(100.0, 32.0))).clicked();
-        let (play, folder) = (button(&mut row, "Play"), button(&mut row, "Show in folder"));
+        let (play, copy_video, copy_path, folder) = (button(&mut row, "Play"), button(&mut row, "Copy video"), button(&mut row, "Copy path"), button(&mut row, "Show in folder"));
+        if copy_video {
+            self.copy_video(ui.ctx(), CopyAs::File);
+        }
+        if copy_path {
+            self.copy_video(ui.ctx(), CopyAs::Path);
+        }
         if resp.clicked() || play {
             if let Err(e) = win::open_path(&path) {
                 self.say(format!("Couldn't open the video: {e}"));
@@ -1099,6 +1124,12 @@ fn copy_recording(from: &std::path::Path, to: &std::path::Path) -> Result<(), St
         return Ok(());
     }
     std::fs::copy(from, to).map(|_| ()).map_err(|e| e.to_string())
+}
+
+/// What of a recording goes on the clipboard.
+enum CopyAs {
+    File,
+    Path,
 }
 
 fn saved_note(path: &std::path::Path, result: Result<(), String>) -> String {

@@ -23,14 +23,14 @@ use windows_sys::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, GetClipboardSequenceNumber, OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
 };
 use windows_sys::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
-use windows_sys::Win32::System::Ole::CF_DIB;
+use windows_sys::Win32::System::Ole::{CF_DIB, CF_HDROP, CF_UNICODETEXT, DROPEFFECT_COPY};
 use windows_sys::Win32::System::SystemInformation::GetLocalTime;
 use windows_sys::Win32::UI::Controls::Dialogs::{
     GetSaveFileNameW, OFN_NOCHANGEDIR, OFN_OVERWRITEPROMPT, OFN_PATHMUSTEXIST, OPENFILENAMEW,
 };
 
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{TrackMouseEvent, TME_LEAVE, TME_NONCLIENT, TRACKMOUSEEVENT};
-use windows_sys::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass, FOLDERID_LocalAppData, FOLDERID_Pictures, FOLDERID_RoamingAppData, FOLDERID_Videos, SHGetKnownFolderPath};
+use windows_sys::Win32::UI::Shell::{DefSubclassProc, DROPFILES, RemoveWindowSubclass, SetWindowSubclass, FOLDERID_LocalAppData, FOLDERID_Pictures, FOLDERID_RoamingAppData, FOLDERID_Videos, SHGetKnownFolderPath};
 use windows_sys::Win32::System::Com::{CoInitializeEx, CoTaskMemFree, CoUninitialize, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     EnumWindows, FindWindowExW, GetClientRect, GetWindowThreadProcessId, IsZoomed, PostMessageW, GWL_STYLE, HTCAPTION, HTCLIENT, HTMAXBUTTON, HTTOP, HTTOPLEFT, HTTOPRIGHT,
@@ -313,6 +313,41 @@ pub fn add_png(owner: HWND, seq: u32, png: &[u8]) -> Result<(), String> {
         CloseClipboard();
         result
     }
+}
+
+/// Puts the file on the clipboard the way Explorer's Copy does (a file list, marked as a copy), so
+/// it pastes as the file into Explorer, chat apps and mail.
+pub fn copy_file(owner: HWND, path: &Path) -> Result<(), String> {
+    let list = drop_files(&std::path::absolute(path).map_err(|e| format!("{}: {e}", path.display()))?);
+    unsafe {
+        open_clipboard(owner)?;
+        EmptyClipboard();
+        let effect = RegisterClipboardFormatW(wide("Preferred DropEffect").as_ptr());
+        let result = set_clipboard(CF_HDROP as u32, &list).and_then(|_| set_clipboard(effect, &DROPEFFECT_COPY.to_le_bytes()));
+        CloseClipboard();
+        result
+    }
+}
+
+/// Puts `text` on the clipboard as Unicode text.
+pub fn copy_text(owner: HWND, text: &str) -> Result<(), String> {
+    let bytes: Vec<u8> = wide(text).iter().flat_map(|c| c.to_le_bytes()).collect();
+    unsafe {
+        open_clipboard(owner)?;
+        EmptyClipboard();
+        let result = set_clipboard(CF_UNICODETEXT as u32, &bytes);
+        CloseClipboard();
+        result
+    }
+}
+
+/// A `CF_HDROP` block holding one file: the `DROPFILES` header, then the wide path and an empty
+/// one that ends the list.
+fn drop_files(path: &Path) -> Vec<u8> {
+    let header = DROPFILES { pFiles: size_of::<DROPFILES>() as u32, pt: POINT { x: 0, y: 0 }, fNC: 0, fWide: 1 };
+    let mut out = unsafe { std::slice::from_raw_parts(&header as *const _ as *const u8, size_of::<DROPFILES>()) }.to_vec();
+    out.extend(wide(&path.to_string_lossy()).iter().chain(&[0]).flat_map(|c| c.to_le_bytes()));
+    out
 }
 
 /// Puts the picture on the open clipboard as a bottom-up 32-bit DIB, converted straight into the
@@ -775,11 +810,12 @@ pub fn open_path(path: &std::path::Path) -> Result<(), String> {
     std::process::Command::new("explorer").arg(path).spawn().map(|_| ()).map_err(|e| e.to_string())
 }
 
-/// Opens Explorer with the file selected.
+/// Opens Explorer with the file selected. Explorer wants `/select,"<path>"`: given the whole
+/// argument in quotes, as `Command::arg` writes one with a space in it, it ignores it and opens its
+/// default folder. Windows paths can't contain `"`, so the raw argument needs no escaping.
 pub fn show_in_folder(path: &std::path::Path) -> Result<(), String> {
-    let mut arg = std::ffi::OsString::from("/select,");
-    arg.push(path);
-    std::process::Command::new("explorer").arg(arg).spawn().map(|_| ()).map_err(|e| e.to_string())
+    use std::os::windows::process::CommandExt;
+    std::process::Command::new("explorer").raw_arg(format!("/select,\"{}\"", path.display())).spawn().map(|_| ()).map_err(|e| e.to_string())
 }
 
 /// A top-level window of ours by its exact title. Another program's window with the same title is
@@ -1119,6 +1155,18 @@ fn wide(s: &str) -> Vec<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn drop_files_holds_one_wide_path_and_ends_the_list() {
+        let block = drop_files(Path::new(r"C:\é.mp4"));
+        let head = size_of::<DROPFILES>();
+        assert_eq!(u32::from_le_bytes(block[0..4].try_into().unwrap()) as usize, head);
+        assert_eq!(u32::from_le_bytes(block[head - 4..head].try_into().unwrap()), 1, "fWide");
+        let chars: Vec<u16> = block[head..].as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes(*c)).collect();
+        let mut expected: Vec<u16> = r"C:\é.mp4".encode_utf16().collect();
+        expected.extend([0, 0]);
+        assert_eq!(chars, expected);
+    }
 
     /// A zero-byte moveable block is allocated "discarded" and `GlobalLock`
     /// returns null for it: the failure must be reported, never written
