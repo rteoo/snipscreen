@@ -312,7 +312,7 @@ impl Text {
     /// Width of the halo stroked under the letters (half of it shows outside them).
     fn halo(&self) -> f32 {
         if self.outline {
-            (self.size * 0.16).max(2.0)
+            (self.size * 0.10).max(1.5)
         } else {
             0.0
         }
