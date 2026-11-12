@@ -33,6 +33,7 @@ installed per user or run portable. It is a sibling of [SnipType](https://github
 - Lives in the notification area, optionally starts with Windows, and keeps one copy running.
 - A small Settings window: the snip shortcut, what happens after a snip, auto-copy, auto-save, and start with Windows.
 - Pen (6 colours), a highlighter that blends into the picture (4 colours), shapes (arrow, line, rectangle, ellipse; rectangles and ellipses can be filled), text in Geist with a size slider and a contrasting outline, eraser, crop with a frame and handles, and 50-step undo/redo.
+- Edit in Paint opens the snip, markup included, in Paint.
 - Placed marks stay editable: the Select tool moves and resizes them, changes their colour, size, fill or outline, and deletes them.
 - Scan text reads the text in a snip with Windows' own OCR (every installed language at once, so English and accented text both come out right), then copies all of it or the words you pick, as plain text or formatted: Markdown (the default), rich text for Word, Outlook and Teams, or WhatsApp's markup. Headings, paragraphs, lists and tables are kept.
 - Each snip opens in its own editor window, so several can be open at once.
