@@ -35,6 +35,18 @@ pub const CAPTION_W: f32 = 46.0;
 pub const BTN: Vec2 = vec2(32.0, 32.0);
 /// Toolbar icons are drawn this many points square.
 pub const GLYPH: f32 = 18.0;
+/// Control sizes: `FULL` for the toolbars, `COMPACT` for the picker's helper bar.
+#[derive(Clone, Copy)]
+pub struct Scale {
+    pub btn: Vec2,
+    pub glyph: f32,
+    pub dropdown_w: f32,
+}
+pub const FULL: Scale = Scale { btn: BTN, glyph: GLYPH, dropdown_w: 46.0 };
+pub const COMPACT: Scale = Scale { btn: vec2(26.0, 26.0), glyph: 16.0, dropdown_w: 40.0 };
+/// The Size slider in the tool options: a thin rail and a small round handle.
+pub const SLIDER_RAIL: f32 = 4.0;
+pub const SLIDER_HANDLE: f32 = 14.0;
 pub const RADIUS: u8 = 4;
 pub const GAP: f32 = 4.0;
 pub const DIVIDER_W: f32 = 9.0;
@@ -44,8 +56,8 @@ pub const GROUP_GAP: f32 = 16.0;
 pub const MIN_WINDOW_W: f32 = 520.0;
 pub const MIN_WINDOW_H: f32 = 240.0;
 /// Dashes around an area being picked or recorded: (on, off) in points.
-pub const DASH: (f32, f32) = (7.0, 5.0);
-pub const DASH_STROKE: f32 = 2.0;
+pub const DASH: (f32, f32) = (5.0, 4.0);
+pub const DASH_STROKE: f32 = 1.0;
 pub const DASH_COLOR: Color32 = Color32::from_rgba_premultiplied(230, 230, 230, 230);
 /// How long a message stays up once something is drawing it.
 pub const NOTE_SECS: f64 = 4.0;
@@ -220,22 +232,30 @@ pub fn new_button(ui: &mut egui::Ui, tip: &str) -> egui::Response {
 }
 
 pub fn icon_button(ui: &mut egui::Ui, icon: Icon, ink: Option<Color32>, selected: bool, enabled: bool, tip: &str) -> egui::Response {
-    let (rect, resp) = ui.allocate_exact_size(BTN, if enabled { Sense::click() } else { Sense::hover() });
+    icon_button_sized(ui, FULL, icon, ink, selected, enabled, tip)
+}
+
+pub fn icon_button_sized(ui: &mut egui::Ui, sc: Scale, icon: Icon, ink: Option<Color32>, selected: bool, enabled: bool, tip: &str) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(sc.btn, if enabled { Sense::click() } else { Sense::hover() });
     let p = ui.painter();
     button_fill(p, rect, &resp, selected, enabled);
     let color = if enabled { ICON } else { ICON_OFF };
-    icons::paint(p, Rect::from_center_size(rect.center(), Vec2::splat(GLYPH)), icon, color, ink);
+    icons::paint(p, Rect::from_center_size(rect.center(), Vec2::splat(sc.glyph)), icon, color, ink);
     resp.on_hover_text(tip)
 }
 
 /// Icon plus a small chevron; `badge` writes a number by the icon (timer seconds).
 pub fn dropdown(ui: &mut egui::Ui, icon: Icon, badge: Option<u64>) -> egui::Response {
-    let (rect, resp) = ui.allocate_exact_size(vec2(46.0, BTN.y), Sense::click());
+    dropdown_sized(ui, FULL, icon, badge)
+}
+
+pub fn dropdown_sized(ui: &mut egui::Ui, sc: Scale, icon: Icon, badge: Option<u64>) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(vec2(sc.dropdown_w, sc.btn.y), Sense::click());
     let p = ui.painter();
     button_fill(p, rect, &resp, false, true);
-    let icon_rect = Rect::from_center_size(rect.left_center() + vec2(17.0, 0.0), Vec2::splat(GLYPH));
+    let icon_rect = Rect::from_center_size(rect.left_center() + vec2(sc.dropdown_w * 0.37, 0.0), Vec2::splat(sc.glyph));
     icons::paint(p, icon_rect, icon, ICON, None);
-    icons::paint(p, Rect::from_center_size(rect.right_center() - vec2(11.0, 0.0), vec2(10.0, 10.0)), Icon::Chevron, ICON, None);
+    icons::paint(p, Rect::from_center_size(rect.right_center() - vec2(sc.dropdown_w * 0.24, 0.0), Vec2::splat(sc.glyph * 0.55)), Icon::Chevron, ICON, None);
     if let Some(n) = badge {
         p.text(icon_rect.right_bottom() + vec2(1.0, 2.0), Align2::CENTER_BOTTOM, n.to_string(), FontId::proportional(10.0), ACCENT);
     }
@@ -243,9 +263,38 @@ pub fn dropdown(ui: &mut egui::Ui, icon: Icon, badge: Option<u64>) -> egui::Resp
 }
 
 pub fn divider(ui: &mut egui::Ui) {
-    let (rect, _) = ui.allocate_exact_size(vec2(DIVIDER_W, BTN.y), Sense::hover());
+    divider_sized(ui, FULL);
+}
+
+pub fn divider_sized(ui: &mut egui::Ui, sc: Scale) {
+    let (rect, _) = ui.allocate_exact_size(vec2(DIVIDER_W, sc.btn.y), Sense::hover());
     let x = ui.painter().round_to_pixel_center(rect.center().x);
-    ui.painter().line_segment([pos2(x, rect.center().y - 8.0), pos2(x, rect.center().y + 8.0)], (1.0, DIVIDER));
+    let half = sc.btn.y / 4.0;
+    ui.painter().line_segment([pos2(x, rect.center().y - half), pos2(x, rect.center().y + half)], (1.0, DIVIDER));
+}
+
+/// The tool options' Size slider: a thin rail, accent up to the handle, and a small light round handle.
+pub fn slim_slider(ui: &mut egui::Ui, value: &mut f32, range: std::ops::RangeInclusive<f32>) -> egui::Response {
+    let (lo, hi) = (*range.start(), *range.end());
+    let r = SLIDER_HANDLE / 2.0;
+    let (rect, mut resp) = ui.allocate_exact_size(vec2(ui.spacing().slider_width, SLIDER_HANDLE + 6.0), Sense::click_and_drag());
+    let (x0, x1) = (rect.left() + r, rect.right() - r);
+    if let Some(pos) = resp.interact_pointer_pos() {
+        let v = lo + ((pos.x - x0) / (x1 - x0)).clamp(0.0, 1.0) * (hi - lo);
+        if v != *value {
+            *value = v;
+            resp.mark_changed();
+        }
+    }
+    let t = ((*value - lo) / (hi - lo)).clamp(0.0, 1.0);
+    let hx = x0 + t * (x1 - x0);
+    let p = ui.painter();
+    let rail = Rect::from_center_size(rect.center(), vec2(rect.width(), SLIDER_RAIL));
+    p.rect_filled(rail, SLIDER_RAIL / 2.0, OUTLINE);
+    p.rect_filled(Rect::from_min_max(rail.min, pos2(hx, rail.max.y)), SLIDER_RAIL / 2.0, ACCENT);
+    let grow = if resp.dragged() || resp.hovered() { 1.0 } else { 0.0 };
+    p.circle_filled(pos2(hx, rect.center().y), r + grow, ICON);
+    resp
 }
 
 /// The window's top row: the toolbar merged into the title bar, with the caption buttons at the

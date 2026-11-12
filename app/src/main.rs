@@ -25,10 +25,14 @@ use eframe::egui::{
 use icons::Icon;
 use settings::{AfterCapture, Hotkey, Mode, Settings, Shape as Shape_, DELAYS};
 use widgets::{
-    dim_outside, divider, dropdown, icon_button, style, take_escape, Note, Notifier, PopupClickGuard, ACCENT, BTN, BUTTON_BG, BUTTON_HOVER, DIM, DIVIDER_W,
+    dim_outside, divider, divider_sized, dropdown, dropdown_sized, icon_button, icon_button_sized, style, take_escape, Note, Notifier, PopupClickGuard, Scale, ACCENT, BTN, COMPACT, FULL, BUTTON_BG, BUTTON_HOVER, DIM, DIVIDER_W,
     GAP, GLYPH, ICON, ICON_OFF, MIN_WINDOW_H, MIN_WINDOW_W, OUTLINE, RADIUS, TOOLBAR_BG,
 };
 use windows_sys::Win32::Foundation::HWND;
+
+/// The picker's helper bar: compact controls in a thin frame, 26 + 2 * 3 + 2 (outline) = 34 pt tall, set this far below the monitor's top.
+const PICKER_BAR_MARGIN: i8 = 3;
+const PICKER_BAR_TOP: f32 = 10.0;
 
 /// The home window: a toolbar to start a capture over an empty canvas.
 const HOME_SIZE: Vec2 = vec2(620.0, 330.0);
@@ -1089,9 +1093,9 @@ impl App {
             self.start_snip(&ctx);
         }
         ui.add_space(8.0);
-        self.mode_switch(ui);
+        self.mode_switch(ui, FULL);
         ui.add_space(4.0);
-        self.shape_menu(ui);
+        self.shape_menu(ui, FULL);
         if self.settings.mode == Mode::Video {
             return;
         }
@@ -1105,9 +1109,9 @@ impl App {
         });
     }
 
-    fn mode_switch(&mut self, ui: &mut egui::Ui) {
+    fn mode_switch(&mut self, ui: &mut egui::Ui, sc: Scale) {
         const INSET: f32 = 2.0;
-        let (group, _) = ui.allocate_exact_size(vec2(BTN.x * 2.0 + 2.0 * INSET, BTN.y), Sense::hover());
+        let (group, _) = ui.allocate_exact_size(vec2(sc.btn.x * 2.0 + 2.0 * INSET, sc.btn.y), Sense::hover());
         // Concentric corners: the cells' radius plus the inset between them and the outline.
         ui.painter().rect_stroke(group, RADIUS as f32 + INSET, (1.0, OUTLINE), StrokeKind::Inside);
         for (i, (mode, icon, tip)) in
@@ -1115,7 +1119,7 @@ impl App {
                 .into_iter()
                 .enumerate()
         {
-            let cell = Rect::from_min_size(group.min + vec2(INSET + i as f32 * BTN.x, INSET), BTN - vec2(0.0, 2.0 * INSET));
+            let cell = Rect::from_min_size(group.min + vec2(INSET + i as f32 * sc.btn.x, INSET), sc.btn - vec2(0.0, 2.0 * INSET));
             let resp = ui.interact(cell, ui.scope_id().with(("mode", i)), Sense::click()).on_hover_text(tip);
             let p = ui.painter();
             if self.settings.mode == mode {
@@ -1125,7 +1129,7 @@ impl App {
             } else if resp.hovered() {
                 p.rect_filled(cell, RADIUS, BUTTON_BG);
             }
-            icons::paint(p, Rect::from_center_size(cell.center() - vec2(0.0, 1.0), Vec2::splat(GLYPH)), icon, ICON, None);
+            icons::paint(p, Rect::from_center_size(cell.center() - vec2(0.0, 1.0), Vec2::splat(sc.glyph)), icon, ICON, None);
             if resp.clicked() {
                 self.set_mode(mode);
             }
@@ -1139,8 +1143,8 @@ impl App {
         }
     }
 
-    fn shape_menu(&mut self, ui: &mut egui::Ui) {
-        let resp = dropdown(ui, self.settings.shape.icon(), None).on_hover_text(format!("Shape: {}", self.settings.shape.label()));
+    fn shape_menu(&mut self, ui: &mut egui::Ui, sc: Scale) {
+        let resp = dropdown_sized(ui, sc, self.settings.shape.icon(), None).on_hover_text(format!("Shape: {}", self.settings.shape.label()));
         egui::Popup::menu(&resp).show(|ui| {
             for &s in Shape_::choices(self.settings.mode) {
                 let (rect, item) = ui.allocate_exact_size(vec2(150.0, 32.0), Sense::click());
@@ -1319,22 +1323,22 @@ impl App {
         let top = to_pt(pos2(home[0] as f32 + home[2] as f32 / 2.0, home[1] as f32));
         egui::Area::new(egui::Id::unique("picker_bar"))
             .pivot(Align2::CENTER_TOP)
-            .fixed_pos(top + vec2(0.0, 14.0))
+            .fixed_pos(top + vec2(0.0, PICKER_BAR_TOP))
             .order(egui::Order::Foreground)
             .show(&ctx, |ui| {
                 egui::Frame::new()
                     .fill(TOOLBAR_BG)
                     .stroke((1.0, OUTLINE))
                     .corner_radius(8)
-                    .inner_margin(6)
+                    .inner_margin(PICKER_BAR_MARGIN)
                     .show(ui, |ui| {
                         ui.spacing_mut().item_spacing = vec2(GAP, 0.0);
                         ui.horizontal(|ui| {
-                            self.mode_switch(ui);
+                            self.mode_switch(ui, COMPACT);
                             ui.add_space(4.0);
-                            self.shape_menu(ui);
-                            divider(ui);
-                            if icon_button(ui, Icon::Close, None, false, true, "Close (Esc)").clicked() {
+                            self.shape_menu(ui, COMPACT);
+                            divider_sized(ui, COMPACT);
+                            if icon_button_sized(ui, COMPACT, Icon::Close, None, false, true, "Close (Esc)").clicked() {
                                 cancel = true;
                             }
                         });
@@ -2470,6 +2474,13 @@ mod tests {
         assert!(!egui::Popup::is_any_open(&ctx), "click outside should have closed the menu");
         picker_frame(&ctx, &mut guard, vec![btn(true)], false);
         assert!(picker_frame(&ctx, &mut guard, vec![btn(false)], false), "the next click picks as usual");
+    }
+
+    #[test]
+    fn picker_bar_is_slimmer_than_the_toolbar() {
+        let bar_h = COMPACT.btn.y + 2.0 * PICKER_BAR_MARGIN as f32 + 2.0;
+        assert_eq!(bar_h, 34.0, "34 pt is ~50 px at 150% scaling");
+        assert_eq!(FULL.btn, BTN, "the toolbars keep their size");
     }
 
     #[test]

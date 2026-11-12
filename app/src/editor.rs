@@ -807,7 +807,7 @@ impl Snip {
             _ => (&mut self.tools.pen, &PEN_COLORS[..], 1.0..=24.0),
         };
         swatches(ui, palette, color);
-        let slider = sized.then(|| size_slider(ui, width, range, egui::SliderClamping::Always));
+        let slider = sized.then(|| size_slider(ui, width, range));
         if tool == Tool::Text {
             ui.checkbox(&mut self.tools.text_outline, "Outline");
         }
@@ -841,7 +841,7 @@ impl Snip {
         let (was, mut size_pt) = (*size_px / k, *size_px / k);
         swatches(ui, palette, color);
         // A mark sized outside the slider's range (drawn at another zoom) keeps its size until the slider moves.
-        let slider = sized.then(|| size_slider(ui, &mut size_pt, range, egui::SliderClamping::Edits));
+        let slider = sized.then(|| size_slider(ui, &mut size_pt, range));
         if size_pt != was {
             *size_px = size_pt * k;
         }
@@ -2233,10 +2233,10 @@ fn swatches(ui: &mut egui::Ui, palette: &[Color32], color: &mut Color32) {
 }
 
 /// The size slider of an options popup.
-fn size_slider(ui: &mut egui::Ui, width: &mut f32, range: std::ops::RangeInclusive<f32>, clamping: egui::SliderClamping) -> egui::Response {
+fn size_slider(ui: &mut egui::Ui, width: &mut f32, range: std::ops::RangeInclusive<f32>) -> egui::Response {
     ui.horizontal(|ui| {
         ui.label("Size");
-        ui.add(egui::Slider::new(width, range).show_value(false).clamping(clamping))
+        widgets::slim_slider(ui, width, range)
     })
     .inner
 }
