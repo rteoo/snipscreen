@@ -19,15 +19,16 @@ use windows_sys::Win32::Foundation::HWND;
 
 use crate::icons::{self, Icon};
 use crate::markup::{self, Doc, Ink, Mark, PxRect, Shape, ShapeKind, Stroke, Text, TextRaster, Tiles};
+use crate::ocr;
 use crate::widgets::{
     self, dim_outside, divider, escape_for_app, icon_button, Note, Notifier, PopupClickGuard, ACCENT, BTN, BUTTON_HOVER, DIVIDER_W, GAP, GROUP_GAP, ICON,
-    ICON_OFF, MIN_WINDOW_H, MIN_WINDOW_W, TOOLBAR_BG,
+    ICON_OFF, MIN_WINDOW_H, MIN_WINDOW_W, SCAN_PICK, SCAN_VEIL, TOOLBAR_BG,
 };
 use crate::win;
 
-/// Measured: bar padding 8 + New button 72 + markup with crop buttons 418 + output group 117 + 2 group gaps
-/// + padding 8 + caption buttons 138 = 793.
-pub const MIN_EDIT_W: f32 = 796.0;
+/// Measured: bar padding 8 + New button 72 + markup with crop buttons 454 + output group 117 + 2 group gaps
+/// + padding 8 + caption buttons 138 = 829.
+pub const MIN_EDIT_W: f32 = 832.0;
 const MIN_ZOOM: f32 = 0.05;
 const MAX_ZOOM: f32 = 8.0;
 /// Snip zoom change per Ctrl+Plus / Ctrl+Minus press.
@@ -457,6 +458,8 @@ pub struct Tools {
     /// Colour and font size in screen points.
     pub text: (Color32, f32),
     pub text_outline: bool,
+    /// How Scan text's "Copy formatted" lays text out.
+    pub scan_format: ocr::Format,
 }
 
 impl Default for Tools {
@@ -470,6 +473,7 @@ impl Default for Tools {
             shape_fill: false,
             text: (PEN_COLORS[2], 24.0),
             text_outline: true,
+            scan_format: ocr::Format::Markdown,
         }
     }
 }
@@ -513,6 +517,40 @@ pub struct Snip {
     px_per_pt: f32,
     /// The Select tool's options popup, as the toolbar last laid it out: it takes no keys, so Delete still reaches the selection.
     select_popup: Option<egui::Id>,
+    /// Scan text, while it is on: the snip's text and the words picked in it.
+    scan: Option<Scan>,
+    /// Text Scan text's bar asked to copy this frame; the editor puts it on the clipboard.
+    scan_copy: Option<ScanCopy>,
+}
+
+/// Scan text: the snip's words, read on a worker, and the ones picked.
+struct Scan {
+    /// The reading while it runs.
+    reading: Option<Receiver<Result<Vec<ocr::Line>, String>>>,
+    lines: Result<Vec<ocr::Line>, String>,
+    /// The first and last picked word (indices over all words, line by line; either way round).
+    picked: Option<(usize, usize)>,
+    /// A drag picking words is under way, from this word.
+    anchor: Option<usize>,
+}
+
+impl Scan {
+    /// The picked words, or all of them; and whether they are a pick.
+    fn chosen(&self) -> (Vec<ocr::Line>, bool) {
+        let all = self.lines.as_deref().unwrap_or_default();
+        match self.picked {
+            Some((a, b)) => (ocr::select(all, a, b), true),
+            None => (all.to_vec(), false),
+        }
+    }
+}
+
+/// Text to put on the clipboard: plain, or rich (an HTML fragment) with the plain text beside it.
+struct ScanCopy {
+    plain: String,
+    html: Option<String>,
+    /// The toast once it is there.
+    done: String,
 }
 
 pub enum Content {
@@ -585,6 +623,8 @@ impl Snip {
             option_held: false,
             px_per_pt: 1.0,
             select_popup: None,
+            scan: None,
+            scan_copy: None,
         }
     }
 
@@ -640,6 +680,42 @@ impl Snip {
         self.cancel_crop();
         self.finish_text();
         self.deselect();
+        self.scan = None;
+    }
+
+    /// Turns Scan text on, reading the snip's text (with its ink: what you see is what is read) on a
+    /// worker, or off.
+    fn toggle_scan(&mut self, ctx: &egui::Context) {
+        if self.scan.take().is_some() {
+            return;
+        }
+        self.cancel_crop();
+        self.finish_text();
+        self.deselect();
+        let image = self.flattened();
+        let (tx, rx) = channel();
+        let (ctx, id) = (ctx.clone(), ctx.viewport_id());
+        std::thread::spawn(move || {
+            let _ = tx.send(ocr::recognize(&image));
+            ctx.request_repaint_of(id);
+        });
+        self.scan = Some(Scan { reading: Some(rx), lines: Ok(Vec::new()), picked: None, anchor: None });
+    }
+
+    /// Asks the editor to copy the picked words (all of them when none are picked), as plain text or
+    /// laid out in `format`.
+    fn copy_scanned(&mut self, format: Option<ocr::Format>) {
+        let Some(scan) = &self.scan else { return };
+        let (lines, picked) = scan.chosen();
+        if lines.is_empty() {
+            return;
+        }
+        let what = if picked { "Selected text" } else { "Text" };
+        self.scan_copy = Some(match format {
+            None => ScanCopy { plain: ocr::plain(&lines), html: None, done: format!("{what} copied") },
+            Some(ocr::Format::RichText) => ScanCopy { plain: ocr::plain(&lines), html: Some(ocr::formatted(&lines, ocr::Format::RichText)), done: format!("{what} copied as rich text") },
+            Some(f) => ScanCopy { plain: ocr::formatted(&lines, f), html: None, done: format!("{what} copied as {}", f.label()) },
+        });
     }
 
     /// The picture with its ink, as it would be copied or saved. The canvas texture already holds
@@ -661,6 +737,7 @@ impl Snip {
 
     /// Starts cropping with the frame around the whole snip, or cancels the crop under way.
     fn toggle_crop(&mut self) {
+        self.scan = None;
         let [w, h] = self.doc.size();
         self.crop = match self.crop {
             Some(_) => None,
@@ -701,6 +778,8 @@ impl Snip {
         }
         step_history(&mut self.doc, &mut self.crop, &mut self.drawing, redo);
         self.crop_drag = None;
+        // The words read were the picture's before this step.
+        self.scan = None;
         // The selection stays while its mark is still there; a drag can't go on over another version of the list.
         self.mark_drag = None;
         self.option_held = false;
@@ -722,7 +801,7 @@ impl Snip {
     }
 
     fn markup_width(&self) -> f32 {
-        let buttons = if self.crop.is_some() { 11.0 } else { 9.0 };
+        let buttons = if self.crop.is_some() { 12.0 } else { 10.0 };
         let dividers = 2.0;
         buttons * BTN.x + dividers * DIVIDER_W + (buttons + dividers - 1.0) * GAP
     }
@@ -745,8 +824,10 @@ impl Snip {
                 Tool::Text => Some(self.tools.text.0),
                 Tool::Eraser => None,
             };
-            let resp = icon_button(ui, icon, ink, self.tools.tool == tool, true, tip);
-            let again = resp.clicked() && self.tools.tool == tool;
+            // While Scan text is on no tool is in use; a click on one turns it off and takes that tool.
+            let current = self.tools.tool == tool && self.scan.is_none();
+            let resp = icon_button(ui, icon, ink, current, true, tip);
+            let again = resp.clicked() && current;
             // A click on the tool already chosen opens its options and leaves the text being typed (or the selection) alone.
             if resp.clicked() && !again {
                 self.choose_tool(tool);
@@ -772,6 +853,9 @@ impl Snip {
             if icon_button(ui, Icon::Close, None, false, true, "Cancel crop (Esc)").clicked() {
                 self.cancel_crop();
             }
+        }
+        if icon_button(ui, Icon::ScanText, None, self.scan.is_some(), true, "Scan text: pick out the snip's text to copy it, plain or formatted").clicked() {
+            self.toggle_scan(&ui.ctx().clone());
         }
         divider(ui);
         if icon_button(ui, Icon::Undo, None, false, self.can_undo(), "Undo (Ctrl+Z)").clicked() {
@@ -861,7 +945,7 @@ impl Snip {
 
     fn canvas(&mut self, ui: &mut egui::Ui, guard: &PopupClickGuard) {
         let ctx = ui.ctx().clone();
-        let Snip { doc, tools, texture, drawing, erase_marked, crop, crop_drag, zoom: zoom_choice, key_zoom, draft, ime_taken, selected, mark_drag, option_held: _, px_per_pt, select_popup: _ } = self;
+        let Snip { doc, tools, texture, drawing, erase_marked, crop, crop_drag, zoom: zoom_choice, key_zoom, draft, ime_taken, selected, mark_drag, option_held: _, px_per_pt, select_popup: _, scan, scan_copy: _ } = self;
         let canvas = texture.get_or_insert_with(|| CanvasTex::new(&ctx, doc));
         // A change from outside the canvas (undo, a crop, an option): what was in view last frame now, the rest a little later.
         let last_view = if drawing.is_some() { None } else { canvas.view.clone() };
@@ -917,6 +1001,49 @@ impl Snip {
             let swallowed = guard.swallows(&ctx, resp.clicked());
             match tools.tool {
                 _ if swallowed => {}
+                // Scan text takes the pointer, to pick words, until it is turned off.
+                _ if scan.is_some() => {
+                    let s = scan.as_mut().expect("checked");
+                    if let Some(rx) = &s.reading {
+                        match rx.try_recv() {
+                            Ok(r) => (s.lines, s.reading) = (r, None),
+                            Err(std::sync::mpsc::TryRecvError::Disconnected) => (s.lines, s.reading) = (Err("text recognition stopped".into()), None),
+                            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                        }
+                    }
+                    let lines = s.lines.as_deref().unwrap_or_default();
+                    let pt_rect = |r: Rect| Rect::from_min_max(to_pt(r.min), to_pt(r.max));
+                    // The snip dims, and each line of text shows through as it is.
+                    painter.rect_filled(img_rect, 0.0, SCAN_VEIL);
+                    for l in lines {
+                        let r = pt_rect(l.rect()).expand(3.0).intersect(painter.clip_rect());
+                        if r.is_positive() {
+                            canvas.tex.paint(&painter.with_clip_rect(r), img_rect, doc.size());
+                        }
+                    }
+                    // A click picks the word under it (or nothing), a drag every word from the one it began on.
+                    let reach = 4.0 * k;
+                    if resp.drag_started() {
+                        s.anchor = origin.and_then(|o| ocr::word_at(lines, to_px(o), reach, false));
+                    }
+                    if let (Some(a), Some(p)) = (s.anchor, resp.interact_pointer_pos()) {
+                        s.picked = ocr::word_at(lines, to_px(p), reach, true).map(|b| (a, b));
+                    }
+                    if resp.drag_stopped() {
+                        s.anchor = None;
+                    }
+                    if resp.clicked() {
+                        s.picked = pointer.and_then(|p| ocr::word_at(lines, to_px(p), reach, false)).map(|w| (w, w));
+                    }
+                    if s.anchor.is_some() || resp.hover_pos().is_some_and(|p| ocr::word_at(lines, to_px(p), reach, false).is_some()) {
+                        ctx.set_cursor_icon(CursorIcon::Text);
+                    }
+                    if let Some((a, b)) = s.picked {
+                        for l in ocr::select(lines, a, b) {
+                            painter.rect_filled(pt_rect(l.rect()).expand(1.5), 2.0, SCAN_PICK);
+                        }
+                    }
+                }
                 // The crop frame takes the pointer from whichever tool is chosen until it is applied or cancelled.
                 _ if crop.is_some() => {
                     let frame = crop.unwrap_or(Rect::NOTHING);
@@ -1096,13 +1223,13 @@ impl Snip {
                 canvas.catch_up_behind(doc);
             }
             canvas.view = Some(visible.clone());
-            if tools.tool == Tool::Select && crop.is_none() {
+            if tools.tool == Tool::Select && crop.is_none() && scan.is_none() {
                 if let Some((i, hs, frame)) = selection(doc, selected) {
                     paint_selection(painter, &doc.marks[i], frame, &hs);
                 }
             }
             // A pen or highlighter press always ends in a mark, a click too, so the copy starts then.
-            let pressing_ink = resp.is_pointer_button_down_on() && matches!(tools.tool, Tool::Pen | Tool::Highlighter) && crop.is_none();
+            let pressing_ink = resp.is_pointer_button_down_on() && matches!(tools.tool, Tool::Pen | Tool::Highlighter) && crop.is_none() && scan.is_none();
             if drawing.is_some() || pressing_ink {
                 canvas.own_picture(drawing.is_some());
             } else if !resp.is_pointer_button_down_on() {
@@ -1135,6 +1262,72 @@ impl Snip {
             }
         });
         zoom_badge(ui.painter(), view_rect, zoom);
+        self.scan_bar(ui, view_rect);
+    }
+
+    /// Scan text's bar, floating at the top of the canvas: how the reading went, and the copy buttons.
+    fn scan_bar(&mut self, ui: &mut egui::Ui, view: Rect) {
+        let Some(scan) = &self.scan else { return };
+        let ctx = ui.ctx().clone();
+        let (mut copy, mut format) = (None, self.tools.scan_format);
+        let words = scan.lines.as_deref().map_or(0, ocr::word_count);
+        let area = egui::Area::new(egui::Id::unique("scan_bar")).order(egui::Order::Foreground).pivot(Align2::CENTER_TOP).fixed_pos(pos2(view.center().x, view.top() + 12.0));
+        area.show(&ctx, |ui| {
+            egui::Frame::popup(ui.style()).inner_margin(4.0).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = GAP;
+                    match &scan.lines {
+                        _ if scan.reading.is_some() => {
+                            ui.add_space(8.0);
+                            ui.spinner();
+                            ui.label("Reading the text…");
+                            ui.add_space(8.0);
+                        }
+                        Err(e) => {
+                            ui.add_space(8.0);
+                            ui.label(format!("Couldn't read the text: {e}"));
+                            ui.add_space(8.0);
+                        }
+                        Ok(_) if words == 0 => {
+                            ui.add_space(8.0);
+                            ui.label("No text found");
+                            ui.add_space(8.0);
+                        }
+                        Ok(_) => {
+                            let (label, tip) = if scan.picked.is_some() {
+                                ("Copy selected text", "The words you picked, line by line (Ctrl+C)")
+                            } else {
+                                ("Copy all text", "Every line of text, as plain text. Click or drag over words to pick some")
+                            };
+                            if widgets::text_button(ui, Icon::Copy, label, tip).clicked() {
+                                copy = Some(None);
+                            }
+                            divider(ui);
+                            let tip = match format {
+                                ocr::Format::Markdown => "Headings, paragraphs, lists and tables, in Markdown",
+                                ocr::Format::RichText => "Headings, paragraphs, lists and tables, for Word, Outlook, Teams and the like",
+                                ocr::Format::WhatsApp => "Bold headings, lists, and tables lined up in monospace, in WhatsApp's markup",
+                            };
+                            if widgets::text_button(ui, Icon::Text, &format!("Copy as {}", format.label()), tip).clicked() {
+                                copy = Some(Some(format));
+                            }
+                            let more = icon_button(ui, Icon::Chevron, None, false, true, "Choose the format");
+                            egui::Popup::menu(&more).show(|ui| {
+                                for f in ocr::Format::ALL {
+                                    if ui.radio(format == f, f.label()).clicked() {
+                                        format = f;
+                                    }
+                                }
+                            });
+                        }
+                    }
+                });
+            });
+        });
+        self.tools.scan_format = format;
+        if let Some(f) = copy {
+            self.copy_scanned(f);
+        }
     }
 }
 
@@ -1210,6 +1403,9 @@ impl Editor {
         egui::CentralPanel::default().frame(egui::Frame::new().fill(ui.style().visuals.extreme_bg_color)).show(ui, |ui| {
             if let Content::Snip(snip) = &mut self.content {
                 snip.canvas(ui, &self.popup_guard);
+                if let Some(c) = snip.scan_copy.take() {
+                    self.copy_scan(&ctx, c);
+                }
             } else {
                 video_top = Some(ui.max_rect().top());
                 self.video_view(ui);
@@ -1307,7 +1503,30 @@ impl Editor {
         // While text is being typed Enter belongs to it, as it would to a focused widget.
         let typing = matches!(&self.content, Content::Snip(s) if s.typing());
         let select_options = matches!(&self.content, Content::Snip(s) if s.select_popup.is_some_and(|id| egui::Popup::is_id_open(ctx, id)));
-        let Keys { new, save, undo, redo, copy, enter, esc, delete, zoom_in, zoom_out, zoom_fit } = ctx.input_mut(|i| read_keys(i, popup_open, select_options, focused || typing));
+        let Keys { new, save, undo, redo, mut copy, all, enter, mut esc, delete, zoom_in, zoom_out, zoom_fit } = ctx.input_mut(|i| read_keys(i, popup_open, select_options, focused || typing));
+        // With Scan text on, Ctrl+A picks every word, Ctrl+C copies the pick (the editor copies it after the canvas),
+        // and Esc drops the pick, then turns Scan text off.
+        if let Content::Snip(snip) = &mut self.content {
+            if let Some(scan) = snip.scan.as_mut() {
+                if all {
+                    let n = scan.lines.as_deref().map_or(0, ocr::word_count);
+                    scan.picked = (n > 0).then(|| (0, n - 1));
+                }
+                let picked = scan.picked.is_some();
+                if esc {
+                    esc = false;
+                    if picked {
+                        scan.picked = None;
+                    } else {
+                        snip.scan = None;
+                    }
+                }
+                if copy && picked {
+                    copy = false;
+                    snip.copy_scanned(None);
+                }
+            }
+        }
         if new {
             self.request_new(ctx);
         }
@@ -1439,6 +1658,23 @@ impl Editor {
         std::thread::spawn(move || {
             report.send(match win::copy_image(hwnd as HWND, &image) {
                 Ok(()) => "Copied to clipboard".to_string(),
+                Err(e) => format!("Couldn't copy: {e}"),
+            });
+        });
+    }
+
+    /// Puts Scan text's text on the clipboard, on a worker: the clipboard may be held by another
+    /// program for a moment.
+    fn copy_scan(&self, ctx: &egui::Context, c: ScanCopy) {
+        let (hwnd, report) = (self.root_hwnd, self.notifier(ctx));
+        std::thread::spawn(move || {
+            let hwnd = hwnd as HWND;
+            let result = match &c.html {
+                Some(html) => win::copy_html(hwnd, html, &c.plain),
+                None => win::copy_text(hwnd, std::ffi::OsStr::new(&c.plain)),
+            };
+            report.send(match result {
+                Ok(()) => c.done,
                 Err(e) => format!("Couldn't copy: {e}"),
             });
         });
@@ -2451,6 +2687,8 @@ struct Keys {
     undo: bool,
     redo: bool,
     copy: bool,
+    /// Ctrl+A: Scan text picks every word.
+    all: bool,
     enter: bool,
     esc: bool,
     delete: bool,
@@ -2475,6 +2713,7 @@ fn read_keys(i: &mut egui::InputState, popup_open: bool, select_options: bool, f
         redo: redo_shift | i.consume_shortcut(&cmd(Key::Y)),
         // egui turns Ctrl+C into a Copy event rather than a key press.
         copy: i.events.iter().any(|e| matches!(e, Event::Copy)),
+        all: !focused && i.consume_shortcut(&cmd(Key::A)),
         // Enter applies the crop only when nothing else claims it: with a button focused it activates that button.
         enter: !popup_open && !focused && i.consume_key(Modifiers::NONE, Key::Enter),
         esc: escape_for_app(i, popup_open),
@@ -2636,17 +2875,17 @@ mod tests {
         assert_eq!(edit_window_size(vec2(5000.0, 5000.0), wide), wide * 0.85);
     }
 
-    /// Group widths as laid out by `Editor::toolbar`: New button 80, output 133, markup with crop buttons 430.
+    /// Group widths as laid out by `Editor::toolbar`: New button 80, output 117, markup with crop buttons 454.
     const NEW_END: f32 = BAR_PAD + 72.0;
     const OUT_W: f32 = 117.0;
-    const MARKUP_W: f32 = 418.0;
+    const MARKUP_W: f32 = 454.0;
     /// Right end of the controls row: the caption buttons and the padding before them.
     const ROW_END_GAP: f32 = BAR_PAD + 3.0 * CAPTION_W;
 
     #[test]
     fn markup_width_matches_the_measured_toolbar() {
         let mut snip = Snip::new(white(4, 4), Tools::default());
-        assert_eq!(snip.markup_width(), 9.0 * BTN.x + 2.0 * DIVIDER_W + 10.0 * GAP);
+        assert_eq!(snip.markup_width(), 10.0 * BTN.x + 2.0 * DIVIDER_W + 11.0 * GAP);
         snip.crop = Some(Rect::from_min_max(Pos2::ZERO, pos2(2.0, 2.0)));
         assert_eq!(snip.markup_width(), MARKUP_W);
         const { assert!(NEW_END + GROUP_GAP + MARKUP_W + GROUP_GAP + OUT_W + ROW_END_GAP <= MIN_EDIT_W, "MIN_EDIT_W fits all three groups") };
@@ -3657,6 +3896,7 @@ Arc::ptr_eq(&snip.flattened(), &shown), "a current canvas is reused, not re-burn
             shape_fill: true,
             text: (PEN_COLORS[1], 40.0),
             text_outline: false,
+            scan_format: ocr::Format::WhatsApp,
         };
 
         editors.with(a, |e| {
@@ -4103,6 +4343,106 @@ Arc::ptr_eq(&snip.flattened(), &shown), "a current canvas is reused, not re-burn
         assert_eq!(snip_of(&mut ed).doc.marks.len(), 1);
     }
 
+    /// What Scan text read, as the engine hands it over: "alpha beta gamma" on one line and "delta
+    /// epsilon" under it, each word 50 px wide and 10 px tall, 10 px apart, from (10, 10) and (10, 40).
+    fn scanned() -> Vec<ocr::Line> {
+        let line = |y: f32, words: &[&str]| ocr::Line {
+            words: words.iter().enumerate().map(|(i, w)| ocr::Word { text: w.to_string(), rect: Rect::from_min_size(pos2(10.0 + i as f32 * 60.0, y), vec2(50.0, 10.0)) }).collect(),
+        };
+        vec![line(10.0, &["alpha", "beta", "gamma"]), line(40.0, &["delta", "epsilon"])]
+    }
+
+    fn scanning(snip: &mut Snip) {
+        snip.scan = Some(Scan { reading: None, lines: Ok(scanned()), picked: None, anchor: None });
+    }
+
+    #[test]
+    fn scan_text_picks_words_by_click_and_drag_and_copies_them() {
+        let ctx = egui::Context::default();
+        let mut snip = Snip::new(white(300, 200), Tools::default());
+        let mut screen = Screen { image: None };
+        canvas_frame(&ctx, &mut snip, &mut screen, vec![]);
+        scanning(&mut snip);
+        // The 300x200 snip is shown at 100%, centred on (640, 400).
+        let at = |x: f32, y: f32| pos2(490.0 + x, 300.0 + y);
+        let picked = |snip: &Snip| snip.scan.as_ref().and_then(|s| s.picked);
+        let click = |snip: &mut Snip, screen: &mut Screen, p: Pos2| {
+            canvas_frame(&ctx, snip, screen, vec![Event::PointerMoved(p), pointer(p, true)]);
+            canvas_frame(&ctx, snip, screen, vec![pointer(p, false)]);
+        };
+        click(&mut snip, &mut screen, at(95.0, 15.0));
+        assert_eq!(picked(&snip), Some((1, 1)), "a click picks the word under it");
+
+        // From "gamma" down past the end of the second line: every word between, the last one included.
+        let from = at(155.0, 15.0);
+        canvas_frame(&ctx, &mut snip, &mut screen, vec![Event::PointerMoved(from), pointer(from, true)]);
+        for i in 1..=6 {
+            canvas_frame(&ctx, &mut snip, &mut screen, vec![Event::PointerMoved(from + vec2(16.0, 5.0) * i as f32)]);
+        }
+        canvas_frame(&ctx, &mut snip, &mut screen, vec![pointer(from + vec2(96.0, 30.0), false)]);
+        assert_eq!(picked(&snip), Some((2, 4)));
+        snip.copy_scanned(None);
+        let c = snip.scan_copy.take().expect("asked to copy");
+        assert_eq!((c.plain.as_str(), c.html, c.done.as_str()), ("gamma\ndelta epsilon", None, "Selected text copied"));
+        snip.copy_scanned(Some(ocr::Format::RichText));
+        let c = snip.scan_copy.take().expect("asked to copy");
+        assert_eq!(c.html.as_deref(), Some("<p>gamma</p><p>delta epsilon</p>"));
+        assert_eq!(c.plain, "gamma\ndelta epsilon", "plain text goes beside the rich text");
+
+        click(&mut snip, &mut screen, at(150.0, 150.0));
+        assert_eq!(picked(&snip), None, "a click away from the text drops the pick");
+        snip.copy_scanned(Some(ocr::Format::Markdown));
+        let c = snip.scan_copy.take().expect("asked to copy");
+        assert_eq!((c.plain.as_str(), c.done.as_str()), ("alpha beta gamma\n\ndelta epsilon", "Text copied as Markdown"), "with no pick, all of it");
+        assert!(snip.doc.marks.is_empty() && screen.pixels() == snip.doc.flatten().pixels, "Scan text never touches the picture");
+
+        snip.choose_tool(Tool::Pen);
+        assert!(snip.scan.is_none(), "taking a tool turns Scan text off");
+        scanning(&mut snip);
+        snip.toggle_crop();
+        assert!(snip.scan.is_none() && snip.crop.is_some(), "so does starting a crop");
+    }
+
+    #[test]
+    fn scan_text_nothing_read_copies_nothing() {
+        let mut snip = Snip::new(white(30, 20), Tools::default());
+        snip.scan = Some(Scan { reading: None, lines: Ok(Vec::new()), picked: None, anchor: None });
+        snip.copy_scanned(None);
+        assert!(snip.scan_copy.is_none());
+        snip.scan = Some(Scan { reading: None, lines: Err("no language".into()), picked: None, anchor: None });
+        snip.copy_scanned(Some(ocr::Format::Markdown));
+        assert!(snip.scan_copy.is_none());
+    }
+
+    #[test]
+    fn ctrl_a_picks_every_word_ctrl_c_copies_the_pick_and_esc_backs_out_a_step_at_a_time() {
+        let ctx = egui::Context::default();
+        let mut fresh = Snip::new(white(300, 200), Tools::default());
+        scanning(&mut fresh);
+        let mut ed = Editor::new(Content::Snip(Box::new(fresh)), "t".into(), ViewportId::ROOT, 0, None, Default::default(), MIN_EDIT_W);
+        let keys = |ed: &mut Editor, events: Vec<Event>| {
+            let mut out = ctx.run_ui(egui::RawInput { events, ..Default::default() }, |ui| ed.shortcuts(ui.ctx()));
+            out.textures_delta.clear();
+        };
+        fn snip(ed: &mut Editor) -> &mut Snip {
+            match &mut ed.content {
+                Content::Snip(s) => s,
+                Content::Video(_) => panic!("a snip"),
+            }
+        }
+        keys(&mut ed, vec![key(Key::A, Modifiers::COMMAND)]);
+        assert_eq!(snip(&mut ed).scan.as_ref().and_then(|s| s.picked), Some((0, 4)));
+        keys(&mut ed, vec![Event::Copy]);
+        let c = snip(&mut ed).scan_copy.take().expect("Ctrl+C with a pick copies its text");
+        assert_eq!(c.plain, "alpha beta gamma\ndelta epsilon");
+        keys(&mut ed, vec![key(Key::Escape, Modifiers::NONE)]);
+        let s = snip(&mut ed);
+        assert!(s.scan.as_ref().is_some_and(|s| s.picked.is_none()), "the first Esc drops the pick");
+        // (Ctrl+C with nothing picked copies the picture, as always: not sent here, it would write the real clipboard.)
+        keys(&mut ed, vec![key(Key::Escape, Modifiers::NONE)]);
+        assert!(snip(&mut ed).scan.is_none(), "the second turns Scan text off");
+    }
+
     /// Writes review renders, made by the same rasteriser as a saved snip, into `SNIPSCREEN_RENDER_DIR`.
     #[test]
     #[ignore = "writes PNGs for a person to look at"]
@@ -4275,6 +4615,114 @@ Arc::ptr_eq(&snip.flattened(), &shown), "a current canvas is reused, not re-burn
         stats("undo that erase", &undo);
         stats("redo that erase", &redo);
         stats("eraser hit test over 20 text marks", &hits);
+    }
+
+    /// A screenshot session on this machine's real desktop: grab every monitor, open it at fit zoom,
+    /// draw 40 seeded-random marks of every kind, undo and redo, flatten and encode the PNG (in
+    /// memory; nothing is written), then read its text. Run in release: `cargo test --release perf_session -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "timing report on the real desktop, not a check"]
+    fn perf_session() {
+        let ms = |t: std::time::Instant| t.elapsed().as_secs_f64() * 1000.0;
+        let t = std::time::Instant::now();
+        let grab = win::grab_screen().expect("screen grabbed");
+        let grabbed = ms(t);
+        let [w, h] = grab.image.size;
+        println!("desktop grab {w}x{h}");
+        stats("grab: every monitor (GDI)", &[grabbed]);
+        let ctx = egui::Context::default();
+        let mut snip = Snip::new(grab.image, Tools::default());
+        stats("open: first frame (texture upload)", &[bench_frame(&ctx, &mut snip, vec![])]);
+        let idle: Vec<f64> = (0..20).map(|_| bench_frame(&ctx, &mut snip, vec![])).collect();
+        stats("open: frame with nothing happening", &idle);
+
+        // xorshift, so every run draws the same marks.
+        let mut seed = 0x9E37_79B9_7F4A_7C15_u64;
+        let mut rnd = move |lo: f32, hi: f32| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            lo + (seed % 10_000) as f32 / 10_000.0 * (hi - lo)
+        };
+        let kinds = ["pen", "highlighter", "rectangle", "filled rectangle", "ellipse", "filled ellipse", "arrow", "line", "text"];
+        let mut drag = vec![Vec::new(); kinds.len()];
+        let mut up = vec![Vec::new(); kinds.len()];
+        let t_all = std::time::Instant::now();
+        for i in 0..40 {
+            let k = i % kinds.len();
+            let tool = match kinds[k] {
+                "pen" => Tools { tool: Tool::Pen, ..snip.tools },
+                "highlighter" => Tools { tool: Tool::Highlighter, ..snip.tools },
+                "text" => Tools { tool: Tool::Text, ..snip.tools },
+                s => {
+                    let shape_kind = match s {
+                        "arrow" => ShapeKind::Arrow,
+                        "line" => ShapeKind::Line,
+                        s if s.ends_with("ellipse") => ShapeKind::Ellipse,
+                        _ => ShapeKind::Rectangle,
+                    };
+                    Tools { tool: Tool::Shape, shape_kind, shape_fill: s.starts_with("filled"), ..snip.tools }
+                }
+            };
+            snip.tools = tool;
+            let from = pos2(rnd(80.0, 1100.0), rnd(80.0, 650.0));
+            if kinds[k] == "text" {
+                bench_frame(&ctx, &mut snip, vec![Event::PointerMoved(from), pointer(from, true)]);
+                bench_frame(&ctx, &mut snip, vec![pointer(from, false)]);
+                for ch in "Note 42".chars() {
+                    drag[k].push(bench_frame(&ctx, &mut snip, vec![Event::Text(ch.to_string())]));
+                }
+                up[k].push(bench_frame(&ctx, &mut snip, vec![key(Key::Enter, Modifiers::NONE)]));
+                continue;
+            }
+            bench_frame(&ctx, &mut snip, vec![Event::PointerMoved(from), pointer(from, true)]);
+            let mut p = from;
+            for _ in 0..30 {
+                p = (p + vec2(rnd(-12.0, 18.0), rnd(-10.0, 12.0))).clamp(pos2(40.0, 40.0), pos2(1240.0, 760.0));
+                drag[k].push(bench_frame(&ctx, &mut snip, vec![Event::PointerMoved(p)]));
+            }
+            up[k].push(bench_frame(&ctx, &mut snip, vec![pointer(p, false)]));
+        }
+        let drawing = ms(t_all);
+        for (k, name) in kinds.iter().enumerate() {
+            stats(&format!("draw {name}: {}", if *name == "text" { "keystroke" } else { "drag frame" }), &drag[k]);
+            stats(&format!("draw {name}: {}", if *name == "text" { "Enter places it" } else { "mouse-up" }), &up[k]);
+        }
+        println!("{} marks placed, {} frames, {drawing:.0} ms in all", snip.doc.marks.len(), drag.iter().chain(&up).map(Vec::len).sum::<usize>());
+        let settle: Vec<f64> = (0..20).map(|_| bench_frame(&ctx, &mut snip, vec![])).collect();
+        stats("idle frame over 40 marks", &settle);
+        // The canvas doesn't read shortcuts (the editor's frame does), so each step is taken as Ctrl+Z
+        // would take it, timed with the frame that repaints it.
+        let mut steps = |redo: bool| -> Vec<f64> {
+            (0..5)
+                .map(|_| {
+                    let t = std::time::Instant::now();
+                    snip.step(redo);
+                    bench_frame(&ctx, &mut snip, vec![]);
+                    ms(t)
+                })
+                .collect()
+        };
+        let undo = steps(false);
+        let redo = steps(true);
+        stats("undo: step and its frame", &undo);
+        stats("redo: step and its frame", &redo);
+        assert_eq!(snip.doc.marks.len(), 40, "five undone, five redone");
+        let t = std::time::Instant::now();
+        let flat = snip.doc.flatten();
+        stats("save: flatten the marks onto the snip", &[ms(t)]);
+        let t = std::time::Instant::now();
+        let png = win::encode_png(&flat).expect("encoded");
+        stats("save: encode the PNG", &[ms(t)]);
+        println!("PNG {:.1} MB", png.len() as f64 / 1e6);
+        let t = std::time::Instant::now();
+        let lines = ocr::recognize(&flat).expect("read");
+        stats("scan text: read the desktop, every language", &[ms(t)]);
+        println!("{} lines, {} words", lines.len(), ocr::word_count(&lines));
+        let t = std::time::Instant::now();
+        let md = ocr::formatted(&lines, ocr::Format::Markdown);
+        stats("scan text: lay it out as Markdown", &[ms(t)]);
+        std::hint::black_box(md);
     }
 
     /// Timings for moving, resizing and drawing big marks on a 12000x2000 snip at fit zoom, under 10

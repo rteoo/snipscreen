@@ -26,6 +26,10 @@ pub const ICON_INACTIVE: Color32 = Color32::from_rgb(0x8a, 0x8a, 0x8a);
 pub const CLOSE_HOVER: Color32 = Color32::from_rgb(0xc4, 0x2b, 0x1c);
 pub const CLOSE_PRESSED: Color32 = Color32::from_rgb(0xa7, 0x26, 0x19);
 pub const DIM: Color32 = Color32::from_black_alpha(120);
+/// Scan text: the veil over the snip (its lines of text show through, undimmed) and the picked
+/// words' highlight, Windows' selection blue at 45% (premultiplied).
+pub const SCAN_VEIL: Color32 = Color32::from_black_alpha(150);
+pub const SCAN_PICK: Color32 = Color32::from_rgba_premultiplied(0, 54, 97, 115);
 /// The title bar, which holds the toolbar.
 pub const BAR_H: f32 = 40.0;
 /// Space before the first control and after the last one ahead of the caption buttons.
@@ -253,6 +257,19 @@ pub fn icon_button_sized(ui: &mut egui::Ui, sc: Scale, icon: Icon, ink: Option<C
     button_fill(p, rect, &resp, selected, enabled);
     let color = if enabled { ICON } else { ICON_OFF };
     icons::paint(p, Rect::from_center_size(rect.center(), Vec2::splat(sc.glyph)), icon, color, ink);
+    resp.on_hover_text(tip)
+}
+
+/// A glyph and a label, the toolbar's buttons' look, for a bar of actions (Scan text's).
+pub fn text_button(ui: &mut egui::Ui, icon: Icon, label: &str, tip: &str) -> egui::Response {
+    const PAD: f32 = 10.0;
+    let galley = ui.painter().layout_no_wrap(label.to_owned(), FontId::proportional(14.0), ICON);
+    let width = PAD + GLYPH + 8.0 + galley.size().x + PAD + 2.0;
+    let (rect, resp) = ui.allocate_exact_size(vec2(width, BTN.y), Sense::click());
+    let p = ui.painter();
+    button_fill(p, rect, &resp, false, true);
+    icons::paint(p, Rect::from_center_size(rect.left_center() + vec2(PAD + GLYPH / 2.0, 0.0), Vec2::splat(GLYPH)), icon, ICON, None);
+    p.galley(pos2(rect.left() + PAD + GLYPH + 8.0, rect.center().y - galley.size().y / 2.0), galley, ICON);
     resp.on_hover_text(tip)
 }
 

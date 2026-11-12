@@ -346,6 +346,40 @@ pub fn copy_text(owner: HWND, text: &std::ffi::OsStr) -> Result<(), String> {
     }
 }
 
+/// Puts an HTML fragment on the clipboard as rich text (Word, Outlook, Teams and browsers paste it
+/// with its headings, lists and tables), with `plain` beside it for apps that take only text.
+pub fn copy_html(owner: HWND, fragment: &str, plain: &str) -> Result<(), String> {
+    let html = cf_html(fragment);
+    let text: Vec<u8> = wide(plain).iter().flat_map(|c| c.to_le_bytes()).collect();
+    unsafe {
+        open_clipboard(owner)?;
+        EmptyClipboard();
+        let format = RegisterClipboardFormatW(wide("HTML Format").as_ptr());
+        let result = set_clipboard(format, &html).and_then(|_| set_clipboard(CF_UNICODETEXT as u32, &text));
+        CloseClipboard();
+        result
+    }
+}
+
+/// The clipboard's "HTML Format": a header giving the byte offsets of the document and of the
+/// fragment within it, then the UTF-8 document, NUL-terminated.
+fn cf_html(fragment: &str) -> Vec<u8> {
+    // Every offset is written as ten digits, so the header's length doesn't depend on them.
+    let header = |html: usize, end: usize, frag: usize, frag_end: usize| {
+        format!("Version:0.9\r\nStartHTML:{html:010}\r\nEndHTML:{end:010}\r\nStartFragment:{frag:010}\r\nEndFragment:{frag_end:010}\r\n")
+    };
+    let start_html = header(0, 0, 0, 0).len();
+    let before = "<html><head><meta charset=\"utf-8\"></head><body><!--StartFragment-->";
+    let after = "<!--EndFragment--></body></html>";
+    let start_fragment = start_html + before.len();
+    let end_fragment = start_fragment + fragment.len();
+    let end_html = end_fragment + after.len();
+    let header = header(start_html, end_html, start_fragment, end_fragment);
+    let mut out = format!("{header}{before}{fragment}{after}").into_bytes();
+    out.push(0);
+    out
+}
+
 /// A `CF_HDROP` block holding one file: the `DROPFILES` header, then the wide path and an empty
 /// one that ends the list.
 fn drop_files(path: &Path) -> Vec<u8> {
@@ -1169,6 +1203,18 @@ fn wide_os(s: &std::ffi::OsStr) -> Vec<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cf_html_offsets_point_at_the_document_and_the_fragment() {
+        let fragment = "<p>Ação &amp; <b>pão</b></p>";
+        let block = cf_html(fragment);
+        assert_eq!(block.last(), Some(&0), "NUL-terminated");
+        let text = std::str::from_utf8(&block[..block.len() - 1]).expect("UTF-8");
+        let offset = |key: &str| -> usize { text.split(key).nth(1).and_then(|s| s[..10].parse().ok()).expect(key) };
+        assert_eq!(&text[offset("StartFragment:")..offset("EndFragment:")], fragment, "offsets count bytes, not characters");
+        assert!(text[offset("StartHTML:")..].starts_with("<html>"));
+        assert_eq!(offset("EndHTML:"), text.len());
+    }
 
     #[test]
     fn copying_a_gone_file_is_an_error_before_the_clipboard_is_touched() {
