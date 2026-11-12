@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/rteoo/snipscreen/releases/tag/v0.3.0"><img src="https://img.shields.io/badge/stable-v0.3.0-blue.svg" alt="Stable v0.3.0"></a>
+  <a href="https://github.com/rteoo/snipscreen/releases/tag/v0.4.0"><img src="https://img.shields.io/badge/stable-v0.4.0-blue.svg" alt="Stable v0.4.0"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT license"></a>
 </p>
 
@@ -48,9 +48,9 @@ installed per user or run portable. It is a sibling of [SnipType](https://github
 
 ## Quick start
 
-Download `SnipscreenSetup-0.3.0.exe` from the
-[stable v0.3.0 release](https://github.com/rteoo/snipscreen/releases/tag/v0.3.0)
-and run it, or extract the portable `Snipscreen-0.3.0-windows-x64.zip` and run
+Download `SnipscreenSetup-0.4.0.exe` from the
+[stable v0.4.0 release](https://github.com/rteoo/snipscreen/releases/tag/v0.4.0)
+and run it, or extract the portable `Snipscreen-0.4.0-windows-x64.zip` and run
 `snipscreen.exe`. To build from source with Rust and the MSVC build tools (which
 include the Windows SDK) installed:
 
@@ -66,7 +66,7 @@ Use `cargo run` for a development build.
 ### Releases and installer
 
 The current stable release is
-[`v0.3.0`](https://github.com/rteoo/snipscreen/releases/tag/v0.3.0):
+[`v0.4.0`](https://github.com/rteoo/snipscreen/releases/tag/v0.4.0):
 
 | Platform | Package |
 | --- | --- |
@@ -134,7 +134,7 @@ A dashed outline marks exactly what is being recorded and stays out of the video
 | --- | --- |
 | Area | Rectangle, window, or full screen on one monitor; the outline shows the area actually recorded |
 | Format | MP4, H.264 video at 30 fps with AAC sound, up to 4096×2304 |
-| Sound | The computer's sound (on by default) and a chosen microphone, each placed on the recording clock |
+| Sound | The computer's sound (on by default, from the default or a chosen output) and a microphone (the default or a chosen one), each placed on the recording clock |
 | Interruptions | Through UAC, the lock screen, full-screen apps, and resolution changes, the last image repeats until the screen is readable again |
 | Devices | A microphone that is slow to start or unplugged leaves silence instead of stopping the recording; an unplugged one shows a "!" note on the bar |
 | Errors | A recording that stops early is finalized and kept, and the toast says why |
