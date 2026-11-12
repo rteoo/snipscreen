@@ -1,9 +1,20 @@
-//! Toolbar icons drawn as vector strokes, so they stay sharp at any scale
-//! and cost no image files.
+//! Toolbar icons from Bootstrap Icons 1.13.2 (MIT, `assets/icons/LICENSE`).
+//!
+//! Each icon is the vendored SVG's path data, parsed once and rasterised with
+//! vello_cpu to an alpha mask at the exact device-pixel size it is drawn at.
+//! The mask is a texture painted tinted with the icon's colour, so strokes are
+//! as sharp as the 16-unit grid allows at any display scale, and the texture
+//! is uploaded once per (icon, size), not per frame.
 
-use eframe::egui::{vec2, Color32, Painter, Rect, Shape, Stroke};
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+use eframe::egui::{pos2, vec2, Color32, ColorImage, Id, Painter, Rect, Stroke, TextureHandle, TextureOptions, Vec2};
+use vello_cpu::kurbo::{self, Affine, Circle, Shape as _};
+use vello_cpu::peniko::{BlendMode, Compose, Fill, Mix};
+use vello_cpu::{color::palette::css, Pixmap, RenderContext, Resources};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Icon {
     Plus,
     Rectangle,
@@ -13,7 +24,7 @@ pub enum Icon {
     Timer,
     TimerOff,
     Chevron,
-    /// A pointer arrow, with a dot of the selected mark's ink.
+    /// A pointer, with a dot of the selected mark's ink.
     Select,
     Pen,
     Highlighter,
@@ -45,198 +56,276 @@ pub enum Icon {
     Play,
 }
 
-/// Paints `icon` centred in `rect` on a 20×20 grid. `ink` tints the tip of
-/// the pen and highlighter with the colour they will draw in.
-pub fn paint(p: &Painter, rect: Rect, icon: Icon, color: Color32, ink: Option<Color32>) {
-    let s = rect.width().min(rect.height()) / 20.0;
-    let o = rect.center() - vec2(10.0, 10.0) * s;
-    let at = |x: f32, y: f32| o + vec2(x, y) * s;
-    let line = |pts: &[(f32, f32)], w: f32, c: Color32| {
-        p.add(Shape::line(pts.iter().map(|&(x, y)| at(x, y)).collect(), Stroke::new(w * s, c)));
-    };
-    let closed = |pts: &[(f32, f32)], w: f32, c: Color32| {
-        p.add(Shape::closed_line(pts.iter().map(|&(x, y)| at(x, y)).collect(), Stroke::new(w * s, c)));
-    };
-    let filled = |pts: &[(f32, f32)], c: Color32| {
-        p.add(Shape::convex_polygon(pts.iter().map(|&(x, y)| at(x, y)).collect(), c, Stroke::NONE));
-    };
-    let rect_at = |x0: f32, y0: f32, x1: f32, y1: f32| Rect::from_min_max(at(x0, y0), at(x1, y1));
-    let w = 1.4;
-    let stroke = Stroke::new(w * s, color);
-    let outline = eframe::egui::StrokeKind::Middle;
+/// Every icon, in declaration order (`ALL[i] as usize == i`), which indexes `ART`.
+const ALL: [Icon; 34] = [
+    Icon::Plus,
+    Icon::Rectangle,
+    Icon::Window,
+    Icon::FullScreen,
+    Icon::Freeform,
+    Icon::Timer,
+    Icon::TimerOff,
+    Icon::Chevron,
+    Icon::Select,
+    Icon::Pen,
+    Icon::Highlighter,
+    Icon::Eraser,
+    Icon::Arrow,
+    Icon::Line,
+    Icon::RectOutline,
+    Icon::Ellipse,
+    Icon::Text,
+    Icon::Crop,
+    Icon::Check,
+    Icon::Close,
+    Icon::Undo,
+    Icon::Redo,
+    Icon::Save,
+    Icon::Copy,
+    Icon::More,
+    Icon::Camera,
+    Icon::Video,
+    Icon::Mic,
+    Icon::MicOff,
+    Icon::SystemSound,
+    Icon::SystemSoundOff,
+    Icon::Record,
+    Icon::Stop,
+    Icon::Play,
+];
 
+/// The Bootstrap icon each variant is drawn from.
+fn svg(icon: Icon) -> &'static str {
+    macro_rules! bi {
+        ($name:literal) => {
+            include_str!(concat!("../assets/icons/", $name, ".svg"))
+        };
+    }
     match icon {
-        Icon::Plus => {
-            line(&[(10.0, 3.5), (10.0, 16.5)], 1.6, color);
-            line(&[(3.5, 10.0), (16.5, 10.0)], 1.6, color);
-        }
-        Icon::Rectangle => {
-            p.rect_stroke(rect_at(3.0, 5.0, 17.0, 15.0), 2.0 * s, stroke, outline);
-        }
-        Icon::Window => {
-            p.rect_stroke(rect_at(3.0, 4.0, 17.0, 16.0), 2.0 * s, stroke, outline);
-            line(&[(3.0, 7.5), (17.0, 7.5)], w, color);
-        }
-        Icon::FullScreen => {
-            for (a, b, c) in [
-                ((3.0, 7.0), (3.0, 4.0), (6.0, 4.0)),
-                ((14.0, 4.0), (17.0, 4.0), (17.0, 7.0)),
-                ((17.0, 13.0), (17.0, 16.0), (14.0, 16.0)),
-                ((6.0, 16.0), (3.0, 16.0), (3.0, 13.0)),
-            ] {
-                line(&[a, b, c], w, color);
-            }
-        }
-        Icon::Freeform => {
-            closed(
-                &[(4.0, 9.0), (6.5, 4.5), (11.0, 5.5), (15.5, 4.0), (17.0, 8.5), (14.5, 12.0), (16.0, 15.5), (10.0, 16.0), (5.0, 14.5)],
-                w,
-                color,
-            );
-        }
-        Icon::Timer | Icon::TimerOff => {
-            p.circle_stroke(at(10.0, 11.0), 6.5 * s, stroke);
-            line(&[(10.0, 7.5), (10.0, 11.0), (12.5, 12.5)], w, color);
-            line(&[(8.0, 2.5), (12.0, 2.5)], w, color);
-            if icon == Icon::TimerOff {
-                line(&[(3.0, 3.5), (17.0, 18.0)], w, color);
-            }
-        }
-        Icon::Chevron => {
-            line(&[(6.0, 8.0), (10.0, 12.0), (14.0, 8.0)], 1.3, color);
-        }
-        Icon::Select => {
-            closed(&[(4.5, 2.5), (4.5, 15.5), (7.7, 12.6), (10.0, 17.0), (12.0, 16.0), (9.8, 11.7), (14.0, 11.7)], w, color);
-            if let Some(ink) = ink {
-                p.circle(at(16.0, 16.0), 2.6 * s, ink, Stroke::new(1.0 * s, color));
-            }
-        }
-        Icon::Pen => {
-            closed(&[(12.5, 3.0), (15.5, 6.0), (7.0, 14.5), (4.0, 11.5)], w, color);
-            filled(&[(4.0, 11.5), (7.0, 14.5), (2.5, 16.5)], ink.unwrap_or(color));
-            line(&[(4.0, 11.5), (7.0, 14.5), (2.5, 16.5), (4.0, 11.5)], 1.0, ink.unwrap_or(color));
-        }
-        Icon::Highlighter => {
-            filled(&[(5.0, 12.0), (8.0, 15.0), (6.0, 17.0), (2.5, 17.0), (2.5, 15.0)], ink.unwrap_or(color));
-            closed(&[(12.0, 2.5), (17.0, 7.5), (9.0, 15.5), (4.0, 10.5)], w, color);
-            line(&[(4.0, 10.5), (9.0, 15.5)], w, color);
-        }
-        Icon::Eraser => {
-            closed(&[(11.5, 3.0), (17.0, 8.5), (10.0, 15.5), (6.5, 15.5), (3.0, 12.0)], w, color);
-            line(&[(7.0, 7.5), (12.5, 13.0)], w, color);
-            line(&[(6.5, 15.5), (17.0, 15.5)], w, color);
-        }
-        Icon::Arrow | Icon::Line | Icon::RectOutline | Icon::Ellipse => {
-            match icon {
-                Icon::Arrow => {
-                    line(&[(3.5, 15.5), (11.0, 8.0)], w, color);
-                    filled(&[(15.5, 3.5), (13.2, 10.1), (8.9, 5.8)], color);
-                }
-                Icon::Line => line(&[(3.5, 15.5), (15.5, 3.5)], w, color),
-                Icon::RectOutline => {
-                    p.rect_stroke(rect_at(2.5, 3.5, 15.5, 13.0), 0.0, stroke, outline);
-                }
-                _ => {
-                    let pts = (0..32).map(|i| {
-                        let a = std::f32::consts::TAU * i as f32 / 32.0;
-                        at(9.0 + 6.5 * a.cos(), 8.5 + 5.0 * a.sin())
-                    });
-                    p.add(Shape::closed_line(pts.collect(), stroke));
-                }
-            }
-            if let Some(ink) = ink {
-                p.circle(at(16.0, 16.0), 2.6 * s, ink, Stroke::new(1.0 * s, color));
-            }
-        }
-        Icon::Text => {
-            line(&[(3.5, 4.0), (14.5, 4.0)], 1.6, color);
-            line(&[(9.0, 4.0), (9.0, 16.0)], 1.6, color);
-            if let Some(ink) = ink {
-                p.circle(at(16.0, 16.0), 2.6 * s, ink, Stroke::new(1.0 * s, color));
-            }
-        }
-        Icon::Crop => {
+        Icon::Plus => bi!("plus-lg"),
+        Icon::Rectangle => bi!("bounding-box"),
+        Icon::Window => bi!("window"),
+        Icon::FullScreen => bi!("fullscreen"),
+        Icon::Freeform => bi!("bezier2"),
+        Icon::Timer | Icon::TimerOff => bi!("stopwatch"),
+        Icon::Chevron => bi!("chevron-down"),
+        Icon::Select => bi!("cursor"),
+        Icon::Pen => bi!("pencil"),
+        Icon::Highlighter => bi!("highlighter"),
+        Icon::Eraser => bi!("eraser"),
+        Icon::Arrow => bi!("arrow-up-right"),
+        Icon::Line => bi!("slash-lg"),
+        Icon::RectOutline => bi!("square"),
+        Icon::Ellipse => bi!("circle"),
+        Icon::Text => bi!("fonts"),
+        Icon::Crop => bi!("crop"),
+        Icon::Check => bi!("check-lg"),
+        Icon::Close => bi!("x-lg"),
+        Icon::Undo => bi!("arrow-counterclockwise"),
+        Icon::Redo => bi!("arrow-clockwise"),
+        Icon::Save => bi!("floppy"),
+        Icon::Copy => bi!("copy"),
+        Icon::More => bi!("three-dots"),
+        Icon::Camera => bi!("camera"),
+        Icon::Video => bi!("camera-video"),
+        Icon::Mic => bi!("mic"),
+        Icon::MicOff => bi!("mic-mute"),
+        Icon::SystemSound => bi!("volume-up"),
+        Icon::SystemSoundOff => bi!("volume-mute"),
+        Icon::Record => bi!("record-circle"),
+        Icon::Stop => bi!("stop-fill"),
+        Icon::Play => bi!("play-fill"),
+    }
+}
 
+/// Bootstrap Icons are drawn on a 16×16 grid.
+const GRID: f64 = 16.0;
+/// The ink dot's centre and radius, and the clear gap around it, on that grid.
+const DOT: (f64, f64) = (12.7, 12.7);
+const DOT_R: f64 = 2.3;
+const DOT_GAP: f64 = 1.3;
+/// A diagonal bar across the stopwatch (no delay), and the clear gap beside it.
+const SLASH: ((f64, f64), (f64, f64)) = ((1.5, 1.5), (14.5, 14.5));
+const SLASH_W: f64 = 1.1;
+const SLASH_GAP: f64 = 1.1;
 
-            line(&[(6.0, 2.5), (6.0, 14.0), (17.5, 14.0)], w, color);
-            line(&[(2.5, 6.0), (14.0, 6.0), (14.0, 17.5)], w, color);
-        }
-        Icon::Check => {
-            line(&[(4.0, 10.5), (8.0, 14.5), (16.0, 5.5)], 1.6, color);
-        }
-        Icon::Close => {
-            line(&[(5.0, 5.0), (15.0, 15.0)], 1.5, color);
-            line(&[(15.0, 5.0), (5.0, 15.0)], 1.5, color);
-        }
-        Icon::Undo | Icon::Redo => {
-            let flip = |x: f32| if icon == Icon::Redo { 20.0 - x } else { x };
-            // Arrow heading left along the top, swinging round on the right
-            // and coming back along the bottom.
-            let mut path = vec![at(flip(4.0), 7.0)];
-            path.extend((0..=12).map(|i| {
-                let a = std::f32::consts::FRAC_PI_2 - std::f32::consts::PI * i as f32 / 12.0;
-                at(flip(11.5 + 4.5 * a.cos()), 11.5 - 4.5 * a.sin())
-            }));
-            path.push(at(flip(7.0), 16.0));
-            p.add(Shape::line(path, stroke));
-            line(&[(flip(7.0), 4.0), (flip(4.0), 7.0), (flip(7.0), 10.0)], w, color);
-        }
-        Icon::Save => {
-            closed(&[(3.5, 3.5), (14.0, 3.5), (16.5, 6.0), (16.5, 16.5), (3.5, 16.5)], w, color);
-            p.rect_stroke(rect_at(6.5, 3.5, 12.5, 7.5), 0.0, stroke, outline);
-            p.rect_stroke(rect_at(6.0, 11.0, 14.0, 16.5), 0.0, stroke, outline);
-        }
-        Icon::Copy => {
-            p.rect_stroke(rect_at(7.0, 6.5, 16.5, 17.0), 2.0 * s, stroke, outline);
-            line(&[(4.0, 13.5), (4.0, 4.5), (5.0, 3.5), (13.0, 3.5)], w, color);
-        }
-        Icon::Camera => {
-            closed(&[(2.5, 6.5), (6.5, 6.5), (8.0, 4.0), (12.0, 4.0), (13.5, 6.5), (17.5, 6.5), (17.5, 16.0), (2.5, 16.0)], w, color);
-            p.circle_stroke(at(10.0, 11.0), 3.2 * s, stroke);
-        }
-        Icon::Video => {
-            p.rect_stroke(rect_at(2.5, 5.0, 13.0, 15.0), 2.0 * s, stroke, outline);
-            closed(&[(13.0, 9.0), (17.5, 6.0), (17.5, 14.0), (13.0, 11.0)], w, color);
-        }
-        Icon::Mic | Icon::MicOff => {
-            p.rect_stroke(rect_at(7.5, 2.5, 12.5, 12.0), 2.5 * s, stroke, outline);
-            let arc: Vec<_> = (0..=10)
-                .map(|i| {
-                    let a = std::f32::consts::PI * i as f32 / 10.0;
-                    at(10.0 + 5.0 * a.cos(), 10.0 + 4.5 * a.sin())
-                })
-                .collect();
-            p.add(Shape::line(arc, stroke));
-            line(&[(10.0, 14.5), (10.0, 17.5)], w, color);
-            if icon == Icon::MicOff {
-                line(&[(3.5, 3.0), (16.5, 17.5)], w, color);
+struct Layer {
+    path: kurbo::BezPath,
+    rule: Fill,
+}
+
+/// The `<path>` elements of a Bootstrap icon: every one is a filled `d` with an optional `fill-rule`.
+fn parse(svg: &str) -> Result<Vec<Layer>, String> {
+    svg.split("<path")
+        .skip(1)
+        .map(|tag| {
+            let tag = tag.split('>').next().unwrap_or_default();
+            let d = tag.split(" d=\"").nth(1).and_then(|s| s.split('"').next()).ok_or("path without d")?;
+            let path = kurbo::BezPath::from_svg(d).map_err(|e| format!("bad path data: {e}"))?;
+            let rule = if tag.contains("fill-rule=\"evenodd\"") { Fill::EvenOdd } else { Fill::NonZero };
+            Ok(Layer { path, rule })
+        })
+        .collect()
+}
+
+static ART: LazyLock<Vec<Vec<Layer>>> = LazyLock::new(|| {
+    ALL.iter()
+        .map(|&icon| {
+            parse(svg(icon)).unwrap_or_else(|e| {
+                eprintln!("icon {icon:?}: {e}");
+                Vec::new()
+            })
+        })
+        .collect()
+});
+
+/// The icon's alpha at `px`×`px` device pixels. `dot` clears a gap for the ink dot.
+fn coverage(icon: Icon, px: u16, dot: bool) -> Vec<u8> {
+    let mut cx = RenderContext::new(px, px);
+    let s = f64::from(px) / GRID;
+    // Bootstrap's cursor points up and to the right; mirrored, it reads as the usual pointer.
+    cx.set_transform(if icon == Icon::Select { Affine::new([-s, 0.0, 0.0, s, f64::from(px), 0.0]) } else { Affine::scale(s) });
+    cx.set_paint(css::WHITE);
+    for layer in &ART[icon as usize] {
+        cx.set_fill_rule(layer.rule);
+        cx.fill_path(&layer.path);
+    }
+    let clear = BlendMode::new(Mix::Normal, Compose::Clear);
+    let over = BlendMode::default();
+    cx.set_fill_rule(Fill::NonZero);
+    if icon == Icon::TimerOff {
+        let mut bar = kurbo::BezPath::new();
+        bar.move_to(SLASH.0);
+        bar.line_to(SLASH.1);
+        cx.set_blend_mode(clear);
+        cx.set_stroke(kurbo::Stroke::new(SLASH_W + 2.0 * SLASH_GAP).with_caps(kurbo::Cap::Butt));
+        cx.stroke_path(&bar);
+        cx.set_blend_mode(over);
+        cx.set_stroke(kurbo::Stroke::new(SLASH_W).with_caps(kurbo::Cap::Butt));
+        cx.stroke_path(&bar);
+    }
+    if dot {
+        cx.set_blend_mode(clear);
+        cx.fill_path(&Circle::new(DOT, DOT_R + DOT_GAP).to_path(0.05));
+    }
+    cx.flush();
+    let mut pixmap = Pixmap::new(px, px);
+    cx.render(&mut pixmap, &mut Resources::new());
+    pixmap.data().iter().map(|p| p.a).collect()
+}
+
+/// Uploaded masks, per egui context (a texture belongs to the context that made it).
+// ceiling: never evicted; sizes only change with the display scale or a window's DPI, so a handful per icon. Evict if icons are ever drawn at animated sizes.
+#[derive(Clone, Default)]
+struct Textures(Arc<Mutex<HashMap<Mask, TextureHandle>>>);
+
+/// What a mask depends on: the icon, its size in device pixels, and whether it has an ink dot's gap.
+type Mask = (Icon, u16, bool);
+
+/// The square of whole device pixels, centred on `rect` and as wide as its shorter side, and its size in pixels.
+fn snap(rect: Rect, ppp: f32) -> (Rect, u16) {
+    let px = (rect.width().min(rect.height()) * ppp).round().clamp(1.0, 1024.0);
+    let min = ((rect.center().to_vec2() * ppp - Vec2::splat(px) / 2.0).round() / ppp).to_pos2();
+    (Rect::from_min_size(min, Vec2::splat(px / ppp)), px as u16)
+}
+
+/// Paints `icon` centred in `rect`, snapped to whole device pixels so it stays crisp at any scale.
+/// `ink` adds a dot of the colour the tool draws in at the bottom-right.
+pub fn paint(p: &Painter, rect: Rect, icon: Icon, color: Color32, ink: Option<Color32>) {
+    let ctx = p.ctx();
+    let (at, px) = snap(rect, ctx.pixels_per_point());
+    let key = (icon, px, ink.is_some());
+    let textures = ctx.data_mut(|d| d.get_temp_mut_or_insert_with(Id::NULL, Textures::default).clone());
+    let texture = textures
+        .0
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .entry(key)
+        .or_insert_with(|| {
+            let alpha = coverage(icon, px, key.2);
+            let image = ColorImage { size: [usize::from(px); 2], source_size: Vec2::splat(f32::from(px)), pixels: alpha.into_iter().map(Color32::from_white_alpha).collect() };
+            ctx.load_texture(format!("icon-{icon:?}-{px}"), image, TextureOptions::LINEAR)
+        })
+        .id();
+    p.image(texture, at, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), color);
+    if let Some(ink) = ink {
+        let unit = at.width() / GRID as f32;
+        p.circle(at.min + vec2(DOT.0 as f32, DOT.1 as f32) * unit, DOT_R as f32 * unit, ink, Stroke::new(1.0, color));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn icons_land_on_whole_device_pixels_at_any_scale() {
+        for ppp in [1.0, 1.25, 1.5, 1.75, 2.0] {
+            for (x, y, side) in [(10.0, 10.0, 16.0), (10.3, 7.7, 18.0), (33.5, 2.25, 12.0), (5.0, 5.0, 28.0)] {
+                let (at, px) = snap(Rect::from_min_size(pos2(x, y), Vec2::splat(side)), ppp);
+                let device = |v: f32| (v * ppp, (v * ppp).round());
+                for v in [at.min.x, at.min.y, at.width(), at.height()] {
+                    let (exact, whole) = device(v);
+                    assert!((exact - whole).abs() < 1e-3, "{v} not on the pixel grid at {ppp}x");
+                }
+                assert!((f32::from(px) - at.width() * ppp).abs() < 1e-3);
+                assert!((at.center() - Rect::from_min_size(pos2(x, y), Vec2::splat(side)).center()).length() <= 0.5 / ppp * 1.5);
             }
         }
-        Icon::SystemSound | Icon::SystemSoundOff => {
-            line(&[(9.0, 14.0), (2.5, 14.0), (2.5, 3.5), (17.5, 3.5), (17.5, 8.5)], w, color);
-            line(&[(5.5, 16.5), (8.5, 16.5)], w, color);
-            closed(&[(11.0, 12.0), (12.5, 12.0), (15.0, 10.0), (15.0, 17.5), (12.5, 15.5), (11.0, 15.5)], 1.2, color);
-            if icon == Icon::SystemSoundOff {
-                line(&[(16.5, 12.0), (19.0, 15.5)], 1.2, color);
-                line(&[(19.0, 12.0), (16.5, 15.5)], 1.2, color);
-            } else {
-                line(&[(17.0, 12.0), (17.8, 13.75), (17.0, 15.5)], 1.2, color);
+    }
+
+    #[test]
+    fn all_lists_every_icon_in_order() {
+        assert_eq!(ALL.len(), Icon::Play as usize + 1);
+        for (i, icon) in ALL.iter().enumerate() {
+            assert_eq!(*icon as usize, i, "{icon:?} out of order");
+        }
+    }
+
+    #[test]
+    fn every_icon_parses_and_rasterises() {
+        for icon in ALL {
+            let layers = parse(svg(icon)).unwrap_or_else(|e| panic!("{icon:?}: {e}"));
+            assert!(!layers.is_empty(), "{icon:?} has no paths");
+            for px in [16, 18, 20, 23, 27, 36] {
+                let mask = coverage(icon, px, false);
+                assert_eq!(mask.len(), usize::from(px) * usize::from(px));
+                let ink: u32 = mask.iter().map(|&a| u32::from(a)).sum();
+                assert!(ink > 255 * u32::from(px) / 2, "{icon:?} at {px}px is blank (alpha sum {ink})");
+                assert!(mask.iter().any(|&a| a > 127), "{icon:?} at {px}px has no solid pixel");
             }
         }
-        Icon::Record => {
-            p.circle_stroke(at(10.0, 10.0), 6.5 * s, stroke);
-            p.circle_filled(at(10.0, 10.0), 3.8 * s, color);
+    }
+
+    #[test]
+    fn ink_dot_clears_a_gap() {
+        let px = 32u16;
+        let at = |m: &[u8], x: f64, y: f64| m[(y * f64::from(px) / GRID) as usize * usize::from(px) + (x * f64::from(px) / GRID) as usize];
+        for icon in [Icon::Pen, Icon::Highlighter, Icon::Arrow, Icon::Line, Icon::RectOutline, Icon::Ellipse, Icon::Text] {
+            let plain = coverage(icon, px, false);
+            let gapped = coverage(icon, px, true);
+            assert_eq!(at(&gapped, DOT.0, DOT.1), 0, "{icon:?}: dot centre not cleared");
+            assert!(gapped.iter().map(|&a| u32::from(a)).sum::<u32>() <= plain.iter().map(|&a| u32::from(a)).sum::<u32>());
+            assert!(gapped.iter().any(|&a| a > 127), "{icon:?}: the dot gap erased the whole icon");
         }
-        Icon::Stop => {
-            p.rect_filled(rect_at(5.0, 5.0, 15.0, 15.0), 2.0 * s, color);
+    }
+
+    #[test]
+    fn no_delay_stopwatch_differs_from_the_plain_one() {
+        assert_ne!(coverage(Icon::Timer, 32, false), coverage(Icon::TimerOff, 32, false));
+    }
+
+    #[test]
+    fn a_texture_is_uploaded_once_per_icon_and_size() {
+        let ctx = eframe::egui::Context::default();
+        let mut uploads = 0;
+        for _ in 0..3 {
+            let mut out = ctx.run_ui(Default::default(), |ui| {
+                paint(ui.painter(), Rect::from_min_size(pos2(10.3, 10.7), Vec2::splat(18.0)), Icon::Camera, Color32::WHITE, None);
+            });
+            uploads += out.textures_delta.set.iter().filter(|(id, _)| **id != eframe::egui::TextureId::default()).count();
+            out.textures_delta.clear();
         }
-        Icon::Play => {
-            filled(&[(6.0, 3.5), (16.5, 10.0), (6.0, 16.5)], color);
-        }
-        Icon::More => {
-            for x in [4.5, 10.0, 15.5] {
-                p.circle_filled(at(x, 10.0), 1.3 * s, color);
-            }
-        }
+        assert_eq!(uploads, 1);
     }
 }
