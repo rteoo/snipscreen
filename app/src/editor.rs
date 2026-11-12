@@ -25,9 +25,9 @@ use crate::widgets::{
 };
 use crate::win;
 
-/// Measured: bar padding 8 + New button 72 + markup with crop buttons 382 + output group 117 + 2 group gaps
-/// + padding 8 + caption buttons 138 = 757.
-pub const MIN_EDIT_W: f32 = 760.0;
+/// Measured: bar padding 8 + New button 72 + markup with crop buttons 418 + output group 117 + 2 group gaps
+/// + padding 8 + caption buttons 138 = 793.
+pub const MIN_EDIT_W: f32 = 796.0;
 const MIN_ZOOM: f32 = 0.05;
 const MAX_ZOOM: f32 = 8.0;
 /// Snip zoom change per Ctrl+Plus / Ctrl+Minus press.
@@ -46,6 +46,8 @@ const CASCADE: i32 = 28;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Tool {
+    /// Picks a placed mark to move, resize, recolour or delete.
+    Select,
     Pen,
     Highlighter,
     Shape,
@@ -75,6 +77,21 @@ impl Grip {
             Grip::E | Grip::W => CursorIcon::ResizeHorizontal,
             Grip::NW | Grip::SE => CursorIcon::ResizeNwSe,
             Grip::NE | Grip::SW => CursorIcon::ResizeNeSw,
+        }
+    }
+
+    /// The sides the grip moves: -1 for the left or top, 1 for the right or bottom, 0 for neither.
+    fn sides(self) -> (i32, i32) {
+        match self {
+            Grip::Move => (0, 0),
+            Grip::N => (0, -1),
+            Grip::S => (0, 1),
+            Grip::E => (1, 0),
+            Grip::W => (-1, 0),
+            Grip::NE => (1, -1),
+            Grip::NW => (-1, -1),
+            Grip::SE => (1, 1),
+            Grip::SW => (-1, 1),
         }
     }
 }
@@ -167,6 +184,165 @@ fn paint_crop_frame(painter: &egui::Painter, img_rect: Rect, frame: Rect, px: Ve
     painter.galley(at + vec2(5.0, 2.0), galley, Color32::WHITE);
 }
 
+/// What a drag on the selected mark holds: a grip of its frame (`Grip::Move` is the mark itself),
+/// or one end of a line or arrow.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Handle {
+    Frame(Grip),
+    From,
+    To,
+}
+
+impl Handle {
+    fn cursor(self) -> CursorIcon {
+        match self {
+            Handle::Frame(g) => g.cursor(),
+            Handle::From | Handle::To => CursorIcon::Crosshair,
+        }
+    }
+}
+
+/// Room between a selected mark and the frame drawn round it, in points.
+const SELECT_PAD: f32 = 4.0;
+/// Side of a selection handle, in points.
+const HANDLE_SIZE: f32 = 7.0;
+/// How close to a handle, in points, the pointer takes hold of it.
+const HANDLE_REACH: f32 = 7.0;
+/// How close to a mark, in points, a click with the Select tool picks it.
+const SELECT_REACH: f32 = 4.0;
+/// Text sizes a corner drag can reach, in image pixels (a text already outside keeps its size as a bound).
+const TEXT_MIN_PX: f32 = 4.0;
+const TEXT_MAX_PX: f32 = 1024.0;
+
+/// How far a mark's ink reaches past its `Mark::frame`, in image pixels: half its line (a text's frame holds all of it).
+fn ink_reach(m: &Mark) -> f32 {
+    match m {
+        Mark::Stroke(s) => s.width / 2.0,
+        Mark::Shape(s) => s.width / 2.0,
+        Mark::Text(_) => 0.0,
+    }
+}
+
+fn is_line(m: &Mark) -> bool {
+    matches!(m, Mark::Shape(s) if matches!(s.kind, ShapeKind::Line | ShapeKind::Arrow))
+}
+
+/// The handles of the selected mark `m`, at their places in points: a line's or arrow's two ends,
+/// a text's bottom-right corner (it scales about its top-left), else the corners and sides of
+/// `frame`, the selection frame drawn round it.
+fn handles(m: &Mark, frame: Rect, to_pt: impl Fn(Pos2) -> Pos2) -> Vec<(Handle, Pos2)> {
+    match m {
+        Mark::Shape(s) if is_line(m) => vec![(Handle::From, to_pt(s.from)), (Handle::To, to_pt(s.to))],
+        Mark::Text(_) => vec![(Handle::Frame(Grip::SE), frame.right_bottom())],
+        _ => [Grip::NW, Grip::N, Grip::NE, Grip::E, Grip::SE, Grip::S, Grip::SW, Grip::W]
+            .into_iter()
+            .map(|g| {
+                let (sx, sy) = g.sides();
+                let x = [frame.left(), frame.center().x, frame.right()][(sx + 1) as usize];
+                let y = [frame.top(), frame.center().y, frame.bottom()][(sy + 1) as usize];
+                (Handle::Frame(g), pos2(x, y))
+            })
+            .collect(),
+    }
+}
+
+/// The handle nearest `p` within reach.
+fn handle_at(handles: &[(Handle, Pos2)], p: Pos2) -> Option<Handle> {
+    handles.iter().map(|&(h, at)| (h, at.distance(p))).filter(|&(_, d)| d <= HANDLE_REACH).min_by(|a, b| a.1.total_cmp(&b.1)).map(|(h, _)| h)
+}
+
+/// The selected mark's index in the stack, its handles and its selection frame, in points.
+type Selection = (usize, Vec<(Handle, Pos2)>, Rect);
+
+/// What a press at `p` (points) takes hold of with the Select tool: a handle of the selected mark
+/// (`selection`: its index, handles and frame in points), else the topmost mark within `reach`
+/// image pixels of `at` (`p` in image pixels), to move it, else the empty middle of the selection's
+/// frame, which moves the selected mark too.
+fn hold_at(doc: &Doc, selection: Option<&Selection>, p: Pos2, at: Pos2, reach: f32) -> Option<(usize, Handle)> {
+    if let Some(h) = selection.and_then(|(i, hs, _)| handle_at(hs, p).map(|h| (*i, h))) {
+        return Some(h);
+    }
+    if let Some(i) = doc.mark_at(at, reach) {
+        return Some((i, Handle::Frame(Grip::Move)));
+    }
+    selection.filter(|(_, _, frame)| frame.contains(p)).map(|(i, _, _)| (*i, Handle::Frame(Grip::Move)))
+}
+
+/// `start`, the selected mark as a drag on `handle` found it, after the pointer moved `delta` image
+/// pixels; `frame` is its `Mark::frame` then. Shift keeps a line's or arrow's end at 45° and a
+/// rectangle's or ellipse's corner square, as while drawing one.
+fn drag_mark(start: &Mark, frame: Rect, handle: Handle, delta: Vec2, shift: bool) -> Mark {
+    let mut m = start.clone();
+    match (handle, &mut m) {
+        (Handle::Frame(Grip::Move), m) => m.translate(delta),
+        (Handle::From | Handle::To, Mark::Shape(s)) => {
+            let (end, anchor) = if handle == Handle::From { (s.from, s.to) } else { (s.to, s.from) };
+            let p = if shift { markup::constrain(s.kind, anchor, end + delta) } else { end + delta };
+            if handle == Handle::From {
+                s.from = p;
+            } else {
+                s.to = p;
+            }
+        }
+        (Handle::From | Handle::To, _) => {}
+        (Handle::Frame(_), Mark::Text(t)) => {
+            // Scales about the top-left corner by how far the pointer went along the diagonal to the bottom-right one.
+            let d = frame.max - t.pos;
+            let scale = if d.length_sq() > 1e-3 { (d + delta).dot(d) / d.length_sq() } else { 1.0 };
+            t.size = (t.size * scale).clamp(TEXT_MIN_PX.min(t.size), TEXT_MAX_PX.max(t.size));
+        }
+        (Handle::Frame(g), m) => {
+            let (sx, sy) = g.sides();
+            let mut r = frame;
+            match sx {
+                -1 => r.min.x += delta.x,
+                1 => r.max.x += delta.x,
+                _ => {}
+            }
+            match sy {
+                -1 => r.min.y += delta.y,
+                1 => r.max.y += delta.y,
+                _ => {}
+            }
+            if let (true, Mark::Shape(s)) = (shift && sx != 0 && sy != 0, &*m) {
+                let pick = |side: i32, lo: f32, hi: f32| if side < 0 { lo } else { hi };
+                let anchor = pos2(pick(-sx, frame.min.x, frame.max.x), pick(-sy, frame.min.y, frame.max.y));
+                let c = markup::constrain(s.kind, anchor, pos2(pick(sx, r.min.x, r.max.x), pick(sy, r.min.y, r.max.y)));
+                *(if sx < 0 { &mut r.min.x } else { &mut r.max.x }) = c.x;
+                *(if sy < 0 { &mut r.min.y } else { &mut r.max.y }) = c.y;
+            }
+            m.reframe(frame, r);
+        }
+    }
+    m
+}
+
+/// The selected mark's frame (none round a line or arrow, whose ends are its handles) and handles,
+/// over a dark halo so they show on any picture.
+fn paint_selection(painter: &egui::Painter, m: &Mark, frame: Rect, handles: &[(Handle, Pos2)]) {
+    if !is_line(m) {
+        painter.rect_stroke(frame, 0.0, (3.0, Color32::from_black_alpha(90)), StrokeKind::Middle);
+        painter.rect_stroke(frame, 0.0, (1.0, ACCENT), StrokeKind::Middle);
+    }
+    for (_, at) in handles {
+        let r = Rect::from_center_size(*at, Vec2::splat(HANDLE_SIZE));
+        painter.rect_filled(r.expand(1.5), 2.0, Color32::from_black_alpha(110));
+        painter.rect_filled(r, 1.0, Color32::WHITE);
+        painter.rect_stroke(r, 1.0, (1.0, ACCENT), StrokeKind::Inside);
+    }
+}
+
+/// A drag on the selected mark: what it holds, the mark and its `frame` as the drag found them,
+/// where it began (points), and whether it changed the mark yet (its undo step is made then).
+struct MarkDrag {
+    handle: Handle,
+    index: usize,
+    start: Mark,
+    frame: Rect,
+    origin: Pos2,
+    edited: bool,
+}
+
 const SHAPES: [(ShapeKind, Icon, &str); 4] = [
     (ShapeKind::Arrow, Icon::Arrow, "Arrow"),
     (ShapeKind::Line, Icon::Line, "Line"),
@@ -254,6 +430,14 @@ pub struct Snip {
     /// Text was placed with an input method's composition in it; the editor cancels the composition
     /// the input method still holds, so it isn't committed a second time.
     ime_taken: bool,
+    /// The mark the Select tool picked, by identity in `doc.marks` (`Arc::ptr_eq`): an undo that
+    /// takes it away drops the selection.
+    selected: Option<Arc<Mark>>,
+    mark_drag: Option<MarkDrag>,
+    /// The selected mark's size slider is held, and its first change made the undo step for the hold.
+    option_held: bool,
+    /// Image pixels per point at the canvas's last zoom, for the selected mark's options (set in points).
+    px_per_pt: f32,
 }
 
 pub enum Content {
@@ -309,7 +493,66 @@ impl Drop for Busy {
 
 impl Snip {
     pub fn new(image: ColorImage, tools: Tools) -> Self {
-        Self { doc: Doc::new(image), tools, texture: None, drawing: None, erase_marked: false, crop: None, crop_drag: None, zoom: None, key_zoom: 1.0, draft: Draft::default(), ime_taken: false }
+        Self {
+            doc: Doc::new(image),
+            tools,
+            texture: None,
+            drawing: None,
+            erase_marked: false,
+            crop: None,
+            crop_drag: None,
+            zoom: None,
+            key_zoom: 1.0,
+            draft: Draft::default(),
+            ime_taken: false,
+            selected: None,
+            mark_drag: None,
+            option_held: false,
+            px_per_pt: 1.0,
+        }
+    }
+
+    /// Where the selected mark is in the stack, while it is still there.
+    fn selected_index(&self) -> Option<usize> {
+        let s = self.selected.as_ref()?;
+        self.doc.marks.iter().position(|m| Arc::ptr_eq(m, s))
+    }
+
+    fn deselect(&mut self) {
+        self.selected = None;
+        self.mark_drag = None;
+        self.option_held = false;
+    }
+
+    /// Removes the selected mark as one undo step.
+    fn delete_selected(&mut self) {
+        if let Some(i) = self.selected_index() {
+            self.doc.remove_mark(i);
+        }
+        self.deselect();
+    }
+
+    /// Puts `m` in place of the selected mark as one undo step, except that every change made while
+    /// one slider is `held` goes into the step its first change made.
+    fn edit_selected(&mut self, m: Mark, held: bool) {
+        let Some(i) = self.selected_index() else { return };
+        let changed = *self.doc.marks[i] != m;
+        if changed {
+            if !(held && self.option_held) {
+                self.doc.checkpoint();
+            }
+            self.doc.replace_mark(i, m);
+            self.selected = Some(self.doc.marks[i].clone());
+        }
+        self.option_held = held && (self.option_held || changed);
+    }
+
+    /// Switches to `tool`: a crop under way is cancelled, text being typed is placed and the selection dropped.
+    fn choose_tool(&mut self, tool: Tool) {
+        self.tools.tool = tool;
+        self.cancel_crop();
+        self.finish_text();
+        self.deselect();
     }
 
     /// The picture with its ink, as it would be copied or saved. The canvas texture already holds
@@ -338,6 +581,7 @@ impl Snip {
         };
         self.crop_drag = None;
         self.finish_text();
+        self.deselect();
     }
 
     /// True while text is being typed.
@@ -370,6 +614,9 @@ impl Snip {
         }
         step_history(&mut self.doc, &mut self.crop, &mut self.drawing, redo);
         self.crop_drag = None;
+        // The selection stays while its mark is still there; a drag can't go on over another version of the list.
+        self.mark_drag = None;
+        self.option_held = false;
     }
 
     /// Whether Undo has something to take back: the text being typed (undoing past its start drops
@@ -388,13 +635,15 @@ impl Snip {
     }
 
     fn markup_width(&self) -> f32 {
-        let buttons = if self.crop.is_some() { 10.0 } else { 8.0 };
+        let buttons = if self.crop.is_some() { 11.0 } else { 9.0 };
         let dividers = 2.0;
         buttons * BTN.x + dividers * DIVIDER_W + (buttons + dividers - 1.0) * GAP
     }
 
     fn markup_controls(&mut self, ui: &mut egui::Ui) {
+        let selected_ink = self.selected_index().map(|i| self.doc.marks[i].color());
         for (tool, icon, tip) in [
+            (Tool::Select, Icon::Select, "Select: click a mark to pick it, drag it to move it, drag its handles to resize it, Delete removes it (click again for its colour and size)"),
             (Tool::Pen, Icon::Pen, "Pen (click again for colour and size)"),
             (Tool::Highlighter, Icon::Highlighter, "Highlighter (click again for colour and size)"),
             (Tool::Shape, shape_icon(self.tools.shape_kind), "Shapes (click again for shape, colour and size; Shift keeps lines at 45° and boxes square)"),
@@ -402,21 +651,20 @@ impl Snip {
             (Tool::Eraser, Icon::Eraser, "Eraser: rubs out whole marks"),
         ] {
             let ink = match tool {
+                Tool::Select => selected_ink,
                 Tool::Pen => Some(self.tools.pen.0),
                 Tool::Highlighter => Some(self.tools.highlighter.0),
                 Tool::Shape => Some(self.tools.shape.0),
                 Tool::Text => Some(self.tools.text.0),
-                _ => None,
+                Tool::Eraser => None,
             };
             let resp = icon_button(ui, icon, ink, self.tools.tool == tool, true, tip);
             let again = resp.clicked() && self.tools.tool == tool;
-            // A click on the tool already chosen opens its options and leaves the text being typed alone.
+            // A click on the tool already chosen opens its options and leaves the text being typed (or the selection) alone.
             if resp.clicked() && !again {
-                self.tools.tool = tool;
-                self.cancel_crop();
-                self.finish_text();
+                self.choose_tool(tool);
             }
-            if ink.is_some() {
+            if ink.is_some() || tool == Tool::Select {
                 egui::Popup::from_response(&resp)
                     .open_memory(again.then_some(egui::SetOpenCommand::Toggle))
                     .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
@@ -446,6 +694,10 @@ impl Snip {
 
     fn ink_options(&mut self, ui: &mut egui::Ui, tool: Tool) {
         ui.spacing_mut().item_spacing = vec2(6.0, 8.0);
+        if tool == Tool::Select {
+            self.selection_options(ui);
+            return;
+        }
         if tool == Tool::Shape {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = GAP;
@@ -462,24 +714,7 @@ impl Snip {
             Tool::Text => (&mut self.tools.text, &PEN_COLORS[..], 10.0..=96.0),
             _ => (&mut self.tools.pen, &PEN_COLORS[..], 1.0..=24.0),
         };
-        ui.horizontal(|ui| {
-            for &c in palette {
-                let (rect, resp) = ui.allocate_exact_size(vec2(24.0, 24.0), Sense::click());
-                let p = ui.painter();
-                p.circle_filled(rect.center(), 9.0, c);
-                p.circle_stroke(rect.center(), 9.0, (1.0, Color32::from_gray(90)));
-                if *color == c {
-                    p.circle_stroke(rect.center(), 11.5, (2.0, ACCENT));
-                }
-                if resp.clicked() {
-                    *color = c;
-                }
-            }
-        });
-        ui.horizontal(|ui| {
-            ui.label("Size");
-            ui.add(egui::Slider::new(width, range).show_value(false));
-        });
+        ink_controls(ui, palette, color, width, range, egui::SliderClamping::Always);
         if tool == Tool::Text {
             ui.checkbox(&mut self.tools.text_outline, "Outline");
         }
@@ -488,9 +723,46 @@ impl Snip {
         }
     }
 
+    /// The Select tool's options: those of the tool that drew the selected mark, changing that mark.
+    /// The size reads in points at the current zoom, as the tools' do.
+    fn selection_options(&mut self, ui: &mut egui::Ui) {
+        let Some(i) = self.selected_index() else {
+            ui.label("Click a mark to select it");
+            return;
+        };
+        let mut m = (*self.doc.marks[i]).clone();
+        let (palette, range) = match &m {
+            Mark::Stroke(s) if s.ink == Ink::Highlighter => (&HIGHLIGHT_COLORS[..], 6.0..=48.0),
+            Mark::Text(_) => (&PEN_COLORS[..], 10.0..=96.0),
+            _ => (&PEN_COLORS[..], 1.0..=24.0),
+        };
+        let (color, size_px) = match &mut m {
+            Mark::Stroke(s) => (&mut s.color, &mut s.width),
+            Mark::Shape(s) => (&mut s.color, &mut s.width),
+            Mark::Text(t) => (&mut t.color, &mut t.size),
+        };
+        let k = self.px_per_pt;
+        let (was, mut size_pt) = (*size_px / k, *size_px / k);
+        // A mark sized outside the slider's range (drawn at another zoom) keeps its size until the slider moves.
+        let slider = ink_controls(ui, palette, color, &mut size_pt, range, egui::SliderClamping::Edits);
+        if size_pt != was {
+            *size_px = size_pt * k;
+        }
+        match &mut m {
+            Mark::Text(t) => {
+                ui.checkbox(&mut t.outline, "Outline");
+            }
+            Mark::Shape(s) if matches!(s.kind, ShapeKind::Rectangle | ShapeKind::Ellipse) => {
+                ui.checkbox(&mut s.fill, "Fill");
+            }
+            _ => {}
+        }
+        self.edit_selected(m, slider.is_pointer_button_down_on());
+    }
+
     fn canvas(&mut self, ui: &mut egui::Ui, guard: &PopupClickGuard) {
         let ctx = ui.ctx().clone();
-        let Snip { doc, tools, texture, drawing, erase_marked, crop, crop_drag, zoom: zoom_choice, key_zoom, draft, ime_taken } = self;
+        let Snip { doc, tools, texture, drawing, erase_marked, crop, crop_drag, zoom: zoom_choice, key_zoom, draft, ime_taken, selected, mark_drag, option_held: _, px_per_pt } = self;
         let canvas = texture.get_or_insert_with(|| CanvasTex::new(&ctx, doc));
         canvas.sync(doc);
 
@@ -522,8 +794,17 @@ impl Snip {
             let (outer, resp) = ui.allocate_exact_size(area.max(view), Sense::click_and_drag());
             let img_rect = Rect::from_center_size(outer.center(), shown);
             let k = px_size.x / img_rect.width(); // image pixels per point
+            *px_per_pt = k;
             let to_px = |p: Pos2| ((p - img_rect.min) * k).to_pos2();
             let to_pt = |p: Pos2| img_rect.min + p.to_vec2() / k;
+            // The selected mark's index, handles and frame (points), while it is still on the snip.
+            let selection = |doc: &Doc, selected: &Option<Arc<Mark>>| {
+                let s = selected.as_ref()?;
+                let i = doc.marks.iter().position(|m| Arc::ptr_eq(m, s))?;
+                let f = doc.frame_of(i)?;
+                let frame = Rect::from_min_max(to_pt(f.min), to_pt(f.max)).expand(SELECT_PAD + ink_reach(&doc.marks[i]) / k);
+                Some((i, handles(&doc.marks[i], frame, to_pt), frame))
+            };
 
             let painter = ui.painter();
             // Committed ink is already burned into the texture, exactly as it will be saved.
@@ -555,6 +836,51 @@ impl Snip {
                     }
                     let frame = crop.unwrap_or(frame);
                     paint_crop_frame(painter, img_rect, Rect::from_min_max(to_pt(frame.min), to_pt(frame.max)), frame.size());
+                }
+                Tool::Select => {
+                    let sel = selection(doc, selected);
+                    if sel.is_none() {
+                        *selected = None;
+                        *mark_drag = None;
+                    }
+                    let reach = SELECT_REACH * k;
+                    if resp.drag_started() {
+                        *mark_drag = None;
+                        if let Some(o) = origin {
+                            let held = hold_at(doc, sel.as_ref(), o, to_px(o), reach);
+                            *selected = held.map(|(i, _)| doc.marks[i].clone());
+                            if let Some((index, handle)) = held {
+                                let frame = doc.frame_of(index).unwrap_or(Rect::NOTHING);
+                                *mark_drag = Some(MarkDrag { handle, index, start: (*doc.marks[index]).clone(), frame, origin: o, edited: false });
+                            }
+                        }
+                    }
+                    if let (Some(d), Some(p)) = (mark_drag.as_mut(), resp.interact_pointer_pos()) {
+                        let m = drag_mark(&d.start, d.frame, d.handle, (p - d.origin) * k, ctx.input(|i| i.modifiers.shift));
+                        let still = doc.marks.get(d.index).is_some_and(|c| selected.as_ref().is_some_and(|s| Arc::ptr_eq(c, s)));
+                        if still && *doc.marks[d.index] != m {
+                            // One undo step for the whole drag, made when it first changes the mark.
+                            if !d.edited {
+                                doc.checkpoint();
+                                d.edited = true;
+                            }
+                            doc.replace_mark(d.index, m);
+                            *selected = Some(doc.marks[d.index].clone());
+                        }
+                    }
+                    if resp.drag_stopped() {
+                        *mark_drag = None;
+                    }
+                    if resp.clicked() {
+                        // A click picks the mark under it, keeps the selection on its handles and empty middle, and drops it elsewhere.
+                        if let Some(p) = pointer {
+                            *selected = hold_at(doc, sel.as_ref(), p, to_px(p), reach).map(|(i, _)| doc.marks[i].clone());
+                        }
+                    }
+                    let held = mark_drag.as_ref().map(|d| d.handle).or_else(|| resp.hover_pos().and_then(|p| hold_at(doc, selection(doc, selected).as_ref(), p, to_px(p), reach)).map(|(_, h)| h));
+                    if let Some(h) = held {
+                        ctx.set_cursor_icon(h.cursor());
+                    }
                 }
                 Tool::Pen | Tool::Highlighter => {
                     let (ink, (color, width)) = if tools.tool == Tool::Pen { (Ink::Pen, tools.pen) } else { (Ink::Highlighter, tools.highlighter) };
@@ -658,8 +984,13 @@ impl Snip {
                     }
                 }
             }
-            // An erase above changed the doc after the first sync: show it in this same frame.
+            // An erase or an edit above changed the doc after the first sync: show it in this same frame.
             canvas.sync(doc);
+            if tools.tool == Tool::Select && crop.is_none() {
+                if let Some((i, hs, frame)) = selection(doc, selected) {
+                    paint_selection(painter, &doc.marks[i], frame, &hs);
+                }
+            }
             // A pen or highlighter press always ends in a mark, a click too, so the copy starts then.
             let pressing_ink = resp.is_pointer_button_down_on() && matches!(tools.tool, Tool::Pen | Tool::Highlighter) && crop.is_none();
             if drawing.is_some() || pressing_ink {
@@ -868,7 +1199,7 @@ impl Editor {
         let (popup_open, focused) = (egui::Popup::is_any_open(ctx), ctx.memory(|m| m.focused().is_some()));
         // While text is being typed Enter belongs to it, as it would to a focused widget.
         let typing = matches!(&self.content, Content::Snip(s) if s.typing());
-        let Keys { new, save, undo, redo, copy, enter, esc, zoom_in, zoom_out, zoom_fit } = ctx.input_mut(|i| read_keys(i, popup_open, focused || typing));
+        let Keys { new, save, undo, redo, copy, enter, esc, delete, zoom_in, zoom_out, zoom_fit } = ctx.input_mut(|i| read_keys(i, popup_open, focused || typing));
         if new {
             self.request_new(ctx);
         }
@@ -894,7 +1225,12 @@ impl Editor {
             snip.apply_crop();
         }
         if esc && !typing {
+            // A crop and a selection never coexist (starting a crop drops the selection), so this is the one thing Esc cancels.
             snip.cancel_crop();
+            snip.deselect();
+        }
+        if delete {
+            snip.delete_selected();
         }
         if zoom_fit {
             snip.zoom = None;
@@ -1714,6 +2050,29 @@ impl CanvasTex {
     }
 }
 
+/// The colour swatches and size slider of an options popup. Returns the slider.
+fn ink_controls(ui: &mut egui::Ui, palette: &[Color32], color: &mut Color32, width: &mut f32, range: std::ops::RangeInclusive<f32>, clamping: egui::SliderClamping) -> egui::Response {
+    ui.horizontal(|ui| {
+        for &c in palette {
+            let (rect, resp) = ui.allocate_exact_size(vec2(24.0, 24.0), Sense::click());
+            let p = ui.painter();
+            p.circle_filled(rect.center(), 9.0, c);
+            p.circle_stroke(rect.center(), 9.0, (1.0, Color32::from_gray(90)));
+            if *color == c {
+                p.circle_stroke(rect.center(), 11.5, (2.0, ACCENT));
+            }
+            if resp.clicked() {
+                *color = c;
+            }
+        }
+    });
+    ui.horizontal(|ui| {
+        ui.label("Size");
+        ui.add(egui::Slider::new(width, range).show_value(false).clamping(clamping))
+    })
+    .inner
+}
+
 /// Text worth placing: typed text with something visible in it. Anything else is dropped.
 fn placeable(m: Option<Mark>) -> Option<Mark> {
     match m {
@@ -1926,6 +2285,7 @@ struct Keys {
     copy: bool,
     enter: bool,
     esc: bool,
+    delete: bool,
     zoom_in: bool,
     zoom_out: bool,
     zoom_fit: bool,
@@ -1949,6 +2309,8 @@ fn read_keys(i: &mut egui::InputState, popup_open: bool, focused: bool) -> Keys 
         // Enter applies the crop only when nothing else claims it: with a button focused it activates that button.
         enter: !popup_open && !focused && i.consume_key(Modifiers::NONE, Key::Enter),
         esc: escape_for_app(i, popup_open),
+        // Delete or Backspace removes the selected mark, unless a popup or a focused widget (or the text being typed) has the keyboard.
+        delete: !popup_open && !focused && (i.consume_key(Modifiers::NONE, Key::Delete) | i.consume_key(Modifiers::NONE, Key::Backspace)),
         zoom_in: zoom_in_plus | zoom_in_equals,
         zoom_out: i.consume_shortcut(&cmd(Key::Minus)),
         zoom_fit: i.consume_shortcut(&cmd(Key::Num0)),
@@ -2107,14 +2469,14 @@ mod tests {
     /// Group widths as laid out by `Editor::toolbar`: New button 80, output 133, markup with crop buttons 430.
     const NEW_END: f32 = BAR_PAD + 72.0;
     const OUT_W: f32 = 117.0;
-    const MARKUP_W: f32 = 382.0;
+    const MARKUP_W: f32 = 418.0;
     /// Right end of the controls row: the caption buttons and the padding before them.
     const ROW_END_GAP: f32 = BAR_PAD + 3.0 * CAPTION_W;
 
     #[test]
     fn markup_width_matches_the_measured_toolbar() {
         let mut snip = Snip::new(white(4, 4), Tools::default());
-        assert_eq!(snip.markup_width(), 8.0 * BTN.x + 2.0 * DIVIDER_W + 9.0 * GAP);
+        assert_eq!(snip.markup_width(), 9.0 * BTN.x + 2.0 * DIVIDER_W + 10.0 * GAP);
         snip.crop = Some(Rect::from_min_max(Pos2::ZERO, pos2(2.0, 2.0)));
         assert_eq!(snip.markup_width(), MARKUP_W);
         const { assert!(NEW_END + GROUP_GAP + MARKUP_W + GROUP_GAP + OUT_W + ROW_END_GAP <= MIN_EDIT_W, "MIN_EDIT_W fits all three groups") };
@@ -2186,6 +2548,14 @@ mod tests {
     fn esc_still_cancels_with_a_widget_focused() {
         // egui drops keyboard focus on Esc itself, so a focused button must not hold the key back.
         assert_eq!(press_in(Key::Escape, Modifiers::NONE, false, true), Keys { esc: true, ..Default::default() });
+    }
+
+    #[test]
+    fn delete_and_backspace_remove_the_selection_unless_something_else_has_the_keyboard() {
+        assert_eq!(press(Key::Delete, Modifiers::NONE), Keys { delete: true, ..Default::default() });
+        assert_eq!(press(Key::Backspace, Modifiers::NONE), Keys { delete: true, ..Default::default() });
+        assert_eq!(press_in(Key::Delete, Modifiers::NONE, true, false), Keys::default(), "an open popup has it");
+        assert_eq!(press_in(Key::Backspace, Modifiers::NONE, false, true), Keys::default(), "so do a focused widget and the text being typed");
     }
 
     #[test]
@@ -2289,6 +2659,12 @@ Arc::ptr_eq(&snip.flattened(), &shown), "a current canvas is reused, not re-burn
 
     /// One headless frame of the snip's canvas (1280x800 window at 100%), applying its texture uploads to `screen`.
     fn canvas_frame(ctx: &egui::Context, snip: &mut Snip, screen: &mut Screen, events: Vec<Event>) {
+        canvas_frame_held(ctx, snip, screen, events, Modifiers::NONE);
+    }
+
+    /// `canvas_frame` with `modifiers` held.
+    fn canvas_frame_held(ctx: &egui::Context, snip: &mut Snip, screen: &mut Screen, mut events: Vec<Event>, modifiers: Modifiers) {
+        events.insert(0, Event::ModifiersChanged(modifiers));
         let input = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1280.0, 800.0))), events, ..Default::default() };
         let guard = PopupClickGuard::default();
         let mut out = ctx.run_ui(input, |ui| {
@@ -2570,6 +2946,231 @@ Arc::ptr_eq(&snip.flattened(), &shown), "a current canvas is reused, not re-burn
         snip.step(false);
         canvas_frame(&ctx, &mut snip, &mut screen, vec![]);
         assert!(screen.pixels() == snip.doc.image.pixels, "undo mid-stroke puts the picture back");
+    }
+
+    /// On screen, the image pixel `(x, y)` of a 300x200 snip shown at 100%: its corner is at (490, 300).
+    fn on_snip(x: f32, y: f32) -> Pos2 {
+        pos2(490.0 + x, 300.0 + y)
+    }
+
+    fn rect_mark() -> Mark {
+        Mark::Shape(Shape { kind: ShapeKind::Rectangle, color: PEN_COLORS[2], width: 4.0, from: pos2(50.0, 50.0), to: pos2(150.0, 120.0), fill: false })
+    }
+
+    fn line_mark() -> Mark {
+        Mark::Shape(Shape { kind: ShapeKind::Line, color: PEN_COLORS[3], width: 4.0, from: pos2(20.0, 20.0), to: pos2(100.0, 20.0), fill: false })
+    }
+
+    /// A 300x200 snip with the Select tool and `marks` (each added as its own undo step), after one frame.
+    fn selecting(marks: Vec<Mark>) -> (egui::Context, Snip, Screen) {
+        let ctx = egui::Context::default();
+        let mut snip = Snip::new(gradient(300, 200), Tools { tool: Tool::Select, ..Tools::default() });
+        for m in marks {
+            snip.doc.add_mark(m);
+        }
+        let mut screen = Screen { image: None };
+        canvas_frame(&ctx, &mut snip, &mut screen, vec![]);
+        (ctx, snip, screen)
+    }
+
+    fn click_on(ctx: &egui::Context, snip: &mut Snip, screen: &mut Screen, at: Pos2) {
+        canvas_frame(ctx, snip, screen, vec![Event::PointerMoved(at), pointer(at, true)]);
+        canvas_frame(ctx, snip, screen, vec![pointer(at, false)]);
+        canvas_frame(ctx, snip, screen, vec![]);
+    }
+
+    /// Drags from `from` to `to` over several frames with `modifiers` held, checking every frame that the screen shows what would be saved.
+    fn drag_on(ctx: &egui::Context, snip: &mut Snip, screen: &mut Screen, from: Pos2, to: Pos2, modifiers: Modifiers) {
+        canvas_frame_held(ctx, snip, screen, vec![Event::PointerMoved(from), pointer(from, true)], modifiers);
+        for t in [0.25, 0.5, 1.0] {
+            canvas_frame_held(ctx, snip, screen, vec![Event::PointerMoved(from + (to - from) * t)], modifiers);
+            assert!(screen.pixels() == snip.doc.flatten().pixels, "mid-drag the screen shows the edited snip as saved");
+        }
+        canvas_frame_held(ctx, snip, screen, vec![pointer(to, false)], modifiers);
+        canvas_frame(ctx, snip, screen, vec![]);
+        assert!(screen.pixels() == snip.doc.flatten().pixels, "after the drag the screen shows the snip as saved");
+        assert!(*snip.flattened() == snip.doc.flatten(), "copy and save write what is shown");
+    }
+
+    #[test]
+    fn select_picks_the_topmost_mark_under_a_click_and_a_click_on_nothing_drops_it() {
+        let (ctx, mut snip, mut screen) = selecting(vec![rect_mark(), line_mark()]);
+        click_on(&ctx, &mut snip, &mut screen, on_snip(51.0, 80.0));
+        assert_eq!(snip.selected_index(), Some(0), "a click on the rectangle's side");
+        click_on(&ctx, &mut snip, &mut screen, on_snip(100.0, 85.0));
+        assert_eq!(snip.selected_index(), Some(0), "a click in the selection's empty middle keeps it");
+        click_on(&ctx, &mut snip, &mut screen, on_snip(60.0, 22.0));
+        assert_eq!(snip.selected_index(), Some(1), "a click on the line picks it");
+        click_on(&ctx, &mut snip, &mut screen, on_snip(250.0, 180.0));
+        assert_eq!(snip.selected_index(), None, "a click on nothing drops the selection");
+        click_on(&ctx, &mut snip, &mut screen, on_snip(100.0, 85.0));
+        assert_eq!(snip.selected_index(), None, "an unfilled rectangle's middle is not the rectangle");
+        assert_eq!(snip.doc.marks.len(), 2, "selecting changes nothing");
+        assert!(screen.pixels() == snip.doc.flatten().pixels);
+    }
+
+    #[test]
+    fn dragging_a_mark_moves_it_as_one_undo_step() {
+        let (ctx, mut snip, mut screen) = selecting(vec![rect_mark()]);
+        // Nothing is selected yet: a drag on the mark picks it and moves it.
+        drag_on(&ctx, &mut snip, &mut screen, on_snip(51.0, 80.0), on_snip(71.0, 90.0), Modifiers::NONE);
+        assert_eq!(snip.selected_index(), Some(0));
+        assert!(matches!(&*snip.doc.marks[0], Mark::Shape(s) if s.from == pos2(70.0, 60.0) && s.to == pos2(170.0, 130.0)), "{:?}", snip.doc.marks[0]);
+        // The selection's empty middle moves it too.
+        drag_on(&ctx, &mut snip, &mut screen, on_snip(120.0, 95.0), on_snip(110.0, 95.0), Modifiers::NONE);
+        assert!(matches!(&*snip.doc.marks[0], Mark::Shape(s) if s.from == pos2(60.0, 60.0)));
+        snip.step(false);
+        assert!(matches!(&*snip.doc.marks[0], Mark::Shape(s) if s.from == pos2(70.0, 60.0)), "one undo takes back one drag");
+        snip.step(false);
+        assert_eq!(*snip.doc.marks[0], rect_mark());
+        snip.step(false);
+        assert!(snip.doc.marks.is_empty() && !snip.doc.can_undo(), "each drag was exactly one step");
+        canvas_frame(&ctx, &mut snip, &mut screen, vec![]);
+        assert!(screen.pixels() == snip.doc.image.pixels);
+    }
+
+    #[test]
+    fn dragging_a_handle_resizes_the_mark_and_shift_keeps_a_box_square() {
+        let (ctx, mut snip, mut screen) = selecting(vec![rect_mark(), line_mark()]);
+        click_on(&ctx, &mut snip, &mut screen, on_snip(51.0, 80.0));
+        // The handles sit on the frame drawn SELECT_PAD outside the rectangle's ink (half its 4 px line past its corners).
+        let pad = Vec2::splat(SELECT_PAD + 2.0);
+        drag_on(&ctx, &mut snip, &mut screen, on_snip(150.0, 120.0) + pad, on_snip(170.0, 130.0) + pad, Modifiers::NONE);
+        assert!(matches!(&*snip.doc.marks[0], Mark::Shape(s) if s.from == pos2(50.0, 50.0) && s.to == pos2(170.0, 130.0)), "{:?}", snip.doc.marks[0]);
+        // Top-left corner with Shift: a square on the bottom-right corner.
+        drag_on(&ctx, &mut snip, &mut screen, on_snip(50.0, 50.0) - pad, on_snip(40.0, 80.0) - pad, Modifiers::SHIFT);
+        assert!(matches!(&*snip.doc.marks[0], Mark::Shape(s) if s.from == pos2(40.0, 0.0) && s.to == pos2(170.0, 130.0)), "{:?}", snip.doc.marks[0]);
+        // A line's end, right on it.
+        click_on(&ctx, &mut snip, &mut screen, on_snip(60.0, 22.0));
+        drag_on(&ctx, &mut snip, &mut screen, on_snip(100.0, 20.0), on_snip(110.0, 50.0), Modifiers::NONE);
+        assert!(matches!(&*snip.doc.marks[1], Mark::Shape(s) if s.from == pos2(20.0, 20.0) && s.to == pos2(110.0, 50.0)), "{:?}", snip.doc.marks[1]);
+        snip.step(false);
+        assert_eq!(*snip.doc.marks[1], line_mark(), "one undo step per resize");
+        assert_eq!(snip.selected_index(), None, "undo took the selected version away");
+    }
+
+    #[test]
+    fn a_text_grows_from_its_corner_handle_and_keeps_its_place() {
+        let text = Text { text: "Hi".into(), color: PEN_COLORS[2], size: 30.0, outline: true, pos: pos2(20.0, 120.0) };
+        let (ctx, mut snip, mut screen) = selecting(vec![text.clone().into()]);
+        let frame = snip.doc.frame_of(0).unwrap();
+        click_on(&ctx, &mut snip, &mut screen, on_snip(frame.min.x + 3.0, frame.center().y));
+        assert_eq!(snip.selected_index(), Some(0));
+        let corner = on_snip(frame.max.x, frame.max.y) + vec2(SELECT_PAD, SELECT_PAD);
+        drag_on(&ctx, &mut snip, &mut screen, corner, corner + (frame.max - text.pos) * 0.5, Modifiers::NONE);
+        let Mark::Text(t) = &*snip.doc.marks[0] else { panic!("text") };
+        assert!((t.size - 45.0).abs() < 0.01 && t.pos == text.pos && t.text == "Hi", "{t:?}");
+    }
+
+    #[test]
+    fn drag_mark_follows_its_handle() {
+        let s = Mark::Stroke(Stroke { ink: Ink::Pen, color: Color32::RED, width: 2.0, points: vec![pos2(10.0, 10.0), pos2(30.0, 20.0)] });
+        let f = s.frame();
+        let wider = drag_mark(&s, f, Handle::Frame(Grip::E), vec2(20.0, 99.0), false);
+        assert!(matches!(&wider, Mark::Stroke(s) if s.points == vec![pos2(10.0, 10.0), pos2(50.0, 20.0)]), "a side handle moves one side only: {wider:?}");
+        let moved = drag_mark(&s, f, Handle::Frame(Grip::Move), vec2(5.0, -5.0), true);
+        assert!(matches!(&moved, Mark::Stroke(s) if s.points == vec![pos2(15.0, 5.0), pos2(35.0, 15.0)]));
+        let arrow = Mark::Shape(Shape { kind: ShapeKind::Arrow, color: Color32::RED, width: 2.0, from: pos2(0.0, 0.0), to: pos2(10.0, 0.0), fill: false });
+        let snapped = drag_mark(&arrow, arrow.frame(), Handle::To, vec2(0.0, 11.0), true);
+        assert!(matches!(&snapped, Mark::Shape(s) if (s.to.x - s.to.y).abs() < 1e-3 && s.from == Pos2::ZERO), "Shift keeps the end at 45°: {snapped:?}");
+        let t = Mark::Text(Text { text: "x".into(), color: Color32::RED, size: 2.0, outline: false, pos: Pos2::ZERO });
+        let shrunk = drag_mark(&t, Rect::from_min_max(Pos2::ZERO, pos2(4.0, 4.0)), Handle::Frame(Grip::SE), vec2(-3.0, -3.0), false);
+        assert!(matches!(&shrunk, Mark::Text(t) if t.size == 2.0), "never smaller than the smallest of the limit and its own size: {shrunk:?}");
+    }
+
+    #[test]
+    fn the_selection_options_recolour_the_selected_mark_one_undo_step_per_change() {
+        let (ctx, mut snip, mut screen) = selecting(vec![rect_mark()]);
+        click_on(&ctx, &mut snip, &mut screen, on_snip(51.0, 80.0));
+        // The options as the popup lays them out, from the window's corner: the first swatch is at (12, 12).
+        let options = |snip: &mut Snip, events: Vec<Event>| {
+            let input = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1280.0, 800.0))), events, ..Default::default() };
+            let mut out = ctx.run_ui(input, |ui| {
+                egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| snip.selection_options(ui));
+            });
+            out.textures_delta.clear();
+        };
+        let at = pos2(12.0, 12.0);
+        for events in [vec![Event::PointerMoved(at)], vec![pointer(at, true)], vec![pointer(at, false)], vec![]] {
+            options(&mut snip, events);
+        }
+        assert!(matches!(&*snip.doc.marks[0], Mark::Shape(s) if s.color == PEN_COLORS[0] && s.width == 4.0), "{:?}", snip.doc.marks[0]);
+        assert_eq!(snip.selected_index(), Some(0), "the recoloured mark stays selected");
+        // A held slider's changes make one step together; letting go ends it.
+        let with_width = |snip: &Snip, w: f32| match &*snip.doc.marks[0] {
+            Mark::Shape(s) => Mark::Shape(Shape { width: w, ..s.clone() }),
+            _ => unreachable!(),
+        };
+        for w in [6.0, 8.0, 10.0] {
+            snip.edit_selected(with_width(&snip, w), true);
+        }
+        snip.edit_selected(with_width(&snip, 10.0), false);
+        snip.edit_selected(with_width(&snip, 12.0), false);
+        canvas_frame(&ctx, &mut snip, &mut screen, vec![]);
+        assert!(screen.pixels() == snip.doc.flatten().pixels, "the change shows at once");
+        let width = |snip: &Snip| match &*snip.doc.marks[0] {
+            Mark::Shape(s) => (s.width, s.color),
+            _ => unreachable!(),
+        };
+        assert_eq!(width(&snip), (12.0, PEN_COLORS[0]));
+        snip.step(false);
+        assert_eq!(width(&snip), (10.0, PEN_COLORS[0]));
+        snip.step(false);
+        assert_eq!(width(&snip), (4.0, PEN_COLORS[0]), "the whole slider hold is one step");
+        snip.step(false);
+        assert_eq!(width(&snip), (4.0, PEN_COLORS[2]), "and the colour another");
+        canvas_frame(&ctx, &mut snip, &mut screen, vec![]);
+        assert!(screen.pixels() == snip.doc.flatten().pixels);
+    }
+
+    #[test]
+    fn delete_removes_the_selected_mark_and_esc_drops_the_selection() {
+        let ctx = egui::Context::default();
+        let fresh = Snip::new(gradient(300, 200), Tools { tool: Tool::Select, ..Tools::default() });
+        let mut ed = Editor::new(Content::Snip(Box::new(fresh)), "t".into(), ViewportId::ROOT, 0, None, Default::default(), MIN_EDIT_W);
+        snip_of(&mut ed).doc.add_mark(rect_mark());
+        snip_of(&mut ed).doc.add_mark(line_mark());
+        let mut screen = Screen { image: None };
+        canvas_frame(&ctx, snip_of(&mut ed), &mut screen, vec![]);
+        // A shortcut frame here lays out no canvas, and egui hit-tests a press against the last frame: lay it out first.
+        let pick = |ed: &mut Editor, screen: &mut Screen| {
+            canvas_frame(&ctx, snip_of(ed), screen, vec![]);
+            click_on(&ctx, snip_of(ed), screen, on_snip(51.0, 80.0));
+            assert_eq!(snip_of(ed).selected_index(), Some(0), "the click picked the rectangle");
+        };
+        pick(&mut ed, &mut screen);
+        shortcut(&ctx, &mut ed, Key::Escape, Modifiers::NONE);
+        assert_eq!(snip_of(&mut ed).selected_index(), None, "Esc drops the selection");
+        shortcut(&ctx, &mut ed, Key::Delete, Modifiers::NONE);
+        assert_eq!(snip_of(&mut ed).doc.marks.len(), 2, "with nothing selected Delete does nothing");
+        pick(&mut ed, &mut screen);
+        shortcut(&ctx, &mut ed, Key::Delete, Modifiers::NONE);
+        assert_eq!(snip_of(&mut ed).doc.marks.len(), 1);
+        assert_eq!(*snip_of(&mut ed).doc.marks[0], line_mark(), "the selected mark went");
+        canvas_frame(&ctx, snip_of(&mut ed), &mut screen, vec![]);
+        assert!(screen.pixels() == snip_of(&mut ed).doc.flatten().pixels);
+        shortcut(&ctx, &mut ed, Key::Z, Modifiers::COMMAND);
+        assert_eq!(snip_of(&mut ed).doc.marks.len(), 2, "undo brings it back");
+        pick(&mut ed, &mut screen);
+        shortcut(&ctx, &mut ed, Key::Backspace, Modifiers::NONE);
+        assert_eq!(snip_of(&mut ed).doc.marks.len(), 1, "Backspace removes it too");
+    }
+
+    #[test]
+    fn switching_tools_or_starting_a_crop_drops_the_selection() {
+        let (ctx, mut snip, mut screen) = selecting(vec![rect_mark()]);
+        click_on(&ctx, &mut snip, &mut screen, on_snip(51.0, 80.0));
+        snip.choose_tool(Tool::Pen);
+        assert_eq!(snip.selected_index(), None);
+        snip.choose_tool(Tool::Select);
+        click_on(&ctx, &mut snip, &mut screen, on_snip(51.0, 80.0));
+        snip.toggle_crop();
+        assert_eq!(snip.selected_index(), None);
+        snip.toggle_crop();
+        // With the pen, a press on a mark draws instead of selecting.
+        snip.choose_tool(Tool::Pen);
+        click_on(&ctx, &mut snip, &mut screen, on_snip(51.0, 80.0));
+        assert_eq!((snip.doc.marks.len(), snip.selected_index()), (2, None));
     }
 
     /// One headless frame of every open editor. Without a native backend egui embeds each viewport in
@@ -3012,7 +3613,7 @@ Arc::ptr_eq(&snip.flattened(), &shown), "a current canvas is reused, not re-burn
     #[test]
     fn clicking_the_chosen_text_tool_opens_its_options_without_placing_the_draft() {
         let (ctx, mut ed, _) = typing("draft");
-        // The markup buttons laid out from the window's corner: Text is the fourth.
+        // The markup buttons laid out from the window's corner: Select, Pen, Highlighter, Shapes, Text.
         let button = |n: f32| pos2(n * (BTN.x + GAP) + BTN.x / 2.0, BTN.y / 2.0);
         let click = |ed: &mut Editor, at: Pos2| {
             // egui hit-tests against the last frame's layout, so the buttons are laid out once first.
@@ -3030,11 +3631,11 @@ Arc::ptr_eq(&snip.flattened(), &shown), "a current canvas is reused, not re-burn
                 out.textures_delta.clear();
             }
         };
-        click(&mut ed, button(3.0));
+        click(&mut ed, button(4.0));
         assert_eq!(draft_text(&mut ed).as_deref(), Some("draft"), "the draft is still being typed");
         assert!(egui::Popup::is_any_open(&ctx), "the text options opened");
-        click(&mut ed, button(0.0));
-        click(&mut ed, button(0.0));
+        click(&mut ed, button(1.0));
+        click(&mut ed, button(1.0));
         assert_eq!(draft_text(&mut ed), None, "switching tools places it");
         assert_eq!(snip_of(&mut ed).doc.marks.len(), 1);
     }

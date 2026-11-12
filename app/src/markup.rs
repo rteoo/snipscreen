@@ -926,7 +926,7 @@ impl Mark {
         }
     }
 
-    fn translate(&mut self, d: eframe::egui::Vec2) {
+    pub fn translate(&mut self, d: eframe::egui::Vec2) {
         match self {
             Mark::Stroke(s) => s.points.iter_mut().for_each(|p| *p += d),
             Mark::Shape(s) => {
@@ -934,6 +934,44 @@ impl Mark {
                 s.to += d;
             }
             Mark::Text(t) => t.pos += d,
+        }
+    }
+
+    /// The box the mark's geometry spans, in image pixels: a stroke's points, the two corners a shape
+    /// was dragged between, a text's letters. What the editor's selection handles frame.
+    pub fn frame(&self) -> Rect {
+        match self {
+            Mark::Stroke(s) => Rect::from_points(&s.points),
+            Mark::Shape(s) => Rect::from_two_pos(s.from, s.to),
+            Mark::Text(t) => t.bounds(),
+        }
+    }
+
+    /// Stretches the mark from the box `from` (its `frame`) to `to`: every point keeps its place
+    /// within the box. `to` may be turned inside out (min past max), which mirrors the mark. Along
+    /// a side where `from` is flat (a straight horizontal stroke) the mark only moves with `to`'s
+    /// min. Line widths stay as they are; a text keeps its top-left corner's place in the box and
+    /// takes its size from the change in height.
+    pub fn reframe(&mut self, from: Rect, to: Rect) {
+        let axis = |v: f32, a0: f32, a1: f32, b0: f32, b1: f32| if (a1 - a0).abs() > 1e-3 { b0 + (v - a0) * (b1 - b0) / (a1 - a0) } else { v + (b0 - a0) };
+        let map = |p: Pos2| Pos2::new(axis(p.x, from.min.x, from.max.x, to.min.x, to.max.x), axis(p.y, from.min.y, from.max.y, to.min.y, to.max.y));
+        match self {
+            Mark::Stroke(s) => s.points.iter_mut().for_each(|p| *p = map(*p)),
+            Mark::Shape(s) => (s.from, s.to) = (map(s.from), map(s.to)),
+            Mark::Text(t) => {
+                t.pos = map(t.pos);
+                if from.height() > 1e-3 {
+                    t.size *= (to.height() / from.height()).abs();
+                }
+            }
+        }
+    }
+
+    pub fn color(&self) -> Color32 {
+        match self {
+            Mark::Stroke(s) => s.color,
+            Mark::Shape(s) => s.color,
+            Mark::Text(t) => t.color,
         }
     }
 }
@@ -1432,6 +1470,36 @@ impl Doc {
 
     pub fn hits(&self, p: Pos2, radius: f32) -> bool {
         self.marks.iter().any(|m| self.touches(m, p, radius))
+    }
+
+    /// The topmost mark within `radius` of `p`, found as the eraser finds marks.
+    pub fn mark_at(&self, p: Pos2, radius: f32) -> Option<usize> {
+        self.marks.iter().rposition(|m| self.touches(m, p, radius))
+    }
+
+    /// Mark `i`'s `Mark::frame`, from its rendered raster for a text (no layout again).
+    pub fn frame_of(&self, i: usize) -> Option<Rect> {
+        let m = self.marks.get(i)?;
+        Some(self.cached_text(m).map_or_else(|| m.frame(), |r| r.bounds()))
+    }
+
+    /// Puts `m` in place of mark `i`, in the same spot of the stack. It is a new mark to
+    /// `changed_tiles`, so both the old and the new footprint repaint. Not an undo step by itself:
+    /// call `checkpoint` once before an edit (a whole drag, one option change).
+    pub fn replace_mark(&mut self, i: usize, m: Mark) {
+        if let Some(slot) = self.marks.get_mut(i) {
+            *slot = Arc::new(m);
+            self.ink_rev += 1;
+        }
+    }
+
+    /// Removes mark `i` as one undoable step.
+    pub fn remove_mark(&mut self, i: usize) {
+        if i < self.marks.len() {
+            self.checkpoint();
+            self.marks.remove(i);
+            self.ink_rev += 1;
+        }
     }
 
     /// Removes every mark within `radius` of `p`. Returns whether any went.
@@ -1991,6 +2059,110 @@ mod tests {
         d.undo();
         check(&mut d, "undoing an add");
         assert_eq!(d.changed_tiles(&d.marks.clone()), Tiles::new(d.size()), "nothing changed, nothing to redraw");
+    }
+
+    #[test]
+    fn an_edited_mark_repaints_its_old_and_new_place_and_undo_brings_the_old_one_back() {
+        let mut d = Doc::new(gradient(160, 120));
+        d.add_mark(shape(ShapeKind::Rectangle, 4.0, (10.0, 10.0), (50.0, 40.0)));
+        d.add_mark(Stroke { ink: Ink::Highlighter, color: Color32::from_rgb(92, 214, 255), width: 12.0, points: vec![Pos2::new(5.0, 30.0), Pos2::new(150.0, 35.0)] });
+        d.add_mark(Text { text: "Hi".into(), color: Color32::BLACK, size: 30.0, outline: true, pos: Pos2::new(20.0, 60.0) });
+        let mut shown = d.flatten();
+        let mut burned = d.marks.clone();
+        let mut check = |d: &mut Doc, what: &str| {
+            let tiles = d.changed_tiles(&burned);
+            for (r, patch) in d.render_runs(&tiles) {
+                paste(&mut shown, &patch, r.pos());
+            }
+            burned = d.marks.clone();
+            assert!(shown.pixels == d.flatten().pixels, "after {what}");
+        };
+        let original = (*d.marks[0]).clone();
+        let mut moved = original.clone();
+        moved.translate(eframe::egui::vec2(90.0, 60.0));
+        let before = d.marks.clone();
+        d.checkpoint();
+        d.replace_mark(0, moved.clone());
+        let tiles = d.changed_tiles(&before);
+        let (mut old, mut new) = (Tiles::new(d.size()), Tiles::new(d.size()));
+        original.footprint(&mut old);
+        moved.footprint(&mut new);
+        assert!(old.minus(&tiles).is_empty() && new.minus(&tiles).is_empty(), "both places repaint");
+        assert!(Arc::ptr_eq(&d.marks[1], &before[1]) && Arc::ptr_eq(&d.marks[2], &before[2]), "the others are left alone");
+        check(&mut d, "moving the rectangle under the highlighter");
+        assert_eq!(d.marks.len(), 3, "it keeps its place in the stack");
+        // Resizing the text from its rendered frame, then recolouring it, each its own step.
+        let frame = d.frame_of(2).unwrap();
+        assert_eq!(frame, d.marks[2].frame(), "the cached raster frames the text as its layout does");
+        let mut bigger = (*d.marks[2]).clone();
+        bigger.reframe(frame, Rect::from_min_size(frame.min, frame.size() * 1.5));
+        assert!(matches!(&bigger, Mark::Text(t) if (t.size - 45.0).abs() < 1e-3), "{bigger:?}");
+        d.checkpoint();
+        d.replace_mark(2, bigger);
+        check(&mut d, "resizing the text");
+        let Mark::Text(t) = &*d.marks[2] else { panic!("text") };
+        let red = Text { color: Color32::RED, ..t.clone() };
+        d.checkpoint();
+        d.replace_mark(2, red.clone().into());
+        check(&mut d, "recolouring the text");
+        d.undo();
+        check(&mut d, "undoing the colour");
+        assert!(matches!(&*d.marks[2], Mark::Text(t) if t.color == Color32::BLACK && t.size > 40.0));
+        d.undo();
+        check(&mut d, "undoing the resize");
+        d.undo();
+        check(&mut d, "undoing the move");
+        assert_eq!(*d.marks[0], original);
+        d.redo();
+        check(&mut d, "redoing the move");
+        assert_eq!(*d.marks[0], moved);
+        d.remove_mark(1);
+        check(&mut d, "removing the highlighter");
+        assert_eq!(d.marks.len(), 2);
+        d.undo();
+        check(&mut d, "undoing the removal");
+        assert_eq!(d.marks.len(), 3);
+    }
+
+    #[test]
+    fn the_topmost_mark_under_the_pointer_is_found() {
+        let mut d = Doc::new(white(100, 100));
+        d.add_mark(Shape { fill: true, ..stroke_free_shape(ShapeKind::Rectangle, (10.0, 10.0), (90.0, 90.0)) });
+        d.add_mark(shape(ShapeKind::Line, 4.0, (0.0, 50.0), (100.0, 50.0)));
+        d.add_mark(shape(ShapeKind::Rectangle, 2.0, (40.0, 40.0), (60.0, 60.0)));
+        assert_eq!(d.mark_at(Pos2::new(70.0, 50.0), 1.0), Some(1), "the line over the filled box");
+        assert_eq!(d.mark_at(Pos2::new(50.0, 40.0), 1.0), Some(2));
+        assert_eq!(d.mark_at(Pos2::new(50.0, 45.0), 1.0), Some(0), "inside an outline: the fill under it");
+        assert_eq!(d.mark_at(Pos2::new(95.0, 5.0), 1.0), None);
+        assert_eq!(d.mark_at(Pos2::new(95.0, 5.0), 8.0), Some(0), "within the tolerance");
+        assert_eq!(d.frame_of(3), None);
+    }
+
+    fn stroke_free_shape(kind: ShapeKind, from: (f32, f32), to: (f32, f32)) -> Shape {
+        Shape { kind, color: Color32::BLUE, width: 2.0, from: Pos2::new(from.0, from.1), to: Pos2::new(to.0, to.1), fill: false }
+    }
+
+    #[test]
+    fn reframing_stretches_points_and_corners_into_the_new_box() {
+        let mut s = Mark::Stroke(Stroke { ink: Ink::Pen, color: Color32::RED, width: 3.0, points: vec![Pos2::new(10.0, 10.0), Pos2::new(20.0, 30.0), Pos2::new(30.0, 20.0)] });
+        let from = s.frame();
+        assert_eq!(from, Rect::from_min_max(Pos2::new(10.0, 10.0), Pos2::new(30.0, 30.0)));
+        s.reframe(from, Rect::from_min_max(Pos2::new(10.0, 10.0), Pos2::new(50.0, 20.0)));
+        assert_eq!(stroke(&s).points, vec![Pos2::new(10.0, 10.0), Pos2::new(30.0, 20.0), Pos2::new(50.0, 15.0)]);
+        assert_eq!(stroke(&s).width, 3.0, "the line keeps its width");
+        // Dragged past the opposite side: mirrored.
+        let from = s.frame();
+        s.reframe(from, Rect::from_min_max(Pos2::new(10.0, 10.0), Pos2::new(-30.0, 20.0)));
+        assert_eq!(stroke(&s).points[2], Pos2::new(-30.0, 15.0));
+        // A flat stroke only moves along its flat side.
+        let mut flat = Mark::Stroke(Stroke { ink: Ink::Pen, color: Color32::RED, width: 3.0, points: vec![Pos2::new(0.0, 5.0), Pos2::new(10.0, 5.0)] });
+        let from = flat.frame();
+        flat.reframe(from, Rect::from_min_max(Pos2::new(0.0, 8.0), Pos2::new(20.0, 30.0)));
+        assert_eq!(stroke(&flat).points, vec![Pos2::new(0.0, 8.0), Pos2::new(20.0, 8.0)]);
+        let mut r = shape(ShapeKind::Ellipse, 2.0, (40.0, 30.0), (10.0, 10.0));
+        let from = r.frame();
+        r.reframe(from, Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(60.0, 40.0)));
+        assert!(matches!(&r, Mark::Shape(s) if s.from == Pos2::new(60.0, 40.0) && s.to == Pos2::new(0.0, 0.0)), "{r:?}");
     }
 
     fn text(s: &str, color: Color32, outline: bool) -> Mark {
