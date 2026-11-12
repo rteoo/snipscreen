@@ -59,6 +59,8 @@ pub const MIN_WINDOW_H: f32 = 240.0;
 pub const DASH: (f32, f32) = (5.0, 4.0);
 pub const DASH_STROKE: f32 = 1.0;
 pub const DASH_COLOR: Color32 = Color32::from_rgba_premultiplied(230, 230, 230, 230);
+/// The thin dark line under the dashes, so they read over light content too.
+pub const DASH_SHADOW: Color32 = Color32::from_black_alpha(130);
 /// How long a message stays up once something is drawing it.
 pub const NOTE_SECS: f64 = 4.0;
 
@@ -274,19 +276,34 @@ pub fn divider_sized(ui: &mut egui::Ui, sc: Scale) {
 }
 
 /// The tool options' Size slider: a thin rail, accent up to the handle, and a small light round handle.
+/// Once focused (Tab), the arrow keys step it by one.
 pub fn slim_slider(ui: &mut egui::Ui, value: &mut f32, range: std::ops::RangeInclusive<f32>) -> egui::Response {
     let (lo, hi) = (*range.start(), *range.end());
     let r = SLIDER_HANDLE / 2.0;
     let (rect, mut resp) = ui.allocate_exact_size(vec2(ui.spacing().slider_width, SLIDER_HANDLE + 6.0), Sense::click_and_drag());
     let (x0, x1) = (rect.left() + r, rect.right() - r);
-    if let Some(pos) = resp.interact_pointer_pos() {
-        let v = lo + ((pos.x - x0) / (x1 - x0)).clamp(0.0, 1.0) * (hi - lo);
+    let set = |value: &mut f32, v: f32, resp: &mut egui::Response| {
+        let v = v.clamp(lo, hi);
         if v != *value {
             *value = v;
             resp.mark_changed();
         }
+    };
+    if let Some(pos) = resp.interact_pointer_pos() {
+        set(value, lo + ((pos.x - x0) / (x1 - x0)).clamp(0.0, 1.0) * (hi - lo), &mut resp);
     }
-    let t = ((*value - lo) / (hi - lo)).clamp(0.0, 1.0);
+    if resp.has_focus() {
+        let steps = ui.input_mut(|i| {
+            let up = i.count_and_consume_key(Modifiers::NONE, Key::ArrowRight) + i.count_and_consume_key(Modifiers::NONE, Key::ArrowUp);
+            let down = i.count_and_consume_key(Modifiers::NONE, Key::ArrowLeft) + i.count_and_consume_key(Modifiers::NONE, Key::ArrowDown);
+            up as f32 - down as f32
+        });
+        if steps != 0.0 {
+            set(value, value.round() + steps, &mut resp);
+        }
+    }
+    resp.widget_info(|| egui::WidgetInfo::slider(true, *value as f64, "Size"));
+    let t = if hi > lo { ((*value - lo) / (hi - lo)).clamp(0.0, 1.0) } else { 0.0 };
     let hx = x0 + t * (x1 - x0);
     let p = ui.painter();
     let rail = Rect::from_center_size(rect.center(), vec2(rect.width(), SLIDER_RAIL));
@@ -294,6 +311,9 @@ pub fn slim_slider(ui: &mut egui::Ui, value: &mut f32, range: std::ops::RangeInc
     p.rect_filled(Rect::from_min_max(rail.min, pos2(hx, rail.max.y)), SLIDER_RAIL / 2.0, ACCENT);
     let grow = if resp.dragged() || resp.hovered() { 1.0 } else { 0.0 };
     p.circle_filled(pos2(hx, rect.center().y), r + grow, ICON);
+    if resp.has_focus() {
+        p.circle_stroke(pos2(hx, rect.center().y), r + 3.0, (1.0, ACCENT));
+    }
     resp
 }
 
@@ -382,6 +402,8 @@ fn caption_buttons(ui: &mut egui::Ui, bar: Rect, title_bar: &win::TitleBar) -> [
 /// starts on a dash, so the corners always read.
 pub fn dashed_outline(p: &egui::Painter, rect: Rect) {
     let r = rect.expand(DASH_STROKE / 2.0);
+    // A faint dark line just outside the light dashes keeps the outline readable over white.
+    p.rect_stroke(r.expand(DASH_STROKE), 0.0, (DASH_STROKE, DASH_SHADOW), StrokeKind::Middle);
     for side in [[r.left_top(), r.right_top()], [r.right_top(), r.right_bottom()], [r.right_bottom(), r.left_bottom()], [r.left_bottom(), r.left_top()]] {
         p.add(egui::Shape::dashed_line(&side, (DASH_STROKE, DASH_COLOR), DASH.0, DASH.1));
     }
@@ -405,6 +427,37 @@ pub fn dim_outside(painter: &egui::Painter, all: Rect, keep: Rect) {
 mod tests {
     use super::*;
     use eframe::egui::{Event, Pos2};
+
+    #[test]
+    fn the_size_slider_steps_with_the_arrow_keys_once_focused() {
+        let ctx = egui::Context::default();
+        let key = |k: Key| Event::Key { key: k, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE };
+        let mut value = 4.4f32;
+        let frame = |events: Vec<Event>, focus: bool, value: &mut f32| {
+            let input = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(400.0, 200.0))), events, ..Default::default() };
+            let mut changed = false;
+            let mut out = ctx.run_ui(input, |ui| {
+                let resp = slim_slider(ui, value, 1.0..=24.0);
+                if focus {
+                    resp.request_focus();
+                }
+                changed = resp.changed();
+            });
+            out.textures_delta.clear();
+            changed
+        };
+        assert!(!frame(vec![key(Key::ArrowRight)], false, &mut value), "unfocused, the keys are left alone");
+        assert_eq!(value, 4.4);
+        frame(vec![], true, &mut value);
+        assert!(frame(vec![key(Key::ArrowRight), key(Key::ArrowUp)], false, &mut value));
+        assert_eq!(value, 6.0, "rounds, then steps by one per press");
+        frame(vec![key(Key::ArrowLeft)], false, &mut value);
+        assert_eq!(value, 5.0);
+        for _ in 0..30 {
+            frame(vec![key(Key::ArrowDown)], false, &mut value);
+        }
+        assert_eq!(value, 1.0, "stays in range");
+    }
 
     #[test]
     fn note_clock_starts_when_first_drawn() {
