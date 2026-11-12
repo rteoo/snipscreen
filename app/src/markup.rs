@@ -98,7 +98,7 @@ impl Shape {
     }
 
     /// Half the width of the line drawn: the shape's own, or a filled shape's thin edge.
-    fn radius(&self) -> f32 {
+    pub fn radius(&self) -> f32 {
         if self.filled() {
             (self.width * 0.15).clamp(0.75, 1.5)
         } else {
@@ -186,6 +186,40 @@ impl Shape {
             cover_triangle(&mut cover, r, head);
         }
         composite(patch, &mut cover, self.line_color());
+    }
+
+    /// Adds the tiles that the fill paints in its colour alone, with nothing of the edge in them:
+    /// every pixel there comes out `color`, whatever is under it. The colour, or `None` for a shape
+    /// that fills nothing.
+    fn solid(&self, tiles: &mut Tiles) -> Option<Color32> {
+        if !self.filled() {
+            return None;
+        }
+        let r = Rect::from_two_pos(self.from, self.to);
+        // Past the edge line's reach and its antialiasing, with room to spare.
+        let margin = self.radius() + 3.0;
+        let (c, a, b) = (r.center(), r.width() / 2.0, r.height() / 2.0);
+        // The ellipse scaled about its centre by `s` keeps a ball of radius `(1 - s) * min(a, b)` round
+        // each of its points inside the ellipse, so this `s` leaves `margin` to the edge, where the
+        // fill's approximate edge distance is under -0.5 too (full coverage).
+        let s = 1.0 - margin / a.min(b).max(1e-3);
+        let inner = r.shrink(margin);
+        let inside = |p: Pos2| match self.kind {
+            ShapeKind::Rectangle => inner.contains(p),
+            _ => {
+                let (qx, qy) = ((p.x - c.x) / a, (p.y - c.y) / b);
+                s > 0.0 && qx * qx + qy * qy <= s * s
+            }
+        };
+        let t = TILE as f32;
+        for idx in tiles_in(r, tiles.size) {
+            let (x0, y0) = ((idx % tiles.cols * TILE) as f32, (idx / tiles.cols * TILE) as f32);
+            // Both shapes are convex: a tile whose corners are inside is inside.
+            if [(x0, y0), (x0 + t, y0), (x0, y0 + t), (x0 + t, y0 + t)].into_iter().all(|(x, y)| inside(Pos2::new(x, y))) {
+                tiles.on[idx] = true;
+            }
+        }
+        Some(self.color)
     }
 
     fn touches(&self, p: Pos2, radius: f32) -> bool {
@@ -926,7 +960,7 @@ impl Mark {
         }
     }
 
-    fn translate(&mut self, d: eframe::egui::Vec2) {
+    pub fn translate(&mut self, d: eframe::egui::Vec2) {
         match self {
             Mark::Stroke(s) => s.points.iter_mut().for_each(|p| *p += d),
             Mark::Shape(s) => {
@@ -935,6 +969,61 @@ impl Mark {
             }
             Mark::Text(t) => t.pos += d,
         }
+    }
+
+    /// The box the mark's geometry spans, in image pixels: a stroke's points, the two corners a shape
+    /// was dragged between, a text's letters. What the editor's selection handles frame.
+    pub fn frame(&self) -> Rect {
+        match self {
+            Mark::Stroke(s) => Rect::from_points(&s.points),
+            Mark::Shape(s) => Rect::from_two_pos(s.from, s.to),
+            Mark::Text(t) => t.bounds(),
+        }
+    }
+
+    /// Stretches the mark from the box `from` (its `frame`) to `to`: every point keeps its place
+    /// within the box. `to` may be turned inside out (min past max), which mirrors the mark. Along
+    /// a side where `from` is flat (a straight horizontal stroke) the mark only moves with `to`'s
+    /// min. A shape's corners take `to`'s sides as they are, so a box squashed flat widens again.
+    /// Line widths stay as they are; a text keeps its top-left corner's place in the box and takes
+    /// its size from the change in height, unless either height is flat.
+    pub fn reframe(&mut self, from: Rect, to: Rect) {
+        let axis = |v: f32, a0: f32, a1: f32, b0: f32, b1: f32| if (a1 - a0).abs() > 1e-3 { b0 + (v - a0) * (b1 - b0) / (a1 - a0) } else { v + (b0 - a0) };
+        let map = |p: Pos2| Pos2::new(axis(p.x, from.min.x, from.max.x, to.min.x, to.max.x), axis(p.y, from.min.y, from.max.y, to.min.y, to.max.y));
+        match self {
+            Mark::Stroke(s) => s.points.iter_mut().for_each(|p| *p = map(*p)),
+            Mark::Shape(s) => {
+                // The corner on the min side (the first one, when they are level) takes `to`'s min.
+                let sides = |a: f32, b: f32, lo: f32, hi: f32| if a <= b { (lo, hi) } else { (hi, lo) };
+                (s.from.x, s.to.x) = sides(s.from.x, s.to.x, to.min.x, to.max.x);
+                (s.from.y, s.to.y) = sides(s.from.y, s.to.y, to.min.y, to.max.y);
+            }
+            Mark::Text(t) => {
+                t.pos = map(t.pos);
+                if from.height() > 1e-3 && to.height().abs() > 1e-3 {
+                    t.size *= (to.height() / from.height()).abs();
+                }
+            }
+        }
+    }
+
+    pub fn color(&self) -> Color32 {
+        match self {
+            Mark::Stroke(s) => s.color,
+            Mark::Shape(s) => s.color,
+            Mark::Text(t) => t.color,
+        }
+    }
+}
+
+/// The tiles of an image of `size` that come out the same with `b` in `a`'s place in the stack:
+/// those both fill solid in the same colour, where nothing under them shows. So moving or resizing
+/// a filled box repaints its edges, not its whole area.
+pub fn same_tiles(a: &Mark, b: &Mark, size: [usize; 2]) -> Tiles {
+    let (mut ta, mut tb) = (Tiles::new(size), Tiles::new(size));
+    match (a, b) {
+        (Mark::Shape(a), Mark::Shape(b)) if a.solid(&mut ta).is_some_and(|c| b.solid(&mut tb) == Some(c)) => ta.intersect(&tb),
+        _ => Tiles::new(size),
     }
 }
 
@@ -1387,6 +1476,13 @@ impl Doc {
         }
     }
 
+    /// Takes back every change since the last `checkpoint`, leaving nothing to redo: a cancelled edit.
+    pub fn revert(&mut self) {
+        if let Some(s) = self.undo.pop() {
+            self.restore(s);
+        }
+    }
+
     /// Adds a finished mark as one undoable step.
     pub fn add_mark(&mut self, m: impl Into<Mark>) {
         self.checkpoint();
@@ -1434,6 +1530,36 @@ impl Doc {
         self.marks.iter().any(|m| self.touches(m, p, radius))
     }
 
+    /// The topmost mark within `radius` of `p`, found as the eraser finds marks.
+    pub fn mark_at(&self, p: Pos2, radius: f32) -> Option<usize> {
+        self.marks.iter().rposition(|m| self.touches(m, p, radius))
+    }
+
+    /// Mark `i`'s `Mark::frame`, from its rendered raster for a text (no layout again).
+    pub fn frame_of(&self, i: usize) -> Option<Rect> {
+        let m = self.marks.get(i)?;
+        Some(self.cached_text(m).map_or_else(|| m.frame(), |r| r.bounds()))
+    }
+
+    /// Puts `m` in place of mark `i`, in the same spot of the stack. It is a new mark to
+    /// `changed_tiles`, so both the old and the new footprint repaint. Not an undo step by itself:
+    /// call `checkpoint` once before an edit (a whole drag, one option change).
+    pub fn replace_mark(&mut self, i: usize, m: Mark) {
+        if let Some(slot) = self.marks.get_mut(i) {
+            *slot = Arc::new(m);
+            self.ink_rev += 1;
+        }
+    }
+
+    /// Removes mark `i` as one undoable step.
+    pub fn remove_mark(&mut self, i: usize) {
+        if i < self.marks.len() {
+            self.checkpoint();
+            self.marks.remove(i);
+            self.ink_rev += 1;
+        }
+    }
+
     /// Removes every mark within `radius` of `p`. Returns whether any went.
     pub fn erase_at(&mut self, p: Pos2, radius: f32) -> bool {
         let keep: Vec<bool> = self.marks.iter().map(|m| !self.touches(m, p, radius)).collect();
@@ -1472,17 +1598,36 @@ impl Doc {
     /// Tiles whose pixels differ between the picture burned with `before` and with the current
     /// marks: the footprints of every mark in one list and not the other. Marks are compared by
     /// identity, so `before` must be an earlier version of `marks` on the same picture.
+    /// A mark put in another's place (`replace_mark`) leaves out the tiles `same_tiles` finds.
     pub fn changed_tiles(&self, before: &[Arc<Mark>]) -> Tiles {
         let ids = |v: &[Arc<Mark>]| v.iter().map(Arc::as_ptr).collect::<std::collections::HashSet<_>>();
         let (was, now) = (ids(before), ids(&self.marks));
-        let mut tiles = Tiles::new(self.size());
+        let size = self.size();
+        let footprint = |m: &Arc<Mark>, tiles: &mut Tiles| match self.cached_text(m) {
+            Some(r) => tiles.add(r.bounds()),
+            None => m.footprint(tiles),
+        };
+        let mut tiles = Tiles::new(size);
+        let mut paired = std::collections::HashSet::new();
+        if before.len() == self.marks.len() {
+            for (old, new) in before.iter().zip(&self.marks) {
+                if now.contains(&Arc::as_ptr(old)) || was.contains(&Arc::as_ptr(new)) {
+                    continue;
+                }
+                let same = same_tiles(old, new, size);
+                if !same.is_empty() {
+                    let mut both = Tiles::new(size);
+                    footprint(old, &mut both);
+                    footprint(new, &mut both);
+                    tiles.union(&both.minus(&same));
+                    paired.extend([Arc::as_ptr(old), Arc::as_ptr(new)]);
+                }
+            }
+        }
         let gone = before.iter().filter(|m| !now.contains(&Arc::as_ptr(m)));
         let added = self.marks.iter().filter(|m| !was.contains(&Arc::as_ptr(m)));
-        for m in gone.chain(added) {
-            match self.cached_text(m) {
-                Some(r) => tiles.add(r.bounds()),
-                None => m.footprint(&mut tiles),
-            }
+        for m in gone.chain(added).filter(|m| !paired.contains(&Arc::as_ptr(m))) {
+            footprint(m, &mut tiles);
         }
         tiles
     }
@@ -1542,6 +1687,21 @@ impl Doc {
                 (r, patch)
             })
             .collect()
+    }
+
+    /// `flatten`, rendering texts through the cache, so the hit tests and frames after it find them
+    /// laid out (a crop empties the cache).
+    pub fn flatten_cached(&mut self) -> ColorImage {
+        let mut out = (*self.image).clone();
+        if self.marks.is_empty() {
+            return out;
+        }
+        let mut all = Tiles::new(self.size());
+        all.on.fill(true);
+        for (r, patch) in self.render_runs(&all) {
+            paste(&mut out, &patch, r.pos());
+        }
+        out
     }
 
     /// The picture with all ink burned in, ready to copy or save.
@@ -1991,6 +2151,180 @@ mod tests {
         d.undo();
         check(&mut d, "undoing an add");
         assert_eq!(d.changed_tiles(&d.marks.clone()), Tiles::new(d.size()), "nothing changed, nothing to redraw");
+    }
+
+    #[test]
+    fn an_edited_mark_repaints_its_old_and_new_place_and_undo_brings_the_old_one_back() {
+        let mut d = Doc::new(gradient(160, 120));
+        d.add_mark(shape(ShapeKind::Rectangle, 4.0, (10.0, 10.0), (50.0, 40.0)));
+        d.add_mark(Stroke { ink: Ink::Highlighter, color: Color32::from_rgb(92, 214, 255), width: 12.0, points: vec![Pos2::new(5.0, 30.0), Pos2::new(150.0, 35.0)] });
+        d.add_mark(Text { text: "Hi".into(), color: Color32::BLACK, size: 30.0, outline: true, pos: Pos2::new(20.0, 60.0) });
+        let mut shown = d.flatten();
+        let mut burned = d.marks.clone();
+        let mut check = |d: &mut Doc, what: &str| {
+            let tiles = d.changed_tiles(&burned);
+            for (r, patch) in d.render_runs(&tiles) {
+                paste(&mut shown, &patch, r.pos());
+            }
+            burned = d.marks.clone();
+            assert!(shown.pixels == d.flatten().pixels, "after {what}");
+        };
+        let original = (*d.marks[0]).clone();
+        let mut moved = original.clone();
+        moved.translate(eframe::egui::vec2(90.0, 60.0));
+        let before = d.marks.clone();
+        d.checkpoint();
+        d.replace_mark(0, moved.clone());
+        let tiles = d.changed_tiles(&before);
+        let (mut old, mut new) = (Tiles::new(d.size()), Tiles::new(d.size()));
+        original.footprint(&mut old);
+        moved.footprint(&mut new);
+        assert!(old.minus(&tiles).is_empty() && new.minus(&tiles).is_empty(), "both places repaint");
+        assert!(Arc::ptr_eq(&d.marks[1], &before[1]) && Arc::ptr_eq(&d.marks[2], &before[2]), "the others are left alone");
+        check(&mut d, "moving the rectangle under the highlighter");
+        assert_eq!(d.marks.len(), 3, "it keeps its place in the stack");
+        // Resizing the text from its rendered frame, then recolouring it, each its own step.
+        let frame = d.frame_of(2).unwrap();
+        assert_eq!(frame, d.marks[2].frame(), "the cached raster frames the text as its layout does");
+        let mut bigger = (*d.marks[2]).clone();
+        bigger.reframe(frame, Rect::from_min_size(frame.min, frame.size() * 1.5));
+        assert!(matches!(&bigger, Mark::Text(t) if (t.size - 45.0).abs() < 1e-3), "{bigger:?}");
+        d.checkpoint();
+        d.replace_mark(2, bigger);
+        check(&mut d, "resizing the text");
+        let Mark::Text(t) = &*d.marks[2] else { panic!("text") };
+        let red = Text { color: Color32::RED, ..t.clone() };
+        d.checkpoint();
+        d.replace_mark(2, red.clone().into());
+        check(&mut d, "recolouring the text");
+        d.undo();
+        check(&mut d, "undoing the colour");
+        assert!(matches!(&*d.marks[2], Mark::Text(t) if t.color == Color32::BLACK && t.size > 40.0));
+        d.undo();
+        check(&mut d, "undoing the resize");
+        d.undo();
+        check(&mut d, "undoing the move");
+        assert_eq!(*d.marks[0], original);
+        d.redo();
+        check(&mut d, "redoing the move");
+        assert_eq!(*d.marks[0], moved);
+        d.remove_mark(1);
+        check(&mut d, "removing the highlighter");
+        assert_eq!(d.marks.len(), 2);
+        d.undo();
+        check(&mut d, "undoing the removal");
+        assert_eq!(d.marks.len(), 3);
+    }
+
+    #[test]
+    fn moving_or_resizing_a_filled_box_repaints_its_edges_not_its_middle() {
+        let mut d = Doc::new(gradient(640, 480));
+        d.add_mark(Stroke { ink: Ink::Highlighter, color: Color32::from_rgb(92, 214, 255), width: 30.0, points: vec![Pos2::new(5.0, 200.0), Pos2::new(630.0, 260.0)] });
+        let boxed = |kind, from: (f32, f32), to: (f32, f32), color| Mark::Shape(Shape { kind, color, width: 8.0, from: Pos2::new(from.0, from.1), to: Pos2::new(to.0, to.1), fill: true });
+        d.add_mark(boxed(ShapeKind::Rectangle, (40.0, 40.0), (400.0, 300.0), Color32::RED));
+        d.add_mark(boxed(ShapeKind::Ellipse, (300.0, 100.0), (620.0, 460.0), Color32::BLUE));
+        d.add_mark(Stroke { ink: Ink::Highlighter, color: Color32::from_rgb(255, 230, 0), width: 24.0, points: vec![Pos2::new(5.0, 150.0), Pos2::new(630.0, 400.0)] });
+        let mut shown = d.flatten();
+        let mut burned = d.marks.clone();
+        let tile_count = |t: &Tiles| t.indices().count();
+        let mut step = |d: &mut Doc, i: usize, m: Mark, what: &str| {
+            let mut both = Tiles::new(d.size());
+            d.marks[i].footprint(&mut both);
+            m.footprint(&mut both);
+            d.replace_mark(i, m);
+            let tiles = d.changed_tiles(&burned);
+            for (r, patch) in d.render_runs(&tiles) {
+                paste(&mut shown, &patch, r.pos());
+            }
+            burned = d.marks.clone();
+            assert!(shown.pixels == d.flatten().pixels, "after {what}");
+            (tile_count(&tiles), tile_count(&both))
+        };
+        let (redrawn, both) = step(&mut d, 1, boxed(ShapeKind::Rectangle, (50.0, 45.0), (410.0, 305.0), Color32::RED), "moving the box");
+        assert!(redrawn * 2 < both, "the middle stays: {redrawn} of {both} tiles");
+        let (redrawn, both) = step(&mut d, 2, boxed(ShapeKind::Ellipse, (300.0, 100.0), (610.0, 448.0), Color32::BLUE), "shrinking the ellipse");
+        // An ellipse's footprint is its whole box, corners and all.
+        assert!(redrawn * 4 < both * 3, "the middle stays: {redrawn} of {both} tiles");
+        let (redrawn, both) = step(&mut d, 1, boxed(ShapeKind::Rectangle, (50.0, 45.0), (410.0, 305.0), Color32::GREEN), "recolouring the box");
+        assert_eq!(redrawn, both, "a new colour repaints it all");
+        let thin = boxed(ShapeKind::Ellipse, (300.0, 100.0), (620.0, 112.0), Color32::BLUE);
+        assert!(same_tiles(&thin, &thin, d.size()).is_empty(), "too thin to have a middle");
+        let Mark::Shape(hollow) = boxed(ShapeKind::Rectangle, (50.0, 45.0), (410.0, 305.0), Color32::GREEN) else { unreachable!() };
+        let hollow = Mark::Shape(Shape { fill: false, ..hollow });
+        assert!(same_tiles(&hollow, &hollow, d.size()).is_empty(), "an outline shows what is under it");
+        step(&mut d, 1, hollow, "unfilling it");
+        d.undo();
+        let tiles = d.changed_tiles(&burned);
+        for (r, patch) in d.render_runs(&tiles) {
+            paste(&mut shown, &patch, r.pos());
+        }
+        assert!(shown.pixels == d.flatten().pixels, "after undoing that");
+    }
+
+    #[test]
+    fn a_crop_lays_texts_out_again_once_for_the_hit_tests_after_it() {
+        let mut d = Doc::new(gradient(200, 120));
+        d.add_mark(text("Hi there", Color32::BLACK, true));
+        d.flatten_cached();
+        assert!(d.cached_text(&d.marks[0]).is_some());
+        d.crop(Rect::from_min_max(Pos2::new(5.0, 2.0), Pos2::new(190.0, 110.0)));
+        assert!(d.cached_text(&d.marks[0]).is_none(), "the crop changed the picture's size");
+        let flat = d.flatten_cached();
+        assert!(flat.pixels == d.flatten().pixels, "the same pixels as a plain flatten");
+        assert!(d.cached_text(&d.marks[0]).is_some(), "and the text is laid out for what comes next");
+    }
+
+    #[test]
+    fn revert_takes_back_an_edit_without_a_redo() {
+        let mut d = Doc::new(white(40, 40));
+        d.add_mark(shape(ShapeKind::Line, 2.0, (5.0, 5.0), (30.0, 5.0)));
+        let original = d.marks[0].clone();
+        d.checkpoint();
+        d.replace_mark(0, shape(ShapeKind::Line, 2.0, (5.0, 15.0), (30.0, 15.0)));
+        d.revert();
+        assert!(Arc::ptr_eq(&d.marks[0], &original) && !d.can_redo());
+        assert!(d.can_undo(), "adding the line is still there to undo");
+    }
+
+    #[test]
+    fn the_topmost_mark_under_the_pointer_is_found() {
+        let mut d = Doc::new(white(100, 100));
+        d.add_mark(Shape { fill: true, ..stroke_free_shape(ShapeKind::Rectangle, (10.0, 10.0), (90.0, 90.0)) });
+        d.add_mark(shape(ShapeKind::Line, 4.0, (0.0, 50.0), (100.0, 50.0)));
+        d.add_mark(shape(ShapeKind::Rectangle, 2.0, (40.0, 40.0), (60.0, 60.0)));
+        assert_eq!(d.mark_at(Pos2::new(70.0, 50.0), 1.0), Some(1), "the line over the filled box");
+        assert_eq!(d.mark_at(Pos2::new(50.0, 40.0), 1.0), Some(2));
+        assert_eq!(d.mark_at(Pos2::new(50.0, 45.0), 1.0), Some(0), "inside an outline: the fill under it");
+        assert_eq!(d.mark_at(Pos2::new(95.0, 5.0), 1.0), None);
+        assert_eq!(d.mark_at(Pos2::new(95.0, 5.0), 8.0), Some(0), "within the tolerance");
+        assert_eq!(d.frame_of(3), None);
+    }
+
+    fn stroke_free_shape(kind: ShapeKind, from: (f32, f32), to: (f32, f32)) -> Shape {
+        Shape { kind, color: Color32::BLUE, width: 2.0, from: Pos2::new(from.0, from.1), to: Pos2::new(to.0, to.1), fill: false }
+    }
+
+    #[test]
+    fn reframing_stretches_points_and_corners_into_the_new_box() {
+        let mut s = Mark::Stroke(Stroke { ink: Ink::Pen, color: Color32::RED, width: 3.0, points: vec![Pos2::new(10.0, 10.0), Pos2::new(20.0, 30.0), Pos2::new(30.0, 20.0)] });
+        let from = s.frame();
+        assert_eq!(from, Rect::from_min_max(Pos2::new(10.0, 10.0), Pos2::new(30.0, 30.0)));
+        s.reframe(from, Rect::from_min_max(Pos2::new(10.0, 10.0), Pos2::new(50.0, 20.0)));
+        assert_eq!(stroke(&s).points, vec![Pos2::new(10.0, 10.0), Pos2::new(30.0, 20.0), Pos2::new(50.0, 15.0)]);
+        assert_eq!(stroke(&s).width, 3.0, "the line keeps its width");
+        // Dragged past the opposite side: mirrored.
+        let from = s.frame();
+        s.reframe(from, Rect::from_min_max(Pos2::new(10.0, 10.0), Pos2::new(-30.0, 20.0)));
+        assert_eq!(stroke(&s).points[2], Pos2::new(-30.0, 15.0));
+        // A flat stroke only moves along its flat side.
+        let mut flat = Mark::Stroke(Stroke { ink: Ink::Pen, color: Color32::RED, width: 3.0, points: vec![Pos2::new(0.0, 5.0), Pos2::new(10.0, 5.0)] });
+        let from = flat.frame();
+        flat.reframe(from, Rect::from_min_max(Pos2::new(0.0, 8.0), Pos2::new(20.0, 30.0)));
+        assert_eq!(stroke(&flat).points, vec![Pos2::new(0.0, 8.0), Pos2::new(20.0, 8.0)]);
+        let mut r = shape(ShapeKind::Ellipse, 2.0, (40.0, 30.0), (10.0, 10.0));
+        let from = r.frame();
+        r.reframe(from, Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(60.0, 40.0)));
+        assert!(matches!(&r, Mark::Shape(s) if s.from == Pos2::new(60.0, 40.0) && s.to == Pos2::new(0.0, 0.0)), "{r:?}");
     }
 
     fn text(s: &str, color: Color32, outline: bool) -> Mark {

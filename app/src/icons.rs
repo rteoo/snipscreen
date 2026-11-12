@@ -13,6 +13,8 @@ pub enum Icon {
     Timer,
     TimerOff,
     Chevron,
+    /// A pointer arrow, with a dot of the selected mark's ink.
+    Select,
     Pen,
     Highlighter,
     Eraser,
@@ -102,6 +104,12 @@ pub fn paint(p: &Painter, rect: Rect, icon: Icon, color: Color32, ink: Option<Co
         }
         Icon::Chevron => {
             line(&[(6.0, 8.0), (10.0, 12.0), (14.0, 8.0)], 1.3, color);
+        }
+        Icon::Select => {
+            closed(&[(4.5, 2.5), (4.5, 15.5), (7.7, 12.6), (10.0, 17.0), (12.0, 16.0), (9.8, 11.7), (14.0, 11.7)], w, color);
+            if let Some(ink) = ink {
+                p.circle(at(16.0, 16.0), 2.6 * s, ink, Stroke::new(1.0 * s, color));
+            }
         }
         Icon::Pen => {
             closed(&[(12.5, 3.0), (15.5, 6.0), (7.0, 14.5), (4.0, 11.5)], w, color);
