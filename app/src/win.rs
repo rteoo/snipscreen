@@ -318,6 +318,10 @@ pub fn add_png(owner: HWND, seq: u32, png: &[u8]) -> Result<(), String> {
 /// Puts the file on the clipboard the way Explorer's Copy does (a file list, marked as a copy), so
 /// it pastes as the file into Explorer, chat apps and mail.
 pub fn copy_file(owner: HWND, path: &Path) -> Result<(), String> {
+    // The clipboard only carries the name: a file that is gone would paste as nothing, unexplained.
+    if !path.is_file() {
+        return Err(format!("{} no longer exists", path.display()));
+    }
     let list = drop_files(&std::path::absolute(path).map_err(|e| format!("{}: {e}", path.display()))?);
     unsafe {
         open_clipboard(owner)?;
@@ -329,9 +333,10 @@ pub fn copy_file(owner: HWND, path: &Path) -> Result<(), String> {
     }
 }
 
-/// Puts `text` on the clipboard as Unicode text.
-pub fn copy_text(owner: HWND, text: &str) -> Result<(), String> {
-    let bytes: Vec<u8> = wide(text).iter().flat_map(|c| c.to_le_bytes()).collect();
+/// Puts `text` on the clipboard as Unicode text, exactly as Windows spells it (a path's name can
+/// hold UTF-16 that isn't valid Unicode).
+pub fn copy_text(owner: HWND, text: &std::ffi::OsStr) -> Result<(), String> {
+    let bytes: Vec<u8> = wide_os(text).iter().flat_map(|c| c.to_le_bytes()).collect();
     unsafe {
         open_clipboard(owner)?;
         EmptyClipboard();
@@ -346,7 +351,7 @@ pub fn copy_text(owner: HWND, text: &str) -> Result<(), String> {
 fn drop_files(path: &Path) -> Vec<u8> {
     let header = DROPFILES { pFiles: size_of::<DROPFILES>() as u32, pt: POINT { x: 0, y: 0 }, fNC: 0, fWide: 1 };
     let mut out = unsafe { std::slice::from_raw_parts(&header as *const _ as *const u8, size_of::<DROPFILES>()) }.to_vec();
-    out.extend(wide(&path.to_string_lossy()).iter().chain(&[0]).flat_map(|c| c.to_le_bytes()));
+    out.extend(wide_os(path.as_os_str()).iter().chain(&[0]).flat_map(|c| c.to_le_bytes()));
     out
 }
 
@@ -417,7 +422,7 @@ unsafe fn set_clipboard_with(format: u32, len: usize, fill: impl FnOnce(&mut [u8
     GlobalUnlock(mem);
     if SetClipboardData(format, mem).is_null() {
         GlobalFree(mem);
-        return Err("the clipboard refused the picture".into());
+        return Err("the clipboard refused the data".into());
     }
     Ok(())
 }
@@ -815,7 +820,10 @@ pub fn open_path(path: &std::path::Path) -> Result<(), String> {
 /// default folder. Windows paths can't contain `"`, so the raw argument needs no escaping.
 pub fn show_in_folder(path: &std::path::Path) -> Result<(), String> {
     use std::os::windows::process::CommandExt;
-    std::process::Command::new("explorer").raw_arg(format!("/select,\"{}\"", path.display())).spawn().map(|_| ()).map_err(|e| e.to_string())
+    let mut arg = std::ffi::OsString::from("/select,\"");
+    arg.push(path);
+    arg.push("\"");
+    std::process::Command::new("explorer").raw_arg(arg).spawn().map(|_| ()).map_err(|e| e.to_string())
 }
 
 /// A top-level window of ours by its exact title. Another program's window with the same title is
@@ -1152,9 +1160,34 @@ fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(Some(0)).collect()
 }
 
+/// `wide` for a Windows string, which needn't be valid Unicode.
+fn wide_os(s: &std::ffi::OsStr) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+    s.encode_wide().chain(Some(0)).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn copying_a_gone_file_is_an_error_before_the_clipboard_is_touched() {
+        let missing = std::env::temp_dir().join(format!("snipscreen-gone-{}.mp4", std::process::id()));
+        let err = copy_file(null_mut(), &missing).unwrap_err();
+        assert!(err.ends_with("no longer exists"), "{err}");
+    }
+
+    #[test]
+    fn a_path_that_is_not_valid_unicode_reaches_the_clipboard_unchanged() {
+        use std::os::windows::ffi::OsStringExt;
+        // A lone surrogate is a legal NTFS name; a lossy conversion would turn it into U+FFFD.
+        let units = [b'C' as u16, b':' as u16, b'\\' as u16, 0xD800, b'.' as u16, b'm' as u16];
+        let path = std::path::PathBuf::from(std::ffi::OsString::from_wide(&units));
+        let block = drop_files(&path);
+        let chars: Vec<u16> = block[size_of::<DROPFILES>()..].as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes(*c)).collect();
+        assert_eq!(chars, [&units[..], &[0, 0]].concat());
+        assert_eq!(wide_os(path.as_os_str()), [&units[..], &[0]].concat());
+    }
 
     #[test]
     fn drop_files_holds_one_wide_path_and_ends_the_list() {
