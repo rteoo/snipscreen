@@ -350,8 +350,14 @@ impl Text {
     }
 
     /// Where the caret goes: after the last letter, at the top of its line.
+    #[cfg(test)]
     pub fn caret(&self) -> Pos2 {
-        Self::font().map_or(self.pos, |f| self.lay_out(&f, Pen::start(self), self.text.len(), |_| {}))
+        self.caret_at(self.text.len())
+    }
+
+    /// Where the caret goes after the first `byte` bytes (a char boundary), at the top of its line.
+    pub fn caret_at(&self, byte: usize) -> Pos2 {
+        Self::font().map_or(self.pos, |f| self.lay_out(&f, Pen::start(self), byte, |_| {}))
     }
 
     /// Every glyph that draws something, flattened and placed, in reading order.
@@ -710,6 +716,7 @@ impl TextRaster {
     }
 
     /// Where the caret goes after the whole text, as `Text::caret` puts it, without laying it out again.
+    #[cfg(test)]
     pub fn caret(&self) -> Pos2 {
         self.layout.end
     }
@@ -1560,6 +1567,21 @@ impl Doc {
         }
     }
 
+    /// Moves the top mark down to `i` and folds the step that added it into the one before: text typed
+    /// again goes back to its place in the stack, and taking it out (`remove_mark`) and putting it back
+    /// make one undo step. A mark that moves below others becomes a new mark to `changed_tiles`, so the
+    /// tiles where they cover it repaint.
+    pub fn restack_last(&mut self, i: usize) {
+        let Some(top) = self.marks.pop() else { return };
+        self.undo.pop();
+        if i >= self.marks.len() {
+            self.marks.push(top);
+        } else {
+            self.marks.insert(i, Arc::new((*top).clone()));
+        }
+        self.ink_rev += 1;
+    }
+
     /// Removes every mark within `radius` of `p`. Returns whether any went.
     pub fn erase_at(&mut self, p: Pos2, radius: f32) -> bool {
         let keep: Vec<bool> = self.marks.iter().map(|m| !self.touches(m, p, radius)).collect();
@@ -2214,6 +2236,37 @@ mod tests {
         d.undo();
         check(&mut d, "undoing the removal");
         assert_eq!(d.marks.len(), 3);
+    }
+
+    #[test]
+    fn text_typed_again_goes_back_to_its_place_as_one_undo_step() {
+        let mut d = Doc::new(gradient(200, 100));
+        let text = |s: &str| Text { text: s.into(), color: Color32::BLACK, size: 20.0, outline: false, pos: Pos2::new(10.0, 10.0) };
+        d.add_mark(text("under"));
+        d.add_mark(text("typo"));
+        d.add_mark(Stroke { ink: Ink::Pen, color: Color32::RED, width: 4.0, points: vec![Pos2::new(0.0, 20.0), Pos2::new(200.0, 20.0)] });
+        let before = d.marks.clone();
+        d.remove_mark(1);
+        d.add_mark(text("fixed"));
+        d.restack_last(1);
+        assert!(matches!(&*d.marks[1], Mark::Text(t) if t.text == "fixed"), "back under the stroke, where it was");
+        assert!(d.changed_tiles(&before).indices().next().is_some());
+        assert_eq!(*d.flatten().pixels, *{
+            let mut want = Doc::new(gradient(200, 100));
+            want.add_mark(text("under"));
+            want.add_mark(text("fixed"));
+            want.add_mark(Stroke { ink: Ink::Pen, color: Color32::RED, width: 4.0, points: vec![Pos2::new(0.0, 20.0), Pos2::new(200.0, 20.0)] });
+            want.flatten().pixels
+        });
+        d.undo();
+        assert!(d.marks.iter().zip(&before).all(|(a, b)| Arc::ptr_eq(a, b)) && d.marks.len() == 3, "one undo brings the old text back");
+        d.redo();
+        assert!(matches!(&*d.marks[1], Mark::Text(t) if t.text == "fixed"));
+        // The top mark typed again stays on top.
+        d.remove_mark(2);
+        d.add_mark(text("on top"));
+        d.restack_last(2);
+        assert!(matches!(&*d.marks[2], Mark::Text(t) if t.text == "on top"));
     }
 
     #[test]

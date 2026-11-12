@@ -522,6 +522,9 @@ pub struct Snip {
     scan: Option<Scan>,
     /// Text Scan text's bar asked to copy this frame; the editor puts it on the clipboard.
     scan_copy: Option<ScanCopy>,
+    /// The text being typed was a placed text, taken off the snip (one undo step) to be typed again:
+    /// where it goes back in the stack.
+    reediting: Option<usize>,
 }
 
 /// Scan text: the snip's words, read on a worker, and the ones picked.
@@ -626,6 +629,7 @@ impl Snip {
             select_popup: None,
             scan: None,
             scan_copy: None,
+            reediting: None,
         }
     }
 
@@ -756,8 +760,18 @@ impl Snip {
 
     /// Places the text being typed, if it has anything in it.
     fn finish_text(&mut self) {
-        if let (Some(m), Some(canvas)) = (take_typed(&mut self.drawing, &mut self.draft, &mut self.ime_taken), self.texture.as_mut()) {
-            canvas.commit(&mut self.doc, m);
+        let m = take_typed(&mut self.drawing, &mut self.draft, &mut self.ime_taken);
+        if let Some(canvas) = self.texture.as_mut() {
+            place_typed(canvas, &mut self.doc, m, &mut self.reediting);
+        }
+    }
+
+    /// Throws the text being typed away. A placed text being typed again goes back as it was,
+    /// leaving no undo step.
+    fn drop_text(&mut self) {
+        self.drawing = None;
+        if self.reediting.take().is_some() {
+            self.doc.revert();
         }
     }
 
@@ -773,7 +787,7 @@ impl Snip {
             if redo {
                 self.draft.redo(&mut t.text);
             } else if !self.draft.undo(&mut t.text) {
-                self.drawing = None;
+                self.drop_text();
             }
             return;
         }
@@ -946,7 +960,7 @@ impl Snip {
 
     fn canvas(&mut self, ui: &mut egui::Ui, guard: &PopupClickGuard) {
         let ctx = ui.ctx().clone();
-        let Snip { doc, tools, texture, drawing, erase_marked, crop, crop_drag, zoom: zoom_choice, key_zoom, draft, ime_taken, selected, mark_drag, option_held: _, px_per_pt, select_popup: _, scan, scan_copy: _ } = self;
+        let Snip { doc, tools, texture, drawing, erase_marked, crop, crop_drag, zoom: zoom_choice, key_zoom, draft, ime_taken, selected, mark_drag, option_held: _, px_per_pt, select_popup: _, scan, scan_copy: _, reediting } = self;
         let canvas = texture.get_or_insert_with(|| CanvasTex::new(&ctx, doc));
         // A change from outside the canvas (undo, a crop, an option): what was in view last frame now, the rest a little later.
         let last_view = if drawing.is_some() { None } else { canvas.view.clone() };
@@ -1107,6 +1121,18 @@ impl Snip {
                             *selected = hold_at(doc, sel.as_ref(), p, to_px(p), reach).map(|(i, _)| doc.marks[i].clone());
                         }
                     }
+                    // A double-click on a text types in it again, with the Text tool.
+                    if resp.double_clicked() {
+                        if let Some(p) = pointer {
+                            if let Some(i) = text_at(doc, to_px(p)) {
+                                reopen_text(doc, i, tools, drawing, draft, reediting, k);
+                                (*selected, *mark_drag) = (None, None);
+                                if let Some(Mark::Text(t)) = drawing.as_ref() {
+                                    draft.move_to(caret_near(t, None, to_px(p)));
+                                }
+                            }
+                        }
+                    }
                     let held = mark_drag.as_ref().map(|d| d.handle).or_else(|| resp.hover_pos().and_then(|p| hold_at(doc, selection(doc, selected).as_ref(), p, to_px(p), reach)).map(|(_, h)| h));
                     if let Some(h) = held {
                         ctx.set_cursor_icon(h.cursor());
@@ -1166,14 +1192,27 @@ impl Snip {
                     }
                     if resp.clicked() {
                         if let Some(p) = pointer {
-                            // A click places the text being typed and starts new text there, its first line centred on the click.
-                            if let Some(m) = take_typed(drawing, draft, ime_taken) {
-                                canvas.commit(doc, m);
+                            // A click in the text being typed moves its caret there. Elsewhere it places that text, then
+                            // types in the text under it again, or starts new text there, its first line centred on the click.
+                            let typing_here = match drawing.as_ref() {
+                                Some(Mark::Text(t)) => Mark::Text(t.clone()).frame().expand(SELECT_REACH * k).contains(to_px(p)),
+                                _ => false,
+                            };
+                            if typing_here {
+                                if let Some(Mark::Text(t)) = drawing.as_ref() {
+                                    draft.move_to(caret_near(t, canvas.live.text.as_ref(), to_px(p)));
+                                }
+                            } else if let Some(i) = { place_typed(canvas, doc, take_typed(drawing, draft, ime_taken), reediting); text_at(doc, to_px(p)) } {
+                                reopen_text(doc, i, tools, drawing, draft, reediting, k);
+                                if let Some(Mark::Text(t)) = drawing.as_ref() {
+                                    draft.move_to(caret_near(t, None, to_px(p)));
+                                }
+                            } else {
+                                let mut t = Text { text: String::new(), color: tools.text.0, size: tools.text.1 * k, outline: tools.text_outline, pos: to_px(p) };
+                                t.pos.y -= t.line_height() / 2.0;
+                                *drawing = Some(Mark::Text(t));
+                                *draft = Draft::new(tools.text.1);
                             }
-                            let mut t = Text { text: String::new(), color: tools.text.0, size: tools.text.1 * k, outline: tools.text_outline, pos: to_px(p) };
-                            t.pos.y -= t.line_height() / 2.0;
-                            *drawing = Some(Mark::Text(t));
-                            *draft = Draft::new(tools.text.1);
                         }
                     }
                     if let Some(Mark::Text(t)) = drawing.as_mut() {
@@ -1185,9 +1224,8 @@ impl Snip {
                             (t.size, draft.size_pt) = (tools.text.1 * k, tools.text.1);
                         }
                         if type_into(&ctx, &mut t.text, draft) {
-                            if let Some(m) = take_typed(drawing, draft, ime_taken) {
-                                canvas.commit(doc, m);
-                            }
+                            let m = take_typed(drawing, draft, ime_taken);
+                            place_typed(canvas, doc, m, reediting);
                         }
                     }
                 }
@@ -1238,7 +1276,7 @@ impl Snip {
                 canvas.copying = None;
             }
             match drawing {
-                Some(Mark::Text(t)) if !draft.preedit.is_empty() => canvas.show_live(&Mark::Text(with_preedit(t, &draft.preedit)), &visible),
+                Some(Mark::Text(t)) if !draft.preedit.is_empty() => canvas.show_live(&Mark::Text(with_preedit(t, &draft.preedit, draft.caret)), &visible),
                 Some(m) => canvas.show_live(m, &visible),
                 None => canvas.clear_live(),
             }
@@ -1246,9 +1284,11 @@ impl Snip {
                 let line = t.line_height() / k;
                 // From the text's raster, laid out already, rather than laying out a long paste again.
                 let live = canvas.live.text.as_ref();
-                let typed = to_pt(live.map_or_else(|| t.caret(), |r| r.caret_at(t.text.len())));
-                // An input method's composition shows after the text, underlined, until it is committed.
-                let end = if draft.preedit.is_empty() { typed } else { to_pt(live.map_or_else(|| with_preedit(t, &draft.preedit).caret(), |r| r.caret())) };
+                let c = draft.caret.min(t.text.len());
+                let typed = to_pt(live.map_or_else(|| t.caret_at(c), |r| r.caret_at(c)));
+                // An input method's composition shows at the caret, underlined, until it is committed.
+                let after = c + draft.preedit.len();
+                let end = if draft.preedit.is_empty() { typed } else { to_pt(live.map_or_else(|| with_preedit(t, &draft.preedit, c).caret_at(after), |r| r.caret_at(after))) };
                 if end != typed {
                     let under = vec2(0.0, line * 0.92);
                     painter.line_segment([typed + under, end + under], (1.5, t.color));
@@ -1257,7 +1297,7 @@ impl Snip {
                 painter.line_segment(caret, (3.0, t.halo_color()));
                 painter.line_segment(caret, (1.5, t.color));
                 // Turns the window's input method on and tells it where the text is.
-                let rect = Rect::from_min_max(to_pt(t.pos), end + vec2(1.0, line));
+                let rect = Rect::from_two_pos(to_pt(t.pos), end + vec2(1.0, line));
                 let cursor_rect = Rect::from_min_size(end, vec2(1.0, line));
                 ctx.output_mut(|o| o.ime = Some(egui::output::IMEOutput { purpose: egui::IMEPurpose::Normal, rect, cursor_rect, should_interrupt_composition: false }));
             }
@@ -1539,8 +1579,8 @@ impl Editor {
         }
         let Content::Snip(snip) = &mut self.content else { return };
         if esc && snip.typing() {
-            // Esc throws away the text being typed, and nothing else.
-            snip.drawing = None;
+            // Esc throws away the text being typed (a text typed again goes back as it was), and nothing else.
+            snip.drop_text();
         } else {
             if undo {
                 snip.step(false);
@@ -2552,11 +2592,42 @@ fn placeable(m: Option<Mark>) -> Option<Mark> {
 
 /// Takes the text being typed to be placed, with an input method's composition, which shows after
 /// it, taken in as if committed: what is placed is what was on screen. Sets `ime_taken` when it did.
+/// Places typed text `m`: new text on top, a text typed again back at its place in the stack (its
+/// whole edit one undo step). A text typed again down to nothing stays removed: it was deleted.
+fn place_typed(canvas: &mut CanvasTex, doc: &mut Doc, m: Option<Mark>, reediting: &mut Option<usize>) {
+    let at = reediting.take();
+    if let Some(m) = m {
+        canvas.commit(doc, m);
+        if let Some(i) = at {
+            doc.restack_last(i);
+        }
+    }
+}
+
+/// The topmost text whose box holds `p` (image pixels).
+fn text_at(doc: &Doc, p: Pos2) -> Option<usize> {
+    (0..doc.marks.len()).rev().find(|&i| matches!(*doc.marks[i], Mark::Text(_)) && doc.frame_of(i).is_some_and(|f| f.contains(p)))
+}
+
+/// Takes text `i` off the snip (one undo step) and types in it again with the Text tool, whose
+/// options take the text's colour, size (in points at this zoom, `k` pixels each) and outline, so
+/// it goes on looking as it did until an option changes.
+fn reopen_text(doc: &mut Doc, i: usize, tools: &mut Tools, drawing: &mut Option<Mark>, draft: &mut Draft, reediting: &mut Option<usize>, k: f32) {
+    let Some(Mark::Text(t)) = doc.marks.get(i).map(|m| (**m).clone()) else { return };
+    doc.remove_mark(i);
+    tools.tool = Tool::Text;
+    tools.text = (t.color, t.size / k);
+    tools.text_outline = t.outline;
+    *draft = Draft::new(t.size / k);
+    *drawing = Some(Mark::Text(t));
+    *reediting = Some(i);
+}
+
 fn take_typed(drawing: &mut Option<Mark>, draft: &mut Draft, ime_taken: &mut bool) -> Option<Mark> {
     let mut m = drawing.take();
     if let Some(Mark::Text(t)) = &mut m {
         if !draft.preedit.is_empty() {
-            t.text.push_str(&std::mem::take(&mut draft.preedit));
+            t.text.insert_str(draft.caret.min(t.text.len()), &std::mem::take(&mut draft.preedit));
             *ime_taken = true;
         }
     }
@@ -2564,8 +2635,27 @@ fn take_typed(drawing: &mut Option<Mark>, draft: &mut Draft, ime_taken: &mut boo
 }
 
 /// `t` with an input method's uncommitted `preedit` after it, as it shows while composing.
-fn with_preedit(t: &Text, preedit: &str) -> Text {
-    Text { text: format!("{}{preedit}", t.text), ..t.clone() }
+fn with_preedit(t: &Text, preedit: &str, caret: usize) -> Text {
+    let mut text = t.text.clone();
+    text.insert_str(caret.min(text.len()), preedit);
+    Text { text, ..t.clone() }
+}
+
+/// The char boundary of `t` nearest `p` (image pixels) on the line `p` is on: where a click puts
+/// the caret. `raster` is the text's own, laid out already, when there is one.
+fn caret_near(t: &Text, raster: Option<&TextRaster>, p: Pos2) -> usize {
+    let line = ((p.y - t.pos.y) / t.line_height()).floor().max(0.0) as usize;
+    let mut start = 0;
+    let mut lines = t.text.split('\n').peekable();
+    for _ in 0..line {
+        match lines.next() {
+            Some(l) if lines.peek().is_some() => start += l.len() + 1,
+            _ => break,
+        }
+    }
+    let end = start + t.text[start..].find('\n').unwrap_or(t.text.len() - start);
+    let at = |i: usize| raster.map_or_else(|| t.caret_at(i), |r| r.caret_at(i)).x;
+    (start..=end).filter(|&i| t.text.is_char_boundary(i)).min_by(|&a, &b| (at(a) - p.x).abs().total_cmp(&(at(b) - p.x).abs())).unwrap_or(end)
 }
 
 /// What a change to the draft is, for grouping changes into undo steps.
@@ -2583,10 +2673,13 @@ enum Edit {
 struct Draft {
     /// The size option, in points, that the text's size in pixels was last worked out from.
     size_pt: f32,
-    /// What the input method is composing: shown after the text, not part of it until committed.
+    /// What the input method is composing: shown at the caret, not part of the text until committed.
     preedit: String,
-    undo: Vec<String>,
-    redo: Vec<String>,
+    /// Where typing goes: a byte offset into the text, on a char boundary.
+    caret: usize,
+    /// Earlier and later versions of the text, each with where its caret was.
+    undo: Vec<(String, usize)>,
+    redo: Vec<(String, usize)>,
     /// The kind of the last change, so a run of typing (a word) or of deleting is one undo step.
     run: Edit,
 }
@@ -2601,7 +2694,7 @@ impl Draft {
     /// its own.
     fn begin(&mut self, kind: Edit, text: &str, new_word: bool) {
         if kind == Edit::None || kind != self.run || new_word {
-            self.undo.push(text.to_string());
+            self.undo.push((text.to_string(), self.caret));
             self.redo.clear();
         }
         self.run = kind;
@@ -2609,15 +2702,17 @@ impl Draft {
 
     /// Takes back the last step. False when there is nothing to take back.
     fn undo(&mut self, text: &mut String) -> bool {
-        let Some(before) = self.undo.pop() else { return false };
-        self.redo.push(std::mem::replace(text, before));
+        let Some((before, caret)) = self.undo.pop() else { return false };
+        self.redo.push((std::mem::replace(text, before), self.caret));
+        self.caret = caret;
         self.run = Edit::None;
         true
     }
 
     fn redo(&mut self, text: &mut String) {
-        if let Some(after) = self.redo.pop() {
-            self.undo.push(std::mem::replace(text, after));
+        if let Some((after, caret)) = self.redo.pop() {
+            self.undo.push((std::mem::replace(text, after), self.caret));
+            self.caret = caret;
             self.run = Edit::None;
         }
     }
@@ -2627,9 +2722,27 @@ impl Draft {
         if s.is_empty() {
             return;
         }
-        let new_word = kind == Edit::Typing && !s.starts_with(char::is_whitespace) && text.ends_with(|c: char| c.is_whitespace());
+        let at = self.caret.min(text.len());
+        let new_word = kind == Edit::Typing && !s.starts_with(char::is_whitespace) && text[..at].ends_with(|c: char| c.is_whitespace());
         self.begin(kind, text, new_word);
-        text.push_str(&s);
+        text.insert_str(at, &s);
+        self.caret = at + s.len();
+    }
+
+    /// Deletes the letter before the caret (`forward`: after it).
+    fn delete(&mut self, text: &mut String, forward: bool) {
+        let at = self.caret.min(text.len());
+        let range = if forward { text[at..].chars().next().map(|c| at..at + c.len_utf8()) } else { text[..at].char_indices().next_back().map(|(i, _)| i..at) };
+        let Some(range) = range else { return };
+        self.begin(Edit::Deleting, text, false);
+        self.caret = range.start;
+        text.replace_range(range, "");
+    }
+
+    /// Puts the caret at `to`; the next change starts an undo step of its own.
+    fn move_to(&mut self, to: usize) {
+        self.caret = to;
+        self.run = Edit::None;
     }
 }
 
@@ -2662,11 +2775,18 @@ fn type_into(ctx: &egui::Context, text: &mut String, draft: &mut Draft) -> bool 
                     draft.preedit.clear();
                     draft.insert(text, s, Edit::None);
                 }
-                Event::Key { key: Key::Backspace, pressed: true, .. } => {
-                    if !text.is_empty() {
-                        draft.begin(Edit::Deleting, text, false);
-                        text.pop();
-                    }
+                Event::Key { key: Key::Backspace, pressed: true, .. } => draft.delete(text, false),
+                Event::Key { key: Key::Delete, pressed: true, .. } => draft.delete(text, true),
+                Event::Key { key: key @ (Key::ArrowLeft | Key::ArrowRight | Key::Home | Key::End), pressed: true, .. } => {
+                    let at = draft.caret.min(text.len());
+                    let to = match key {
+                        Key::ArrowLeft => text[..at].char_indices().next_back().map_or(0, |(i, _)| i),
+                        Key::ArrowRight => text[at..].chars().next().map_or(at, |c| at + c.len_utf8()),
+                        // The start or end of the caret's line.
+                        Key::Home => text[..at].rfind('\n').map_or(0, |i| i + 1),
+                        _ => text[at..].find('\n').map_or(text.len(), |i| at + i),
+                    };
+                    draft.move_to(to);
                 }
                 Event::Key { key: Key::Enter, pressed: true, modifiers, .. } if modifiers.shift => draft.insert(text, "\n", Edit::None),
                 Event::Key { key: Key::Enter, pressed: true, .. } => place = true,
@@ -4432,6 +4552,121 @@ Arc::ptr_eq(&snip.flattened(), &shown), "a current canvas is reused, not re-burn
         click(&mut ed, button(1.0));
         assert_eq!(draft_text(&mut ed), None, "switching tools places it");
         assert_eq!(snip_of(&mut ed).doc.marks.len(), 1);
+    }
+
+    /// A 300x200 snip at 100% (centred on (640, 400)) with one red, outlined, 24 px text "typo" and
+    /// a blue stroke over it, the Select tool chosen. Returns where the text's box centre shows.
+    fn snip_with_text(ctx: &egui::Context, screen: &mut Screen) -> (Snip, Pos2) {
+        let mut snip = Snip::new(white(300, 200), Tools { tool: Tool::Select, ..Tools::default() });
+        snip.doc.add_mark(Text { text: "typo".into(), color: PEN_COLORS[0], size: 24.0, outline: true, pos: pos2(40.0, 40.0) });
+        snip.doc.add_mark(Stroke { ink: Ink::Pen, color: PEN_COLORS[4], width: 3.0, points: vec![pos2(30.0, 52.0), pos2(150.0, 52.0)] });
+        canvas_frame(ctx, &mut snip, screen, vec![]);
+        let at = snip.doc.frame_of(0).expect("text").center() + vec2(490.0, 300.0);
+        (snip, at)
+    }
+
+    fn texts(snip: &Snip) -> Vec<String> {
+        snip.doc.marks.iter().filter_map(|m| if let Mark::Text(t) = &**m { Some(t.text.clone()) } else { None }).collect()
+    }
+
+    #[test]
+    fn a_double_click_types_in_a_placed_text_again_and_enter_puts_it_back_as_one_step() {
+        let ctx = egui::Context::default();
+        let mut screen = Screen { image: None };
+        let (mut snip, at) = snip_with_text(&ctx, &mut screen);
+        let original = snip.doc.marks[0].clone();
+        for events in [vec![Event::PointerMoved(at), pointer(at, true)], vec![pointer(at, false)], vec![pointer(at, true)], vec![pointer(at, false)]] {
+            canvas_frame(&ctx, &mut snip, &mut screen, events);
+        }
+        assert!(matches!(&snip.drawing, Some(Mark::Text(t)) if t.text == "typo" && t.color == PEN_COLORS[0] && t.outline && t.size == 24.0), "it opens with its words and look");
+        assert_eq!((snip.tools.tool, snip.tools.text.0, snip.tools.text_outline), (Tool::Text, PEN_COLORS[0], true), "with the Text tool, set to its look");
+        assert!(snip.selected.is_none() && texts(&snip).is_empty());
+        assert_eq!(snip.draft.caret, 2, "the caret goes where the double-click was: the middle of the word");
+        canvas_frame(&ctx, &mut snip, &mut screen, vec![key(Key::End, Modifiers::NONE), key(Key::Backspace, Modifiers::NONE), Event::Text("ed".into())]);
+        canvas_frame(&ctx, &mut snip, &mut screen, vec![key(Key::Enter, Modifiers::NONE)]);
+        assert_eq!(texts(&snip), ["typed"]);
+        assert!(matches!(&*snip.doc.marks[0], Mark::Text(t) if t.text == "typed" && t.pos == pos2(40.0, 40.0)), "back in its place, under the stroke");
+        canvas_frame(&ctx, &mut snip, &mut screen, vec![]);
+        assert!(screen.pixels() == snip.doc.flatten().pixels, "the screen shows what would be saved");
+        snip.step(false);
+        assert!(Arc::ptr_eq(&snip.doc.marks[0], &original) && snip.doc.marks.len() == 2, "one undo brings the old words back");
+    }
+
+    #[test]
+    fn a_text_tool_click_on_a_text_types_in_it_and_esc_or_emptying_it_end_the_edit() {
+        let ctx = egui::Context::default();
+        let mut screen = Screen { image: None };
+        let (mut snip, at) = snip_with_text(&ctx, &mut screen);
+        snip.tools.tool = Tool::Text;
+        let marks = snip.doc.marks.clone();
+        let click = |snip: &mut Snip, screen: &mut Screen| {
+            canvas_frame(&ctx, snip, screen, vec![Event::PointerMoved(at), pointer(at, true)]);
+            canvas_frame(&ctx, snip, screen, vec![pointer(at, false)]);
+        };
+        click(&mut snip, &mut screen);
+        assert!(matches!(&snip.drawing, Some(Mark::Text(t)) if t.text == "typo"), "a click on a text types in it, not new text");
+        canvas_frame(&ctx, &mut snip, &mut screen, vec![Event::Text(" zzz".into())]);
+        snip.drop_text();
+        assert!(snip.doc.marks.iter().zip(&marks).all(|(a, b)| Arc::ptr_eq(a, b)) && snip.doc.marks.len() == 2, "Esc puts it back as it was");
+        assert!(!snip.doc.can_redo(), "and leaves no step behind");
+
+        click(&mut snip, &mut screen);
+        canvas_frame(&ctx, &mut snip, &mut screen, vec![key(Key::End, Modifiers::NONE)]);
+        for _ in 0..4 {
+            canvas_frame(&ctx, &mut snip, &mut screen, vec![key(Key::Backspace, Modifiers::NONE)]);
+        }
+        canvas_frame(&ctx, &mut snip, &mut screen, vec![key(Key::Enter, Modifiers::NONE)]);
+        assert!(texts(&snip).is_empty() && snip.drawing.is_none(), "typed down to nothing, it is deleted");
+        snip.step(false);
+        assert_eq!(texts(&snip), ["typo"], "and one undo brings it back");
+
+        // Away from any text the Text tool still starts new text.
+        let away = pos2(490.0 + 200.0, 300.0 + 150.0);
+        canvas_frame(&ctx, &mut snip, &mut screen, vec![Event::PointerMoved(away), pointer(away, true)]);
+        canvas_frame(&ctx, &mut snip, &mut screen, vec![pointer(away, false)]);
+        assert!(matches!(&snip.drawing, Some(Mark::Text(t)) if t.text.is_empty()) && snip.reediting.is_none());
+    }
+
+    #[test]
+    fn the_caret_moves_with_arrows_home_end_and_clicks_and_typing_goes_where_it_is() {
+        let ctx = egui::Context::default();
+        let mut screen = Screen { image: None };
+        let mut snip = Snip::new(white(300, 200), Tools { tool: Tool::Text, ..Tools::default() });
+        canvas_frame(&ctx, &mut snip, &mut screen, vec![]);
+        let at = pos2(500.0, 330.0);
+        canvas_frame(&ctx, &mut snip, &mut screen, vec![Event::PointerMoved(at), pointer(at, true)]);
+        canvas_frame(&ctx, &mut snip, &mut screen, vec![pointer(at, false)]);
+        let text = |snip: &Snip| match &snip.drawing {
+            Some(Mark::Text(t)) => (t.text.clone(), snip.draft.caret),
+            _ => panic!("typing"),
+        };
+        let press = |snip: &mut Snip, screen: &mut Screen, events: Vec<Event>| canvas_frame(&ctx, snip, screen, events);
+        let k = |key_: Key| key(key_, Modifiers::NONE);
+        press(&mut snip, &mut screen, vec![Event::Text("abc".into()), k(Key::ArrowLeft), k(Key::ArrowLeft), Event::Text("X".into())]);
+        assert_eq!(text(&snip), ("aXbc".into(), 2));
+        press(&mut snip, &mut screen, vec![k(Key::Home), Event::Text("^".into()), k(Key::End), k(Key::Backspace)]);
+        assert_eq!(text(&snip), ("^aXb".into(), 4));
+        press(&mut snip, &mut screen, vec![k(Key::Home), k(Key::Delete)]);
+        assert_eq!(text(&snip), ("aXb".into(), 0));
+        snip.step(false);
+        assert_eq!(text(&snip), ("^aXb".into(), 0), "undo brings the letter back, and the caret to where it was");
+        // Home and End keep to the caret's line; Right past the end stays at the end.
+        press(&mut snip, &mut screen, vec![k(Key::End), key(Key::Enter, Modifiers::SHIFT), Event::Text("ção".into()), k(Key::Home)]);
+        assert_eq!(text(&snip), ("^aXb\nção".into(), 5));
+        press(&mut snip, &mut screen, vec![k(Key::ArrowRight), k(Key::ArrowRight)]);
+        assert_eq!(text(&snip).1, 9, "from byte 5, over ç and ã, two bytes each");
+        press(&mut snip, &mut screen, vec![k(Key::End), k(Key::ArrowRight), k(Key::ArrowLeft), k(Key::ArrowLeft), k(Key::ArrowLeft), k(Key::ArrowLeft)]);
+        assert_eq!(text(&snip).1, 4, "Left from the second line's start goes to the end of the first");
+        // A click in the text puts the caret at the nearest gap on the clicked line.
+        let Some(Mark::Text(t)) = snip.drawing.clone() else { panic!("typing") };
+        // Mid-line, at the caret after `i` bytes (100% zoom, the snip's corner at (490, 300)).
+        let gap = |i: usize| t.caret_at(i) + vec2(490.0, 300.0) + vec2(0.0, t.line_height() * 0.5);
+        for (target, want) in [(gap(1), 1), (gap(0) - vec2(3.0, 0.0), 0), (gap(5) - vec2(2.0, 0.0), 5), (gap(9) + vec2(1.0, 0.0), 9)] {
+            press(&mut snip, &mut screen, vec![Event::PointerMoved(target), pointer(target, true)]);
+            press(&mut snip, &mut screen, vec![pointer(target, false)]);
+            assert_eq!(text(&snip), ("^aXb\nção".into(), want), "a click at {target:?}");
+        }
+        assert!(snip.doc.marks.is_empty(), "clicking in the text never places it");
     }
 
     /// What Scan text read, as the engine hands it over: "alpha beta gamma" on one line and "delta

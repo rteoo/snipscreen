@@ -34,7 +34,7 @@ installed per user or run portable. It is a sibling of [SnipType](https://github
 - A small Settings window: the snip shortcut, what happens after a snip, auto-copy, auto-save, where snips and recordings are saved, and start with Windows.
 - Pen (6 colours), a highlighter that blends into the picture (4 colours), shapes (arrow, line, rectangle, ellipse; rectangles and ellipses can be filled), text in Geist with a size slider and a contrasting outline, eraser, crop with a frame and handles, and 50-step undo/redo.
 - Edit in Paint opens the snip, markup included, in Paint.
-- Placed marks stay editable: the Select tool moves and resizes them, changes their colour, size, fill or outline, and deletes them.
+- Placed marks stay editable: the Select tool moves and resizes them, changes their colour, size, fill or outline, and deletes them. A placed text's words can be changed too: double-click it with Select, or click it with the Text tool.
 - Scan text reads the text in a snip with Windows' own OCR (every installed language at once, so English and accented text both come out right), then copies all of it or the words you pick, as plain text or formatted: Markdown (the default), rich text for Word, Outlook and Teams, or WhatsApp's markup. Headings, paragraphs, lists and tables are kept.
 - Each snip opens in its own editor window, so several can be open at once.
 - What you see is what you save: the screen and the saved PNG use the same rasteriser.
@@ -117,6 +117,8 @@ completely.
 | Delete or Backspace | Delete the selected mark (Select tool) |
 | Enter | Place the text, or apply the crop |
 | Shift+Enter | New line in the text |
+| Left / Right, Home / End | Move the caret in the text (a click in the text puts it there too) |
+| Delete | Delete the letter after the caret |
 | Esc | Close a menu, or cancel the text, crop, mark drag or selection, countdown, picking, or recording bar; with Scan text on, drop the picked words, then turn it off |
 
 Alt+Shift+S is the default because Win+Shift+S and Print Screen belong to the
