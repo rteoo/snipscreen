@@ -3107,7 +3107,7 @@ mod tests {
         assert_eq!(edit_window_size(vec2(5000.0, 5000.0), wide), wide * 0.85);
     }
 
-    /// Group widths as laid out by `Editor::toolbar`: New button 80, output 153, markup with crop buttons 454.
+    /// Group widths as laid out by `Editor::toolbar`: New button 80, output 153, markup with crop buttons 562.
     const NEW_END: f32 = BAR_PAD + 72.0;
     const OUT_W: f32 = 153.0;
     const MARKUP_W: f32 = 562.0;
