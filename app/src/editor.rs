@@ -27,9 +27,9 @@ use crate::widgets::{
 };
 use crate::win;
 
-/// Measured: bar padding 8 + New button 72 + markup with crop buttons 454 + output group 153 + 2 group gaps
-/// + padding 8 + caption buttons 138 = 865.
-pub const MIN_EDIT_W: f32 = 868.0;
+/// Measured: bar padding 8 + New button 72 + markup with crop buttons 562 + output group 153 + 2 group gaps
+/// + padding 8 + caption buttons 138 = 973.
+pub const MIN_EDIT_W: f32 = 976.0;
 const MIN_ZOOM: f32 = 0.05;
 const MAX_ZOOM: f32 = 8.0;
 /// Snip zoom change per Ctrl+Plus / Ctrl+Minus press.
@@ -420,16 +420,13 @@ struct MarkDrag {
     edited: bool,
 }
 
+/// The Shape tool's kinds, each its own toolbar button; they share one colour and size.
 const SHAPES: [(ShapeKind, Icon, &str); 4] = [
-    (ShapeKind::Arrow, Icon::Arrow, "Arrow"),
-    (ShapeKind::Line, Icon::Line, "Line"),
-    (ShapeKind::Rectangle, Icon::RectOutline, "Rectangle"),
-    (ShapeKind::Ellipse, Icon::Ellipse, "Ellipse"),
+    (ShapeKind::Arrow, Icon::Arrow, "Arrow (click again for colour and size; Shift keeps it at 45°)"),
+    (ShapeKind::Line, Icon::Line, "Line (click again for colour and size; Shift keeps it at 45°)"),
+    (ShapeKind::Rectangle, Icon::RectOutline, "Rectangle (click again for colour, size and fill; Shift keeps it square)"),
+    (ShapeKind::Ellipse, Icon::Ellipse, "Ellipse (click again for colour, size and fill; Shift keeps it round)"),
 ];
-
-fn shape_icon(kind: ShapeKind) -> Icon {
-    SHAPES.iter().find(|s| s.0 == kind).map_or(Icon::Arrow, |s| s.1)
-}
 
 const PEN_COLORS: [Color32; 6] = [
     Color32::from_rgb(0x1f, 0x1f, 0x1f),
@@ -818,21 +815,25 @@ impl Snip {
     }
 
     fn markup_width(&self) -> f32 {
-        let buttons = if self.crop.is_some() { 12.0 } else { 10.0 };
+        let buttons = if self.crop.is_some() { 15.0 } else { 13.0 };
         let dividers = 2.0;
         buttons * BTN.x + dividers * DIVIDER_W + (buttons + dividers - 1.0) * GAP
     }
 
     fn markup_controls(&mut self, ui: &mut egui::Ui) {
         let selected_ink = self.selected_index().map(|i| self.doc.marks[i].color());
-        for (tool, icon, tip) in [
-            (Tool::Select, Icon::Select, "Select: click a mark to pick it, drag it to move it, drag its handles to resize it, Delete removes it (click again for its colour and size)"),
-            (Tool::Pen, Icon::Pen, "Pen (click again for colour and size)"),
-            (Tool::Highlighter, Icon::Highlighter, "Highlighter (click again for colour and size)"),
-            (Tool::Shape, shape_icon(self.tools.shape_kind), "Shapes (click again for shape, colour and size; Shift keeps lines at 45° and boxes square)"),
-            (Tool::Text, Icon::Text, "Text: click and type, Enter places it, Shift+Enter starts a new line (click again for colour, size and outline)"),
-            (Tool::Eraser, Icon::Eraser, "Eraser: rubs out whole marks"),
-        ] {
+        let buttons = [
+            (Tool::Select, None, Icon::Select, "Select: click a mark to pick it, drag it to move it, drag its handles to resize it, Delete removes it (click again for its colour and size)"),
+            (Tool::Pen, None, Icon::Pen, "Pen (click again for colour and size)"),
+            (Tool::Highlighter, None, Icon::Highlighter, "Highlighter (click again for colour and size)"),
+        ]
+        .into_iter()
+        .chain(SHAPES.map(|(kind, icon, tip)| (Tool::Shape, Some(kind), icon, tip)))
+        .chain([
+            (Tool::Text, None, Icon::Text, "Text: click and type, Enter places it, Shift+Enter starts a new line (click again for colour, size and outline)"),
+            (Tool::Eraser, None, Icon::Eraser, "Eraser: rubs out whole marks"),
+        ]);
+        for (tool, kind, icon, tip) in buttons {
             let ink = match tool {
                 Tool::Select => selected_ink,
                 Tool::Pen => Some(self.tools.pen.0),
@@ -842,12 +843,15 @@ impl Snip {
                 Tool::Eraser => None,
             };
             // While Scan text is on no tool is in use; a click on one turns it off and takes that tool.
-            let current = self.tools.tool == tool && self.scan.is_none();
+            let current = self.tools.tool == tool && kind.is_none_or(|k| k == self.tools.shape_kind) && self.scan.is_none();
             let resp = icon_button(ui, icon, ink, current, true, tip);
             let again = resp.clicked() && current;
             // A click on the tool already chosen opens its options and leaves the text being typed (or the selection) alone.
             if resp.clicked() && !again {
                 self.choose_tool(tool);
+                if let Some(k) = kind {
+                    self.tools.shape_kind = k;
+                }
             }
             if tool == Tool::Select {
                 self.select_popup = Some(egui::Popup::default_response_id(&resp));
@@ -888,16 +892,6 @@ impl Snip {
         ui.spacing_mut().item_spacing = vec2(6.0, 8.0);
         if tool == Tool::Select {
             return self.selection_options(ui);
-        }
-        if tool == Tool::Shape {
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = GAP;
-                for (kind, icon, tip) in SHAPES {
-                    if icon_button(ui, icon, None, self.tools.shape_kind == kind, true, tip).clicked() {
-                        self.tools.shape_kind = kind;
-                    }
-                }
-            });
         }
         // A filled box's edge is fixed and thin, so the size would change nothing it shows.
         let sized = !(tool == Tool::Shape && filled_box(self.tools.shape_kind, self.tools.shape_fill));
@@ -3116,14 +3110,14 @@ mod tests {
     /// Group widths as laid out by `Editor::toolbar`: New button 80, output 153, markup with crop buttons 454.
     const NEW_END: f32 = BAR_PAD + 72.0;
     const OUT_W: f32 = 153.0;
-    const MARKUP_W: f32 = 454.0;
+    const MARKUP_W: f32 = 562.0;
     /// Right end of the controls row: the caption buttons and the padding before them.
     const ROW_END_GAP: f32 = BAR_PAD + 3.0 * CAPTION_W;
 
     #[test]
     fn markup_width_matches_the_measured_toolbar() {
         let mut snip = Snip::new(white(4, 4), Tools::default());
-        assert_eq!(snip.markup_width(), 10.0 * BTN.x + 2.0 * DIVIDER_W + 11.0 * GAP);
+        assert_eq!(snip.markup_width(), 13.0 * BTN.x + 2.0 * DIVIDER_W + 14.0 * GAP);
         snip.crop = Some(Rect::from_min_max(Pos2::ZERO, pos2(2.0, 2.0)));
         assert_eq!(snip.markup_width(), MARKUP_W);
         const { assert!(NEW_END + GROUP_GAP + MARKUP_W + GROUP_GAP + OUT_W + ROW_END_GAP <= MIN_EDIT_W, "MIN_EDIT_W fits all three groups") };
@@ -3131,7 +3125,7 @@ mod tests {
 
     #[test]
     fn markup_group_never_overlaps_its_neighbours() {
-        for window in [MIN_EDIT_W as i32, 900, 1200, 2000] {
+        for window in [MIN_EDIT_W as i32, 1000, 1200, 2000] {
             let row_end = window as f32 - ROW_END_GAP;
             let right_start = row_end - OUT_W;
             let x = markup_x(window as f32 / 2.0, MARKUP_W, NEW_END, right_start);
@@ -4552,34 +4546,51 @@ Arc::ptr_eq(&snip.flattened(), &shown), "a current canvas is reused, not re-burn
         assert_eq!(size(&mut ed), 80.0, "40 pt at 50% zoom is 80 px");
     }
 
+    /// Clicks the `n`th markup button, counted from the window's corner: Select, Pen, Highlighter,
+    /// Arrow, Line, Rectangle, Ellipse, Text, Eraser.
+    fn click_markup(ctx: &egui::Context, ed: &mut Editor, n: f32) {
+        let at = pos2(n * (BTN.x + GAP) + BTN.x / 2.0, BTN.y / 2.0);
+        // egui hit-tests against the last frame's layout, so the buttons are laid out once first.
+        for events in [vec![Event::PointerMoved(at)], vec![pointer(at, true)], vec![pointer(at, false)], vec![]] {
+            let input = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1280.0, 800.0))), events, ..Default::default() };
+            let snip = snip_of(ed);
+            let mut out = ctx.run_ui(input, |ui| {
+                egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing = vec2(GAP, 0.0);
+                        snip.markup_controls(ui);
+                    });
+                });
+            });
+            out.textures_delta.clear();
+        }
+    }
+
     #[test]
     fn clicking_the_chosen_text_tool_opens_its_options_without_placing_the_draft() {
         let (ctx, mut ed, _) = typing("draft");
-        // The markup buttons laid out from the window's corner: Select, Pen, Highlighter, Shapes, Text.
-        let button = |n: f32| pos2(n * (BTN.x + GAP) + BTN.x / 2.0, BTN.y / 2.0);
-        let click = |ed: &mut Editor, at: Pos2| {
-            // egui hit-tests against the last frame's layout, so the buttons are laid out once first.
-            for events in [vec![Event::PointerMoved(at)], vec![pointer(at, true)], vec![pointer(at, false)], vec![]] {
-                let input = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1280.0, 800.0))), events, ..Default::default() };
-                let snip = snip_of(ed);
-                let mut out = ctx.run_ui(input, |ui| {
-                    egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.spacing_mut().item_spacing = vec2(GAP, 0.0);
-                            snip.markup_controls(ui);
-                        });
-                    });
-                });
-                out.textures_delta.clear();
-            }
-        };
-        click(&mut ed, button(4.0));
+        click_markup(&ctx, &mut ed, 7.0);
         assert_eq!(draft_text(&mut ed).as_deref(), Some("draft"), "the draft is still being typed");
         assert!(egui::Popup::is_any_open(&ctx), "the text options opened");
-        click(&mut ed, button(1.0));
-        click(&mut ed, button(1.0));
+        click_markup(&ctx, &mut ed, 1.0);
+        click_markup(&ctx, &mut ed, 1.0);
         assert_eq!(draft_text(&mut ed), None, "switching tools places it");
         assert_eq!(snip_of(&mut ed).doc.marks.len(), 1);
+    }
+
+    #[test]
+    fn each_shape_has_its_own_button_and_a_second_click_opens_the_shared_options() {
+        let (ctx, mut ed, _) = typing("draft");
+        for (n, (kind, _, _)) in SHAPES.into_iter().enumerate() {
+            click_markup(&ctx, &mut ed, 3.0 + n as f32);
+            let tools = snip_of(&mut ed).tools;
+            assert_eq!((tools.tool, tools.shape_kind), (Tool::Shape, kind), "button {n} picks {kind:?}");
+            assert!(!egui::Popup::is_any_open(&ctx), "the first click on {kind:?} only picks it");
+        }
+        assert_eq!(draft_text(&mut ed), None, "picking a shape places the text being typed");
+        click_markup(&ctx, &mut ed, 6.0);
+        assert!(egui::Popup::is_any_open(&ctx), "clicking the chosen Ellipse again opens its options");
+        assert_eq!(snip_of(&mut ed).tools.shape_kind, ShapeKind::Ellipse);
     }
 
     /// A 300x200 snip at 100% (centred on (640, 400)) with one red, outlined, 24 px text "typo" and
