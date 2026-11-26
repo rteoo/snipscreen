@@ -200,7 +200,18 @@ without driving the desktop.
 | `app/src/device_menu.rs` | The recording bar's sound device menus |
 | `app/src/win.rs` | Win32: screen grab, clipboard, dialogs, title bar |
 | `app/src/icons.rs` | Vector toolbar icons |
-| `app/assets/` | App icon sources (`.svg`), renders (`.png`), and `snipscreen.ico`, which `app/build.rs` embeds in the `.exe` |
+| `app/assets/` | Product icon spec, SVG and PNG renders, and the multi-size `snipscreen.ico` embedded in the `.exe` |
+
+The app mark follows the [Teô Design System product icon rules](https://github.com/rteoo/design-system-teo/blob/main/DESIGN.md#product-icons) introduced in v3.2.1.
+The amber sun also represents recording. The 16–24 px Windows variant uses a
+heavier outline and drops the landscape so the capture corners stay legible.
+To regenerate the assets on Windows with Python and Edge, run this command from
+the repository root with the path to your design system checkout. If needed,
+pass `-Browser` with the path to another Chromium executable.
+
+```powershell
+.\app\assets\render-product-icons.ps1 -DesignSystem "C:\path\to\design-system-teo"
+```
 
 Contributor and agent conventions are in [AGENTS.md](AGENTS.md).
 
