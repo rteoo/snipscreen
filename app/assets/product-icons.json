@@ -1,0 +1,19 @@
+[
+  {
+    "name": "snipscreen-icon",
+    "title": "SnipScreen",
+    "desc": "Capture corners frame a landscape whose amber sun doubles as a recording indicator.",
+    "stroke": [
+      "<path d=\"M2 9V6a2 2 0 0 1 2-2h3m10 0h3a2 2 0 0 1 2 2v3M2 15v3a2 2 0 0 0 2 2h3m10 0h3a2 2 0 0 0 2-2v-3\"/>",
+      "<path d=\"m6 16 5-5 3.5 3.5 1.5-1.5 2 3\"/>"
+    ],
+    "accent": "<circle cx=\"8\" cy=\"8.5\" r=\"1.8\"/>"
+  },
+  {
+    "name": "snipscreen-icon-small",
+    "title": "SnipScreen",
+    "desc": "Capture corners surround an amber recording indicator, drawn for 16 to 24 pixel Windows icons.",
+    "stroke": "<path d=\"M2 9V5a2 2 0 0 1 2-2h4m8 0h4a2 2 0 0 1 2 2v4M2 15v4a2 2 0 0 0 2 2h4m8 0h4a2 2 0 0 0 2-2v-4\" stroke-width=\"2.5\"/>",
+    "accent": "<circle cx=\"12\" cy=\"12\" r=\"2.4\"/>"
+  }
+]
